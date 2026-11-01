@@ -745,7 +745,9 @@ void ge_scan(Runtime &rt, GeList &list) {
     // Without workload statistics only the control commands below matter, so
     // runs of other commands (nearly all of a list) are skipped in place.
 #if defined(BURNOUT_GE_RENDER)
-    const bool skip_plain = !workload::collecting() && !render::active();
+    // With the renderer, such runs go to it in one call instead.
+    const bool render_runs = !workload::collecting() && render::active();
+    const bool skip_plain = !workload::collecting();
 #else
     const bool skip_plain = !workload::collecting();
 #endif
@@ -760,6 +762,9 @@ void ge_scan(Runtime &rt, GeList &list) {
                 std::uint32_t plain = 0u;
                 while (plain < span && !ge_is_control(words[plain * 4u + 3u])) ++plain;
                 if (plain != 0u) {
+#if defined(BURNOUT_GE_RENDER)
+                    if (render_runs) render::ge_commands(rt.memory(), words, plain, list.base, list.offset);
+#endif
                     list.pc = pc + plain * 4u;
                     k.ge_commands_scanned += plain;
                     count += plain - 1u;

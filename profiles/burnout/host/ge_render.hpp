@@ -37,6 +37,9 @@ void account_scan(double ms) noexcept;
 // goes away: the GL thread reads vertices from it.
 void finish();
 
+// A run of `count` plain (non control-flow) commands, read in place.
+void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count, std::uint32_t base,
+                 std::uint32_t offset);
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset);
 // sceDisplaySetFrameBuf: the frame at `address` is about to be shown.

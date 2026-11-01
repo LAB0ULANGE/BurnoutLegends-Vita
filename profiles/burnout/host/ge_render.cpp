@@ -523,6 +523,52 @@ void finish() {
     if (g_options.enabled && g_options.backend == Backend::OpenGL) drain_worker();
 }
 
+namespace {
+
+// One command on its way to the GL worker (emulation thread).
+void forward_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset) {
+    const std::uint32_t op = word >> 24u;
+    const std::uint32_t data = word & 0x00FFFFFFu;
+    g_commands[op] = word;
+    if (op == 0xEAu) {
+        gl::emulation_phase = 6u;
+        Transfer transfer = snapshot_transfer(memory, data);
+        if ((transfer.destination & 0x0F000000u) == 0x04000000u) {
+            // Into VRAM, which only the GE reads: replay in command order.
+            g_pending.push_back({word, static_cast<std::uint32_t>(g_pending_transfers.size()), UINT32_MAX});
+            g_pending_transfers.push_back(std::move(transfer));
+            return;
+        }
+        apply_transfer(memory, transfer);  // guest RAM: stays synchronous
+    }
+    if (!forwarded(op, word)) return;
+    if (g_async) {
+        // The worker may draw this list while the game builds the next one.
+        const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
+        if (record != UINT32_MAX) {
+            g_pending.push_back({word, record, UINT32_MAX});
+            return;
+        }
+    }
+    g_pending.push_back({word, base, offset});
+    if (op == 0x0Cu) submit_pending();  // END: hand the list to the worker
+}
+
+} // namespace
+
+void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count, std::uint32_t base,
+                 std::uint32_t offset) {
+    if (!g_options.enabled || g_options.backend != Backend::OpenGL) return;
+    g_memory = &memory;
+    gl::emulation_phase = 2u;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::uint32_t word;
+        std::memcpy(&word, words + i * 4u, 4u);
+        forward_command(memory, word, base, offset);
+    }
+    gl::emulation_phase = 1u;
+}
+
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset) {
     (void)pc;
@@ -531,33 +577,10 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
     const std::uint32_t data = word & 0x00FFFFFFu;
     g_commands[op] = word;
     if (g_options.backend == Backend::OpenGL) {
-        struct Phase {
-            Phase() { gl::emulation_phase = 2u; }
-            ~Phase() { gl::emulation_phase = 1u; }
-        } phase;
         g_memory = &memory;
-        if (op == 0xEAu) {
-            gl::emulation_phase = 6u;
-            Transfer transfer = snapshot_transfer(memory, data);
-            if ((transfer.destination & 0x0F000000u) == 0x04000000u) {
-                // Into VRAM, which only the GE reads: replay in command order.
-                g_pending.push_back({word, static_cast<std::uint32_t>(g_pending_transfers.size()), UINT32_MAX});
-                g_pending_transfers.push_back(std::move(transfer));
-                return;
-            }
-            apply_transfer(memory, transfer);  // guest RAM: stays synchronous
-        }
-        if (!forwarded(op, word)) return;
-        if (g_async) {
-            // The worker may draw this list while the game builds the next one.
-            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
-            if (record != UINT32_MAX) {
-                g_pending.push_back({word, record, UINT32_MAX});
-                return;
-            }
-        }
-        g_pending.push_back({word, base, offset});
-        if (op == 0x0Cu) submit_pending();  // END: hand the list to the worker
+        gl::emulation_phase = 2u;
+        forward_command(memory, word, base, offset);
+        gl::emulation_phase = 1u;
         return;
     }
 #if defined(BURNOUT_GE_SOFTWARE)
