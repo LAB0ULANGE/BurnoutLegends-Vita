@@ -511,9 +511,7 @@ void flush() {
     const bool textured = !clear_mode && (cmd(0x1Eu) & 1u) != 0u;
     if (textured) {
         glActiveTexture(GL_TEXTURE0);
-        const double texture_started = host_now_ms();
         const auto texmap = bind_texture(*g_memory);
-        g_stats.texture_ms += host_now_ms() - texture_started;
         glUniform4f(g_program.texmap, texmap[0], texmap[1], texmap[2], texmap[3]);
         glUniform1i(g_program.texture, 0);
     }
@@ -839,6 +837,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         Vertex &out = vertices[i];
         std::memcpy(out.position, d.position, sizeof(out.position));
         out.color = lit ? light(d, lighting) : d.color;
+        g_stats.lit_vertices += lit ? 1u : 0u;
         out.texcoord[2] = 1.0f;
         if (through) {
             out.texcoord[0] = d.texcoord[0] / texture_width;
@@ -971,11 +970,7 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
     case 0x02u: g_index_address = address(); break;
     case 0x04u:
         ++g_stats.primitives;
-        {
-            const double started = host_now_ms();
-            decode_prim(memory, data);
-            g_stats.decode_ms += host_now_ms() - started;
-        }
+        decode_prim(memory, data);
         break;
     case 0x3Au: g_world_cursor = data & 0xFu; break;
     case 0x3Bu: if (g_world_cursor < 12u) g_world[g_world_cursor++] = float24(data); break;
@@ -1090,11 +1085,13 @@ void present(std::uint32_t address) {
         const double n = static_cast<double>(g_stats.frames - last.frames);
         char line[256];
         std::snprintf(line, sizeof(line),
-                      "frame %llu: %.1f ms/frame wall, decode %.1f, draw %.1f (textures %.1f), present %.1f; %.0f PRIM, %.0f batches, %.0f vertices, %llu texture uploads",
-                      static_cast<unsigned long long>(g_stats.frames), (wall - last_wall) / n, (g_stats.decode_ms - last.decode_ms) / n,
-                      (g_stats.draw_ms - last.draw_ms) / n, (g_stats.texture_ms - last.texture_ms) / n,
-                      (g_stats.present_ms - last.present_ms) / n, static_cast<double>(g_stats.primitives - last.primitives) / n,
+                      "frame %llu: %.1f ms/frame wall, decode %.1f, draw %.1f, present %.1f, idle %.1f; %.0f PRIM, %.0f batches, %.0f vertices (%.0f lit), %llu texture uploads",
+                      static_cast<unsigned long long>(g_stats.frames), (wall - last_wall) / n,
+                      (g_stats.list_ms - last.list_ms - (g_stats.draw_ms - last.draw_ms)) / n, (g_stats.draw_ms - last.draw_ms) / n,
+                      (g_stats.present_ms - last.present_ms) / n, (g_stats.idle_ms - last.idle_ms) / n,
+                      static_cast<double>(g_stats.primitives - last.primitives) / n,
                       static_cast<double>(g_stats.batches - last.batches) / n, static_cast<double>(g_stats.vertices - last.vertices) / n,
+                      static_cast<double>(g_stats.lit_vertices - last.lit_vertices) / n,
                       static_cast<unsigned long long>(g_stats.texture_uploads - last.texture_uploads));
         trace(line);
         last = g_stats;
@@ -1147,5 +1144,10 @@ bool read_frame(std::uint32_t address, std::vector<std::uint8_t> &rgb) {
 }
 
 const Stats &stats() noexcept { return g_stats; }
+
+void account(double list_ms, double idle_ms) noexcept {
+    g_stats.list_ms += list_ms;
+    g_stats.idle_ms += idle_ms;
+}
 
 } // namespace burnout::gl

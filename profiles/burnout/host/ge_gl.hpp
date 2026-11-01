@@ -41,10 +41,15 @@ void present(std::uint32_t address);
 bool read_frame(std::uint32_t address, std::vector<std::uint8_t> &rgb);
 
 struct Stats {
-    std::uint64_t primitives{}, batches{}, vertices{}, skipped_primitives{};
+    std::uint64_t primitives{}, batches{}, vertices{}, skipped_primitives{}, lit_vertices{};
     std::uint64_t texture_uploads{}, render_targets{}, frames{};
-    double decode_ms{}, draw_ms{}, texture_ms{}, present_ms{};
+    // Reading the clock is a system call on the Vita, so it is not done per
+    // PRIM: list_ms covers whole command lists (decode plus draw), draw_ms
+    // the GL submission inside them.
+    double list_ms{}, draw_ms{}, present_ms{}, idle_ms{};
 };
 [[nodiscard]] const Stats &stats() noexcept;
+// Time the caller spent on a command list / waiting for work (for stats()).
+void account(double list_ms, double idle_ms) noexcept;
 
 } // namespace burnout::gl

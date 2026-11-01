@@ -192,9 +192,11 @@ int main() {
     const SceUID awake = sceKernelCreateThread("keep_awake", keep_awake, 0x10000100, 0x1000, 0, 0, nullptr);
     if (awake >= 0) sceKernelStartThread(awake, 0, nullptr);
 
-#if defined(BURNOUT_VITA_PROFILE)
-    // Keep the emulation thread off the sampler's core.
+#if defined(BURNOUT_VITA_PROFILE) || defined(BURNOUT_VITA_GL)
+    // Keep the emulation thread on core 0, off the sampler's or GL worker's core.
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
+#endif
+#if defined(BURNOUT_VITA_PROFILE)
     const SceUID profiler = sceKernelCreateThread("profiler", profiler_thread, 0x10000100, 0x10000, 0,
                                                   SCE_KERNEL_CPU_MASK_USER_2, nullptr);
     if (profiler >= 0) sceKernelStartThread(profiler, 0, nullptr);

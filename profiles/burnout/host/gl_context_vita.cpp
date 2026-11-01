@@ -32,6 +32,9 @@ bool create_context(std::string &error) {
         trace("vitaGL initialised (resolution fell back)");
     else
         trace("vitaGL initialised");
+    // The emulation paces itself on PSP vblanks; waiting for the Vita's vblank
+    // in the swap only stalls the worker.
+    vglWaitVblankStart(GL_FALSE);
     return true;
 }
 

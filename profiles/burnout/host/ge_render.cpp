@@ -257,6 +257,7 @@ void worker_loop() {
     }
     for (;;) {
         Job job;
+        const double waiting = host_now_ms();
         {
             std::unique_lock lock(g_jobs_mutex);
             g_jobs_cv.wait(lock, [] { return !g_jobs.empty(); });
@@ -264,6 +265,7 @@ void worker_loop() {
             g_jobs.pop_front();
             g_worker_busy = true;
         }
+        const double started = host_now_ms();
         switch (job.kind) {
         case Job::Kind::Commands:
             for (const auto &c : job.commands) {
@@ -282,8 +284,10 @@ void worker_loop() {
                 gl::ge_command(*g_memory, c[0], c[1], c[2]);
                 if (snapshot) gl::use_snapshot(nullptr);
             }
+            gl::account(host_now_ms() - started, started - waiting);
             break;
         case Job::Kind::Present:
+            gl::account(0.0, started - waiting);
             gl::present(job.address);
             break;
         case Job::Kind::Capture: {
@@ -302,8 +306,15 @@ void worker_loop() {
 #if defined(__vita__)
 void *worker_entry(void *) {
     // Core 1: core 0 runs the emulation.
-    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
-    gl::trace("worker started");
+    const int affinity = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
+    char line[96];
+    std::snprintf(line, sizeof(line), "worker started (core 1 affinity 0x%x, priority %d)", affinity,
+                  sceKernelGetThreadCurrentPriority());
+    gl::trace(line);
+    const double before = host_now_ms();
+    for (int i = 0; i < 10000; ++i) host_now_ms();
+    std::snprintf(line, sizeof(line), "clock read costs %.2f us", (host_now_ms() - before) / 10.0);
+    gl::trace(line);
     worker_loop();
     return nullptr;
 }
@@ -559,8 +570,8 @@ std::string report() {
         out << "GE OpenGL render: " << s.primitives << " PRIM in " << s.batches << " batches (" << s.vertices
             << " vertices, " << s.skipped_primitives << " PRIM skipped), " << s.texture_uploads << " texture uploads, "
             << s.render_targets << " render targets, " << s.frames << " frames, " << g_captures << " captures\n"
-            << "GE OpenGL time: decode " << s.decode_ms / 1000.0 << " s, draw " << s.draw_ms / 1000.0 << " s (textures "
-            << s.texture_ms / 1000.0 << " s), present " << s.present_ms / 1000.0 << " s\n";
+            << "GE OpenGL time: decode " << (s.list_ms - s.draw_ms) / 1000.0 << " s, draw " << s.draw_ms / 1000.0
+            << " s, present " << s.present_ms / 1000.0 << " s, idle " << s.idle_ms / 1000.0 << " s\n";
     }
     out << "GE software render: " << g_primitives << " PRIM, " << g_failures << " failed"
         << (g_first_error.empty() ? "" : " (first: " + g_first_error + ")") << ", " << g_render_ms / 1000.0
