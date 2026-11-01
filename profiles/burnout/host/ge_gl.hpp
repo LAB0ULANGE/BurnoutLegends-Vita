@@ -3,6 +3,7 @@
 #include "psprecomp/guest_memory.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -16,7 +17,11 @@ namespace burnout::gl {
 // Every PSP render target becomes a framebuffer object; a texture whose
 // address is a render target samples that object.
 
+// Starts the GL thread, which creates the context and replays what the draw
+// path records (see ge_gl.cpp).
 bool initialize(std::string &error);
+// Waits until the GL thread has replayed everything recorded so far.
+void finish();
 
 // What the worker is doing, for a sampling thread (bring-up profiling):
 // 0 other, 1-5 PRIM (setup, indices, checks, vertex copy, index emit),
@@ -51,15 +56,17 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
 void use_snapshot(const Snapshot *snapshot, std::uint32_t record);
 // The command list ends and its snapshot goes away: draws what still points
 // into it.
-void end_list();
+void end_list(Snapshot &&snapshot);
 // GE block transfer just copied guest memory into [address, address + size).
 void invalidate_textures(std::uint32_t address, std::uint32_t size);
 
 // sceDisplaySetFrameBuf: flushes pending draws and shows `address` on the
 // Vita screen.
 void present(std::uint32_t address);
-// RGB888 copy of the 480x272 visible part of the render target at `address`.
-bool read_frame(std::uint32_t address, std::vector<std::uint8_t> &rgb);
+// RGB888 copy of the 480x272 visible part of the render target at `address`,
+// handed to `done` on the GL thread once the frame so far has been drawn
+// (empty if there is no such target).
+void capture(std::uint32_t address, std::function<void(std::vector<std::uint8_t> &rgb)> done);
 
 struct Stats {
     std::uint64_t primitives{}, batches{}, vertices{}, skipped_primitives{}, lit_vertices{};

@@ -33,6 +33,9 @@ void configure(const Options &options);
 [[nodiscard]] bool active() noexcept;
 // Emulation-thread time spent walking display lists (ge_scan with the hooks).
 void account_scan(double ms) noexcept;
+// Waits until everything queued has been drawn. Called before guest memory
+// goes away: the GL thread reads vertices from it.
+void finish();
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset);

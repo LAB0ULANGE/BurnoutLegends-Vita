@@ -2,6 +2,9 @@
 
 #include "burnout_hle.hpp"
 #include "workload_stats.hpp"
+#if defined(BURNOUT_GE_RENDER)
+#include "ge_render.hpp"
+#endif
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/elf32.hpp"
@@ -143,6 +146,9 @@ BenchResult run_benchmark(const BenchOptions &options) {
               << ", entry " << psprecomp::hex32(elf.runtime_entry()) << ", arena "
               << psprecomp::hex32(static_cast<std::uint32_t>(image_end)) << std::endl;
     runtime.run(elf.runtime_entry(), UINT64_MAX);
+#if defined(BURNOUT_GE_RENDER)
+    render::finish();
+#endif
 
     BenchResult result;
     result.host_seconds = (host_now_ms() - started) / 1000.0;

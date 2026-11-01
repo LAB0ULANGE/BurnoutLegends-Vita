@@ -6,12 +6,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#include <pthread.h>
+#endif
 
 namespace burnout::gl {
 
@@ -344,8 +355,56 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
     return true;
 }
 
+// ---------------------------------------------------------------- GL thread
+//
+// The draw path runs on the decode thread and only records GL work into a
+// Frame; the GL thread, which owns the context, replays it. Translating the
+// GE commands and submitting to vitaGL then run on two cores at once.
+// Textures and render targets are named by ids the decode thread assigns;
+// the GL thread creates the objects on first use.
+
+enum class Op : std::uint32_t {
+    Enable, Disable, BlendFunc, BlendEquation, DepthFunc, DepthMask, ColorMask, FrontFace, Scissor, Viewport,
+    UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, Uniform4, UniformMatrix, Draw, CreateTarget,
+    Present, Capture
+};
+
+// One vertex attribute of a Draw: an array in the batch, or a constant.
+struct AttribSetup {
+    std::int32_t size{};  // 0: constant
+    GLenum type{};
+    std::uint32_t normalized{}, offset{};
+    float constant[4]{};
+};
+
+struct Frame {
+    std::vector<std::uint32_t> ops;
+    std::vector<std::uint8_t> data;                 // payloads, 8-byte aligned
+    std::vector<std::vector<std::uint8_t>> blobs;   // texture images
+    std::vector<Snapshot> snapshots;                // in-place vertices point into these
+    std::vector<std::function<void(std::vector<std::uint8_t> &)>> captures;
+};
+
+Frame g_frame;  // being recorded by the decode thread
+
+void record(Op op, std::initializer_list<std::uint32_t> args = {}) {
+    g_frame.ops.push_back(static_cast<std::uint32_t>(op));
+    g_frame.ops.insert(g_frame.ops.end(), args.begin(), args.end());
+}
+
+std::uint32_t record_data(const void *bytes, std::size_t size) {
+    const std::size_t at = (g_frame.data.size() + 7u) & ~std::size_t{7u};
+    g_frame.data.resize(at + size);
+    if (size != 0u) std::memcpy(g_frame.data.data() + at, bytes, size);
+    return static_cast<std::uint32_t>(at);
+}
+
+std::uint32_t float_bits(float value) { return std::bit_cast<std::uint32_t>(value); }
+
+GLuint g_next_texture_id{1u}, g_next_framebuffer_id{1u};
+
 // GL state of the draw path, so unchanged state is not sent again (vitaGL
-// does work on every call). present(), read_frame() and render target
+// does work on every call). present(), capture() and render target
 // creation change state behind it and call forget_state().
 struct GlState {
     GLuint framebuffer{~0u}, program{~0u}, texture{~0u};
@@ -361,31 +420,30 @@ void forget_state() { g_state = GlState{}; }
 void set_capability(GLenum cap, int &cached, bool on) {
     if (cached == static_cast<int>(on)) return;
     cached = on ? 1 : 0;
-    if (on) glEnable(cap);
-    else glDisable(cap);
+    record(on ? Op::Enable : Op::Disable, {cap});
 }
 
 void set_blend_func(GLenum src, GLenum dst) {
     if (g_state.blend_src == src && g_state.blend_dst == dst) return;
     g_state.blend_src = src;
     g_state.blend_dst = dst;
-    glBlendFunc(src, dst);
+    record(Op::BlendFunc, {src, dst});
 }
 
 void set_blend_equation(GLenum equation) {
     if (g_state.blend_equation == equation) return;
     g_state.blend_equation = equation;
-    glBlendEquation(equation);
+    record(Op::BlendEquation, {equation});
 }
 
 void set_depth(GLenum func, bool write) {
     if (g_state.depth_func != func) {
         g_state.depth_func = func;
-        glDepthFunc(func);
+        record(Op::DepthFunc, {func});
     }
     if (g_state.depth_mask != static_cast<int>(write)) {
         g_state.depth_mask = write ? 1 : 0;
-        glDepthMask(write ? GL_TRUE : GL_FALSE);
+        record(Op::DepthMask, {write ? 1u : 0u});
     }
 }
 
@@ -393,13 +451,13 @@ void set_color_mask(bool rgb, bool alpha) {
     const int mask = (rgb ? 1 : 0) | (alpha ? 2 : 0);
     if (g_state.color_mask == mask) return;
     g_state.color_mask = mask;
-    glColorMask(rgb, rgb, rgb, alpha);
+    record(Op::ColorMask, {rgb ? 1u : 0u, alpha ? 1u : 0u});
 }
 
 void bind_texture_object(GLuint name) {
     if (g_state.texture == name) return;
     g_state.texture = name;
-    glBindTexture(GL_TEXTURE_2D, name);
+    record(Op::BindTexture, {name});
 }
 
 // Sampler parameters live in the texture object: only set when they change.
@@ -410,7 +468,7 @@ void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v) 
     for (int i = 0; i < 4; ++i)
         if (current[i] != wanted[i]) {
             current[i] = wanted[i];
-            glTexParameteri(GL_TEXTURE_2D, names[i], wanted[i]);
+            record(Op::TexParameter, {names[i], static_cast<std::uint32_t>(wanted[i])});
         }
 }
 
@@ -424,31 +482,15 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     if (!inserted) return target;
     target.width = static_cast<int>(std::max<std::uint32_t>(stride, 64u));
     target.height = 272;
-    glGenTextures(1, &target.texture);
-    glBindTexture(GL_TEXTURE_2D, target.texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, target.width, target.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glGenRenderbuffers(1, &target.depth);
-    glBindRenderbuffer(GL_RENDERBUFFER, target.depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, target.width, target.height);
-    glGenFramebuffers(1, &target.framebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture, 0);
-#if defined(__vita__)
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, target.depth);
-#else
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth);
-#endif
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-    glClearDepth(0.0);
-    glDisable(GL_SCISSOR_TEST);
-    glDepthMask(GL_TRUE);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    target.texture = g_next_texture_id++;
+    target.framebuffer = g_next_framebuffer_id++;
+    record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
+                              static_cast<std::uint32_t>(target.height)});
+    // The GL thread binds and clears it, and sets its sampling.
     forget_state();
+    for (GLint &value : target.sampling) value = -1;
+    target.sampling[0] = target.sampling[1] = GL_LINEAR;
+    target.sampling[2] = target.sampling[3] = GL_CLAMP_TO_EDGE;
     ++g_stats.render_targets;
     return target;
 }
@@ -537,7 +579,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     Texture &texture = g_textures[key];
     const bool fresh = texture.name == 0u;
     if (fresh) {
-        glGenTextures(1, &texture.name);
+        texture.name = g_next_texture_id++;
         texture.address = address;
         texture.bytes = bytes;
     }
@@ -582,8 +624,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                     std::memcpy(out, c.data(), 4u);
                 }
             }
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size())});
+            g_frame.blobs.push_back(std::move(rgba));
             ++g_stats.texture_uploads;
         }
     }
@@ -678,15 +720,19 @@ bool uniform_changed(GLint location, const float *values, std::size_t count) {
 
 void uniform4(GLint location, float x, float y, float z, float w) {
     const float values[4]{x, y, z, w};
-    if (uniform_changed(location, values, 4u)) glUniform4f(location, x, y, z, w);
+    if (uniform_changed(location, values, 4u))
+        record(Op::Uniform4, {static_cast<std::uint32_t>(location), 1u, record_data(values, sizeof(values))});
 }
 
 void uniform4v(GLint location, const float *values, int count) {
-    if (uniform_changed(location, values, static_cast<std::size_t>(count) * 4u)) glUniform4fv(location, count, values);
+    if (uniform_changed(location, values, static_cast<std::size_t>(count) * 4u))
+        record(Op::Uniform4, {static_cast<std::uint32_t>(location), static_cast<std::uint32_t>(count),
+                              record_data(values, static_cast<std::size_t>(count) * 4u * sizeof(float))});
 }
 
 void uniform_matrix(GLint location, const float *values) {
-    if (uniform_changed(location, values, 16u)) glUniformMatrix4fv(location, 1, GL_FALSE, values);
+    if (uniform_changed(location, values, 16u))
+        record(Op::UniformMatrix, {static_cast<std::uint32_t>(location), record_data(values, 16u * sizeof(float))});
 }
 
 // PSP 4x3 row-vector matrix (v * M) as a GL matrix: stored row-major, it is
@@ -738,16 +784,16 @@ void flush() {
     RenderTarget &target = render_target(target_key(address), stride);
     if (g_state.framebuffer != target.framebuffer) {
         g_state.framebuffer = target.framebuffer;
-        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+        record(Op::BindFramebuffer, {target.framebuffer});
     }
     if (g_state.viewport_w != target.width || g_state.viewport_h != target.height) {
         g_state.viewport_w = target.width;
         g_state.viewport_h = target.height;
-        glViewport(0, 0, target.width, target.height);
+        record(Op::Viewport, {static_cast<std::uint32_t>(target.width), static_cast<std::uint32_t>(target.height)});
     }
     if (g_state.program != g_program.id) {
         g_state.program = g_program.id;
-        glUseProgram(g_program.id);
+        record(Op::UseProgram, {g_program.id});
     }
 
     const bool clear_mode = (cmd(0xD3u) & 1u) != 0u;
@@ -791,7 +837,8 @@ void flush() {
     const int scissor[4]{x1, target.height - (y2 + 1), std::max(0, x2 - x1 + 1), std::max(0, y2 - y1 + 1)};
     if (std::memcmp(scissor, g_state.scissor, sizeof(scissor)) != 0) {
         std::memcpy(g_state.scissor, scissor, sizeof(scissor));
-        glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+        record(Op::Scissor, {static_cast<std::uint32_t>(scissor[0]), static_cast<std::uint32_t>(scissor[1]),
+                             static_cast<std::uint32_t>(scissor[2]), static_cast<std::uint32_t>(scissor[3])});
     }
 
     if (clear_mode) {
@@ -818,27 +865,13 @@ void flush() {
             const GLenum front = (cmd(0x9Bu) & 1u) != 0u ? GL_CW : GL_CCW;  // y is flipped on the way to GL
             if (g_state.front_face != front) {
                 g_state.front_face = front;
-                glFrontFace(front);
+                record(Op::FrontFace, {front});
             }
         }
     }
 
     phase = 9u;
     bind_vertices();
-    phase = 10u;
-    const void *indices = g_batch_indices.data();
-#if defined(__vita__)
-    const std::size_t index_bytes = g_batch_indices.size() * sizeof(std::uint16_t);
-    if (void *gpu = vglAllocFromScratch(index_bytes)) {
-        std::memcpy(gpu, indices, index_bytes);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_index_buffer);
-        vglBufferData(GL_ELEMENT_ARRAY_BUFFER, gpu);
-        indices = nullptr;
-    } else {
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    }
-#endif
-    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(g_batch_indices.size()), GL_UNSIGNED_SHORT, indices);
     ++g_stats.batches;
     g_stats.vertices += g_batch_count;
     g_batch.clear();
@@ -1040,54 +1073,42 @@ void upload_vertex_state(bool through) {
     }
 }
 
+// Records the batch as one Draw: vertex source, attribute layout, indices.
 void bind_vertices() {
     const std::uint32_t vtype = g_batch_vtype;
     const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
-    const auto stride = static_cast<GLsizei>(g_layout.stride);
-    const std::uint8_t *source = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
-    std::uintptr_t base = reinterpret_cast<std::uintptr_t>(source);
-#if defined(__vita__)
-    // One copy into GPU-visible scratch memory, wrapped as a vertex buffer:
-    // vitaGL then draws from it instead of copying every attribute stream.
-    const std::size_t bytes = static_cast<std::size_t>(g_batch_count) * g_layout.stride;
-    if (void *gpu = vglAllocFromScratch(bytes)) {
-        std::memcpy(gpu, source, bytes);
-        glBindBuffer(GL_ARRAY_BUFFER, g_vertex_buffer);
-        vglBufferData(GL_ARRAY_BUFFER, gpu);
-        base = 0u;
-    } else {
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-    }
-#endif
-    const auto at = [&](std::uint32_t offset) { return reinterpret_cast<const void *>(base + offset); };
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, component_type(pos, true), GL_FALSE, stride, at(g_layout.pos));
-    if (tc != 0u) {
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, component_type(tc, false), GL_FALSE, stride, at(g_layout.tc));
-    } else {
-        glDisableVertexAttribArray(1);
-        glVertexAttrib4f(1, 0.0f, 0.0f, 0.0f, 1.0f);
-    }
+    std::array<AttribSetup, 4> attribs{};
+    attribs[0] = {3, component_type(pos, true), 0u, g_layout.pos, {}};
+    if (tc != 0u) attribs[1] = {2, component_type(tc, false), 0u, g_layout.tc, {}};
+    else attribs[1] = {0, 0u, 0u, 0u, {0.0f, 0.0f, 0.0f, 1.0f}};
     if (col == 7u) {
-        glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, at(g_layout.col));
+        attribs[2] = {4, GL_UNSIGNED_BYTE, 1u, g_layout.col, {}};
     } else if (col >= 4u) {
-        glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 1, GL_UNSIGNED_SHORT, GL_FALSE, stride, at(g_layout.col));
+        attribs[2] = {1, GL_UNSIGNED_SHORT, 0u, g_layout.col, {}};
     } else {
         // No vertex colour: the material ambient colour.
-        glDisableVertexAttribArray(2);
         const auto ambient = rgb_command(0x55u, static_cast<float>(cmd(0x58u) & 0xFFu) / 255.0f);
-        glVertexAttrib4f(2, ambient[0], ambient[1], ambient[2], ambient[3]);
+        attribs[2] = {0, 0u, 0u, 0u, {ambient[0], ambient[1], ambient[2], ambient[3]}};
     }
-    if (nrm != 0u) {
-        glEnableVertexAttribArray(3);
-        glVertexAttribPointer(3, 3, component_type(nrm, true), GL_FALSE, stride, at(g_layout.nrm));
+    if (nrm != 0u) attribs[3] = {3, component_type(nrm, true), 0u, g_layout.nrm, {}};
+    else attribs[3] = {0, 0u, 0u, 0u, {0.0f, 0.0f, 1.0f, 1.0f}};
+
+    // In-place vertices stay where they are (the frame keeps their snapshot;
+    // static ones are guest memory); a copied batch goes into the frame.
+    const std::size_t bytes = static_cast<std::size_t>(g_batch_count) * g_layout.stride;
+    std::uint32_t in_frame = 1u;
+    std::uint32_t source = 0u;
+    if (g_batch_in_place != nullptr) {
+        in_frame = 0u;
+        const auto pointer = reinterpret_cast<std::uintptr_t>(g_batch_in_place);
+        source = record_data(&pointer, sizeof(pointer));
     } else {
-        glDisableVertexAttribArray(3);
-        glVertexAttrib4f(3, 0.0f, 0.0f, 1.0f, 1.0f);
+        source = record_data(g_batch.data(), bytes);
     }
+    record(Op::Draw, {in_frame, source, static_cast<std::uint32_t>(bytes), g_layout.stride,
+                      record_data(attribs.data(), sizeof(attribs)),
+                      record_data(g_batch_indices.data(), g_batch_indices.size() * sizeof(std::uint16_t)),
+                      static_cast<std::uint32_t>(g_batch_indices.size())});
 }
 
 // Snapshot record: header, then the index bytes (a LOAD_CLUT record keeps the
@@ -1285,6 +1306,265 @@ bool batch_neutral(std::uint32_t op) noexcept {
     }
 }
 
+// ---------------------------------------------------------------- GL thread side
+
+struct GlThread {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Frame> frames;
+    bool busy{}, ready{}, ok{};
+    std::string error;
+} g_gl;
+
+std::vector<GLuint> g_gl_textures, g_gl_framebuffers;  // GL names by id (GL thread)
+std::atomic<double> g_gl_busy_ms{0.0}, g_gl_present_ms{0.0};
+
+GLuint gl_texture(GLuint id) {
+    if (id >= g_gl_textures.size()) g_gl_textures.resize(id + 1u, 0u);
+    if (g_gl_textures[id] == 0u) glGenTextures(1, &g_gl_textures[id]);
+    return g_gl_textures[id];
+}
+
+void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int height) {
+    const GLuint texture = gl_texture(texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    GLuint depth = 0u, framebuffer = 0u;
+    glGenRenderbuffers(1, &depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+#if defined(__vita__)
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depth);
+#else
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+#endif
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClearDepth(0.0);
+    glDisable(GL_SCISSOR_TEST);
+    glDepthMask(GL_TRUE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (framebuffer_id >= g_gl_framebuffers.size()) g_gl_framebuffers.resize(framebuffer_id + 1u, 0u);
+    g_gl_framebuffers[framebuffer_id] = framebuffer;
+}
+
+void draw(const Frame &frame, const std::uint32_t *a) {
+    const std::uint32_t in_frame = a[0], source = a[1], bytes = a[2], stride = a[3], attribs_at = a[4];
+    const std::uint32_t indices_at = a[5], index_count = a[6];
+    const std::uint8_t *vertices = frame.data.data() + source;
+    if (in_frame == 0u) {
+        std::uintptr_t pointer;
+        std::memcpy(&pointer, vertices, sizeof(pointer));
+        vertices = reinterpret_cast<const std::uint8_t *>(pointer);
+    }
+    std::array<AttribSetup, 4> attribs;
+    std::memcpy(attribs.data(), frame.data.data() + attribs_at, sizeof(attribs));
+    const void *indices = frame.data.data() + indices_at;
+    std::uintptr_t base = reinterpret_cast<std::uintptr_t>(vertices);
+#if defined(__vita__)
+    // One copy into GPU-visible scratch memory, wrapped as a vertex buffer:
+    // vitaGL then draws from it instead of copying every attribute stream.
+    if (void *gpu = vglAllocFromScratch(bytes)) {
+        std::memcpy(gpu, vertices, bytes);
+        glBindBuffer(GL_ARRAY_BUFFER, g_vertex_buffer);
+        vglBufferData(GL_ARRAY_BUFFER, gpu);
+        base = 0u;
+    } else {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+    const std::size_t index_bytes = index_count * sizeof(std::uint16_t);
+    if (void *gpu = vglAllocFromScratch(index_bytes)) {
+        std::memcpy(gpu, indices, index_bytes);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_index_buffer);
+        vglBufferData(GL_ELEMENT_ARRAY_BUFFER, gpu);
+        indices = nullptr;
+    } else {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
+#else
+    (void)bytes;
+#endif
+    for (GLuint i = 0; i < 4u; ++i) {
+        const AttribSetup &setup = attribs[i];
+        if (setup.size == 0) {
+            glDisableVertexAttribArray(i);
+            glVertexAttrib4f(i, setup.constant[0], setup.constant[1], setup.constant[2], setup.constant[3]);
+        } else {
+            glEnableVertexAttribArray(i);
+            glVertexAttribPointer(i, setup.size, setup.type, setup.normalized != 0u ? GL_TRUE : GL_FALSE,
+                                  static_cast<GLsizei>(stride), reinterpret_cast<const void *>(base + setup.offset));
+        }
+    }
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+}
+
+void present_target(GLuint texture_id, int width) {
+#if defined(__vita__)
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, 960, 544);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    if (texture_id != 0u) {
+        const float u = 480.0f / static_cast<float>(width);
+        const float quad[16]{-1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, u, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
+        glUseProgram(g_present.id);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, gl_texture(texture_id));
+        glUniform1i(g_present.texture, 0);
+        glDisableVertexAttribArray(2);
+        glDisableVertexAttribArray(3);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glEnableVertexAttribArray(0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    swap_buffers();
+#else
+    (void)texture_id;
+    (void)width;
+#endif
+}
+
+void capture_target(GLuint framebuffer_id, int height, const std::function<void(std::vector<std::uint8_t> &)> &done) {
+    std::vector<std::uint8_t> rgb;
+    if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
+        glBindFramebuffer(GL_FRAMEBUFFER, g_gl_framebuffers[framebuffer_id]);
+        std::vector<std::uint8_t> rgba(480u * 272u * 4u);
+        glReadPixels(0, height - 272, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        rgb.resize(480u * 272u * 3u);
+        for (std::uint32_t y = 0; y < 272u; ++y)
+            for (std::uint32_t x = 0; x < 480u; ++x)
+                for (int c = 0; c < 3; ++c) rgb[(y * 480u + x) * 3u + c] = rgba[((271u - y) * 480u + x) * 4u + c];
+    }
+    done(rgb);
+}
+
+void replay(const Frame &frame) {
+    const std::uint32_t *op = frame.ops.data();
+    const std::uint32_t *end = op + frame.ops.size();
+    const auto floats = [&](std::uint32_t at) { return reinterpret_cast<const float *>(frame.data.data() + at); };
+    while (op < end) {
+        switch (static_cast<Op>(*op++)) {
+        case Op::Enable: glEnable(op[0]); op += 1; break;
+        case Op::Disable: glDisable(op[0]); op += 1; break;
+        case Op::BlendFunc: glBlendFunc(op[0], op[1]); op += 2; break;
+        case Op::BlendEquation: glBlendEquation(op[0]); op += 1; break;
+        case Op::DepthFunc: glDepthFunc(op[0]); op += 1; break;
+        case Op::DepthMask: glDepthMask(op[0] != 0u ? GL_TRUE : GL_FALSE); op += 1; break;
+        case Op::ColorMask: {
+            const GLboolean rgb = op[0] != 0u ? GL_TRUE : GL_FALSE;
+            glColorMask(rgb, rgb, rgb, op[1] != 0u ? GL_TRUE : GL_FALSE);
+            op += 2;
+            break;
+        }
+        case Op::FrontFace: glFrontFace(op[0]); op += 1; break;
+        case Op::Scissor:
+            glScissor(static_cast<GLint>(op[0]), static_cast<GLint>(op[1]), static_cast<GLsizei>(op[2]), static_cast<GLsizei>(op[3]));
+            op += 4;
+            break;
+        case Op::Viewport: glViewport(0, 0, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1])); op += 2; break;
+        case Op::UseProgram: glUseProgram(op[0]); op += 1; break;
+        case Op::BindFramebuffer:
+            glBindFramebuffer(GL_FRAMEBUFFER, op[0] < g_gl_framebuffers.size() ? g_gl_framebuffers[op[0]] : 0u);
+            op += 1;
+            break;
+        case Op::BindTexture: glBindTexture(GL_TEXTURE_2D, gl_texture(op[0])); op += 1; break;
+        case Op::TexParameter: glTexParameteri(GL_TEXTURE_2D, op[0], static_cast<GLint>(op[1])); op += 2; break;
+        case Op::TexImage:
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
+            op += 3;
+            break;
+        case Op::Uniform4: glUniform4fv(static_cast<GLint>(op[0]), static_cast<GLsizei>(op[1]), floats(op[2])); op += 3; break;
+        case Op::UniformMatrix: glUniformMatrix4fv(static_cast<GLint>(op[0]), 1, GL_FALSE, floats(op[1])); op += 2; break;
+        case Op::Draw: draw(frame, op); op += 7; break;
+        case Op::CreateTarget:
+            create_target(op[0], op[1], static_cast<int>(op[2]), static_cast<int>(op[3]));
+            op += 4;
+            break;
+        case Op::Present: {
+            const double started = host_now_ms();
+            present_target(op[0], static_cast<int>(op[1]));
+            g_gl_present_ms.store(g_gl_present_ms.load() + host_now_ms() - started);
+            op += 2;
+            break;
+        }
+        case Op::Capture: capture_target(op[0], static_cast<int>(op[1]), frame.captures[op[2]]); op += 3; break;
+        }
+    }
+}
+
+void gl_thread_main() {
+    {
+        std::string error;
+        bool ok = create_context(error);
+        if (ok) trace("compiling the draw shaders");
+        ok = ok && link(g_program, kVertexShader, kFragmentShader, false, error);
+        if (ok) trace("compiling the present shaders");
+        ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error);
+#if defined(__vita__)
+        if (ok) {
+            glGenBuffers(1, &g_vertex_buffer);
+            glGenBuffers(1, &g_index_buffer);
+        }
+#endif
+        std::lock_guard lock(g_gl.mutex);
+        g_gl.ready = true;
+        g_gl.ok = ok;
+        g_gl.error = error;
+        g_gl.cv.notify_all();
+        if (!ok) return;
+    }
+    for (;;) {
+        Frame frame;
+        {
+            std::unique_lock lock(g_gl.mutex);
+            g_gl.cv.wait(lock, [] { return !g_gl.frames.empty(); });
+            frame = std::move(g_gl.frames.front());
+            g_gl.frames.pop_front();
+            g_gl.busy = true;
+        }
+        const double started = host_now_ms();
+        replay(frame);
+        g_gl_busy_ms.store(g_gl_busy_ms.load() + host_now_ms() - started);
+        frame = Frame{};  // release snapshots and payloads before reporting idle
+        std::lock_guard lock(g_gl.mutex);
+        g_gl.busy = false;
+        g_gl.cv.notify_all();
+    }
+}
+
+#if defined(__vita__)
+void *gl_thread_entry(void *) {
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
+    trace("GL thread started (core 2)");
+    gl_thread_main();
+    return nullptr;
+}
+#endif
+
+// Hands the recorded frame to the GL thread (at most two wait there).
+void submit_frame() {
+    std::unique_lock lock(g_gl.mutex);
+    g_gl.cv.wait(lock, [] { return g_gl.frames.size() < 2u; });
+    g_gl.frames.push_back(std::move(g_frame));
+    g_frame = Frame{};
+    g_gl.cv.notify_all();
+}
+
 } // namespace
 
 void trace(const char *message) {
@@ -1294,18 +1574,36 @@ void trace(const char *message) {
 
 bool initialize(std::string &error) {
     trace("creating the context");
-    if (!create_context(error)) return false;
-    trace("compiling the draw shaders");
-    if (!link(g_program, kVertexShader, kFragmentShader, false, error)) return false;
-    trace("compiling the present shaders");
-    if (!link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error)) return false;
 #if defined(__vita__)
-    glGenBuffers(1, &g_vertex_buffer);
-    glGenBuffers(1, &g_index_buffer);
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 4 * 1024 * 1024);  // the shader compiler wants a large stack
+    pthread_t thread;
+    const int result = pthread_create(&thread, &attributes, gl_thread_entry, nullptr);
+    pthread_attr_destroy(&attributes);
+    if (result != 0) {
+        error = "pthread_create failed for the GL thread";
+        return false;
+    }
+    pthread_detach(thread);
+#else
+    std::thread(gl_thread_main).detach();
 #endif
+    std::unique_lock lock(g_gl.mutex);
+    g_gl.cv.wait(lock, [] { return g_gl.ready; });
+    if (!g_gl.ok) {
+        error = g_gl.error;
+        return false;
+    }
     trace("ready");
     g_commands.fill(0u);
     return true;
+}
+
+void finish() {
+    if (!g_frame.ops.empty()) submit_frame();
+    std::unique_lock lock(g_gl.mutex);
+    g_gl.cv.wait(lock, [] { return g_gl.frames.empty() && !g_gl.busy; });
 }
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset) {
@@ -1441,8 +1739,10 @@ void use_snapshot(const Snapshot *snapshot, std::uint32_t record) {
     g_snapshot_vertices = snapshot != nullptr ? snapshot->vertices.data() : nullptr;
 }
 
-void end_list() {
+void end_list(Snapshot &&snapshot) {
     if (g_batch_in_place != nullptr) flush();
+    // Recorded draws may point into it until the GL thread has replayed them.
+    if (!snapshot.vertices.empty()) g_frame.snapshots.push_back(std::move(snapshot));
 }
 
 void invalidate_textures(std::uint32_t address, std::uint32_t size) {
@@ -1463,72 +1763,43 @@ void present(std::uint32_t address) {
         // Per-frame averages since the previous line (worker thread time).
         static Stats last;
         static double last_wall = host_now_ms();
+        static double last_busy = 0.0, last_present = 0.0;
         const double wall = host_now_ms();
         const double n = static_cast<double>(g_stats.frames - last.frames);
         char line[256];
         std::snprintf(line, sizeof(line),
-                      "frame %llu: %.1f ms/frame wall, decode %.1f, draw %.1f, present %.1f, idle %.1f; %.0f PRIM, %.0f batches, %.0f vertices (%.0f lit), %llu texture uploads",
+                      "frame %llu: %.1f ms/frame wall, decode %.1f, record %.1f, present %.1f, idle %.1f; %.0f PRIM, %.0f batches, %.0f vertices (%.0f lit), %llu texture uploads",
                       static_cast<unsigned long long>(g_stats.frames), (wall - last_wall) / n,
                       (g_stats.list_ms - last.list_ms - (g_stats.draw_ms - last.draw_ms)) / n, (g_stats.draw_ms - last.draw_ms) / n,
-                      (g_stats.present_ms - last.present_ms) / n, (g_stats.idle_ms - last.idle_ms) / n,
+                      (g_gl_present_ms.load() - last_present) / n, (g_stats.idle_ms - last.idle_ms) / n,
                       static_cast<double>(g_stats.primitives - last.primitives) / n,
                       static_cast<double>(g_stats.batches - last.batches) / n, static_cast<double>(g_stats.vertices - last.vertices) / n,
                       static_cast<double>(g_stats.lit_vertices - last.lit_vertices) / n,
                       static_cast<unsigned long long>(g_stats.texture_uploads - last.texture_uploads));
         trace(line);
+        std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame", (g_gl_busy_ms.load() - last_busy) / n);
+        trace(line);
         last = g_stats;
         last_wall = wall;
+        last_busy = g_gl_busy_ms.load();
+        last_present = g_gl_present_ms.load();
     }
-    const double started = host_now_ms();
     const auto it = g_targets.find(target_key(address));
-#if defined(__vita__)
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, 960, 544);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    if (it != g_targets.end()) {
-        const RenderTarget &target = it->second;
-        const float u = 480.0f / static_cast<float>(target.width);
-        const float quad[16]{-1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, u, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
-        glUseProgram(g_present.id);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, target.texture);
-        glUniform1i(g_present.texture, 0);
-        glDisableVertexAttribArray(2);
-        glDisableVertexAttribArray(3);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        glEnableVertexAttribArray(0);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    }
-    swap_buffers();
+    record(Op::Present, {it != g_targets.end() ? it->second.texture : 0u,
+                         it != g_targets.end() ? static_cast<std::uint32_t>(it->second.width) : 0u});
     forget_state();
-#else
-    (void)it;
-#endif
-    g_stats.present_ms += host_now_ms() - started;
+    submit_frame();
     phase = 0u;
 }
 
-bool read_frame(std::uint32_t address, std::vector<std::uint8_t> &rgb) {
+void capture(std::uint32_t address, std::function<void(std::vector<std::uint8_t> &rgb)> done) {
     flush();
     const auto it = g_targets.find(target_key(address));
-    if (it == g_targets.end()) return false;
-    glBindFramebuffer(GL_FRAMEBUFFER, it->second.framebuffer);
+    record(Op::Capture, {it != g_targets.end() ? it->second.framebuffer : 0u,
+                         it != g_targets.end() ? static_cast<std::uint32_t>(it->second.height) : 272u,
+                         static_cast<std::uint32_t>(g_frame.captures.size())});
+    g_frame.captures.push_back(std::move(done));
     forget_state();
-    std::vector<std::uint8_t> rgba(480u * 272u * 4u);
-    glReadPixels(0, it->second.height - 272, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-    rgb.resize(480u * 272u * 3u);
-    for (std::uint32_t y = 0; y < 272u; ++y)
-        for (std::uint32_t x = 0; x < 480u; ++x)
-            for (int c = 0; c < 3; ++c) rgb[(y * 480u + x) * 3u + c] = rgba[((271u - y) * 480u + x) * 4u + c];
-    return true;
 }
 
 const Stats &stats() noexcept { return g_stats; }

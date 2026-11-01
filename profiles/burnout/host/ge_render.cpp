@@ -350,7 +350,7 @@ void worker_loop() {
                 if (snapshot) gl::use_snapshot(nullptr, 0u);
                 if (sampled) g_op_ms[op] += (host_now_ms() - op_started) * 16.0;
             }
-            gl::end_list();
+            gl::end_list(std::move(job.snapshot));
             gl::account(host_now_ms() - started, started - waiting);
             break;
         case Job::Kind::Present:
@@ -359,8 +359,10 @@ void worker_loop() {
             if (gl::stats().frames % 300u == 0u) trace_op_costs();
             break;
         case Job::Kind::Capture: {
-            std::vector<std::uint8_t> rgb;
-            if (gl::read_frame(job.address, rgb)) capture_rgb(rgb, job.vblank);
+            const std::uint64_t vblank = job.vblank;
+            gl::capture(job.address, [vblank](std::vector<std::uint8_t> &rgb) {
+                if (!rgb.empty()) capture_rgb(rgb, vblank);
+            });
             break;
         }
         }
@@ -474,8 +476,11 @@ void submit_pending() {
     g_pending_snapshot.vertices.reserve(job.snapshot.vertices.size());
     push_job(std::move(job));
     if (!g_async) {
+        // Without snapshots the GL thread reads guest memory: let it finish too.
         std::unique_lock lock(g_jobs_mutex);
         g_jobs_cv.wait(lock, [] { return g_jobs.empty() && !g_worker_busy; });
+        lock.unlock();
+        gl::finish();
     }
 }
 
@@ -483,6 +488,8 @@ void drain_worker() {
     submit_pending();
     std::unique_lock lock(g_jobs_mutex);
     g_jobs_cv.wait(lock, [] { return g_jobs.empty() && !g_worker_busy; });
+    lock.unlock();
+    gl::finish();
 }
 
 } // namespace
@@ -511,6 +518,10 @@ void configure(const Options &options) {
 bool active() noexcept { return g_options.enabled; }
 
 void account_scan(double ms) noexcept { g_scan_ms += ms; }
+
+void finish() {
+    if (g_options.enabled && g_options.backend == Backend::OpenGL) drain_worker();
+}
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset) {
