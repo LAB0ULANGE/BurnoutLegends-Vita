@@ -13,6 +13,7 @@
 
 #include "workload_stats.hpp"
 #if defined(BURNOUT_GE_RENDER)
+#include "ge_gl.hpp"
 #include "ge_render.hpp"
 #endif
 
@@ -731,7 +732,11 @@ void ge_scan(Runtime &rt, GeList &list) {
 #if defined(BURNOUT_GE_RENDER)
     struct ScanTimer {
         double started = host_now_ms();
-        ~ScanTimer() { render::account_scan(host_now_ms() - started); }
+        ScanTimer() { gl::emulation_phase = 1u; }
+        ~ScanTimer() {
+            gl::emulation_phase = 0u;
+            render::account_scan(host_now_ms() - started);
+        }
     } timer;
 #endif
     constexpr std::uint64_t kCommandLimit = 4u * 1024u * 1024u;

@@ -16,6 +16,7 @@
 namespace burnout::gl {
 
 volatile std::uint32_t phase{};
+volatile std::uint32_t emulation_phase{};
 
 namespace {
 
@@ -1274,6 +1275,7 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
     SnapshotHeader header;
     arena.resize(arena.size() + sizeof(header));
     if (op == 0xC4u) {
+        emulation_phase = 5u;
         const std::uint32_t clut = (g_scan.clut_low & 0xFFFFF0u) | ((g_scan.clut_high << 8u) & 0x0F000000u);
         const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
         if (const std::uint8_t *p = memory.raw_pointer(clut, bytes)) {
@@ -1287,6 +1289,7 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
         const std::uint32_t stride = vertex_layout(g_scan.vtype).stride;
         std::uint32_t vertex_count = count;
         bool readable = true;
+        emulation_phase = 3u;
         if (index != 0u) {
             const std::uint32_t bytes = count * (index == 1u ? 1u : 2u);
             const std::uint8_t *p = memory.raw_pointer(g_scan.index_address, bytes);
@@ -1301,6 +1304,7 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
                 vertex_count = count == 0u ? 0u : max_vertex + 1u;
             }
         }
+        emulation_phase = 4u;
         if (readable) {
             const std::uint32_t bytes = vertex_count * stride;
             if (const std::uint8_t *p = memory.raw_pointer(g_scan.vertex_address, bytes)) {
@@ -1313,6 +1317,7 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
         if (index == 0u) g_scan.vertex_address += count * stride;
     }
     std::memcpy(&arena[record], &header, sizeof(header));
+    emulation_phase = 2u;
     return record;
 }
 

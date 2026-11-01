@@ -23,6 +23,10 @@ bool initialize(std::string &error);
 // 6-10 draw (state, texture, state, attributes, glDrawElements), 11 present,
 // 12 waiting for work, 13 block transfer.
 extern volatile std::uint32_t phase;
+// Same for the emulation thread: 0 game code, 1 ge_scan, 2 render hook,
+// 3 PRIM index snapshot, 4 vertex snapshot, 5 palette snapshot, 6 block
+// transfer snapshot, 7 waiting for the worker.
+extern volatile std::uint32_t emulation_phase;
 // One line in the log, flushed at once (bring-up on the Vita).
 void trace(const char *message);
 

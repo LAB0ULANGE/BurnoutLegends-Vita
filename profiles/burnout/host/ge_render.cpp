@@ -255,9 +255,12 @@ std::array<std::uint64_t, 256> g_op_count{};
 // Sampling thread: histogram of gl::phase every ~100 us.
 std::array<std::atomic<std::uint32_t>, 16> g_phase_samples{};
 
+std::array<std::atomic<std::uint32_t>, 16> g_emulation_samples{};
+
 void sample_phases() {
     for (;;) {
         ++g_phase_samples[gl::phase & 15u];
+        ++g_emulation_samples[gl::emulation_phase & 15u];
         host_sleep_ms(0.1);
     }
 }
@@ -282,6 +285,16 @@ void trace_op_costs() {
         std::snprintf(item, sizeof(item), " %d:%.1f", i, total ? 100.0 * g_phase_samples[i].load() / total : 0.0);
         line += item;
         g_phase_samples[i] = 0u;
+    }
+    gl::trace(line.c_str());
+    line = "emulation phases (% of samples):";
+    total = 0;
+    for (auto &n : g_emulation_samples) total += n.load();
+    for (int i = 0; i < 8; ++i) {
+        char item[24];
+        std::snprintf(item, sizeof(item), " %d:%.1f", i, total ? 100.0 * g_emulation_samples[i].load() / total : 0.0);
+        line += item;
+        g_emulation_samples[i] = 0u;
     }
     gl::trace(line.c_str());
     g_op_ms.fill(0.0);
@@ -436,7 +449,10 @@ void push_job(Job job) {
     std::unique_lock lock(g_jobs_mutex);
     if (job.kind == Job::Kind::Commands) {
         const double started = host_now_ms();
+        const std::uint32_t outer = gl::emulation_phase;
+        gl::emulation_phase = 7u;
         g_jobs_cv.wait(lock, [] { return g_queued_command_jobs < 2u; });
+        gl::emulation_phase = outer;
         g_emulation_wait_ms += host_now_ms() - started;
         ++g_queued_command_jobs;
     }
@@ -504,8 +520,13 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
     const std::uint32_t data = word & 0x00FFFFFFu;
     g_commands[op] = word;
     if (g_options.backend == Backend::OpenGL) {
+        struct Phase {
+            Phase() { gl::emulation_phase = 2u; }
+            ~Phase() { gl::emulation_phase = 1u; }
+        } phase;
         g_memory = &memory;
         if (op == 0xEAu) {
+            gl::emulation_phase = 6u;
             Transfer transfer = snapshot_transfer(memory, data);
             if ((transfer.destination & 0x0F000000u) == 0x04000000u) {
                 // Into VRAM, which only the GE reads: replay in command order.
