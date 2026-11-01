@@ -86,7 +86,9 @@ BenchResult run_benchmark(const BenchOptions &options) {
     HleObserver observer;
     observer.on_wait_vblank = [&](std::int32_t uid, std::uint64_t vblank) { clock.on_wait_vblank(uid, vblank); };
     observer.on_set_frame_buffer = [&](std::uint32_t, std::uint64_t vblank) { clock.on_set_frame_buffer(vblank); };
-    observer.controller_buttons = [&](std::uint64_t vblank) { return options.script.buttons_at(vblank); };
+    observer.controller_buttons = [&](std::uint64_t vblank) {
+        return options.script.buttons_at(vblank) | (options.live_buttons ? options.live_buttons() : 0u);
+    };
     observer.on_file_open = [&](const std::string &path) {
         const std::string key = lower(path);
         const std::uint64_t vblank = vblank_count();
@@ -107,7 +109,13 @@ BenchResult run_benchmark(const BenchOptions &options) {
                       << (host_now_ms() - started) / 1000.0 << " s"
                       << (clock.window_open(vblank) ? " [measuring]" : "") << std::endl;
         }
-        if (clock.window_done(vblank)) runtime.stop("benchmark window complete");
+        if (options.realtime) {
+            // 59.94 Hz: wait while the guest is ahead of the wall clock.
+            const double due = started + static_cast<double>(vblank) * 1001.0 / 60.0;
+            for (double now = host_now_ms(); now < due; now = host_now_ms()) host_sleep_ms(due - now);
+        }
+        if (options.quit_requested && options.quit_requested()) runtime.stop("quit requested");
+        else if (!options.realtime && clock.window_done(vblank)) runtime.stop("benchmark window complete");
         else if (vblank >= options.max_vblanks) runtime.stop("max vblanks reached");
     };
 

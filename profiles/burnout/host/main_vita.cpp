@@ -8,6 +8,11 @@
 // writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
 // solid status colour: blue running, green done, red error.
 #include "burnout_run.hpp"
+#if defined(BURNOUT_VITA_GL)
+#include "ge_render.hpp"
+
+#include <psp2/ctrl.h>
+#endif
 
 #include <psp2/display.h>
 #include <psp2/kernel/cpu.h>
@@ -23,6 +28,7 @@
 #include <exception>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -42,8 +48,15 @@ extern "C" volatile std::uint32_t psprecomp_profile_label;
 namespace {
 
 constexpr const char *kRoot = "ux0:data/burnout/";
+#if defined(BURNOUT_VITA_GL)
+// Rendering build: the game on screen with the real pad (the scripted race
+// inputs are still OR-ed in), paced to real time; START+SELECT quits.
+constexpr const char *kReport = "ux0:data/burnout-gl.txt";
+constexpr const char *kLog = "ux0:data/burnout-gl.log";
+#else
 constexpr const char *kReport = "ux0:data/burnout-bench.txt";
 constexpr const char *kLog = "ux0:data/burnout-bench.log";
+#endif
 
 // Same sequence as profiles/burnout/scripts/race_world_tour_compact.txt.
 constexpr const char *kDefaultScript =
@@ -88,6 +101,10 @@ void write_profile() {
 #endif
 
 void show_status(std::uint32_t abgr) {
+#if defined(BURNOUT_VITA_GL)
+    (void)abgr;  // vitaGL owns the display
+    return;
+#endif
     constexpr int kWidth = 960, kHeight = 544;
     if (g_framebuffer == nullptr) {
         const SceUID block = sceKernelAllocMemBlock("status_fb", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
@@ -131,7 +148,22 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
     options.memstick = root + "ms0";
     options.script = script;
     options.max_vblanks = 9000u;
+#if defined(BURNOUT_VITA_GL)
+    options.max_vblanks = 60u * 60u * 30u;
+    options.realtime = true;
+    options.live_buttons = [] {
+        SceCtrlData pad{};
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        return static_cast<std::uint32_t>(pad.buttons) & 0xF3F9u;  // PSP-compatible bits
+    };
+    options.quit_requested = [] {
+        SceCtrlData pad{};
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        return (pad.buttons & (SCE_CTRL_START | SCE_CTRL_SELECT)) == (SCE_CTRL_START | SCE_CTRL_SELECT);
+    };
+#else
     options.hash_trace = "ux0:data/burnout-hashes.txt";
+#endif
 #if defined(BURNOUT_VITA_PROFILE)
     options.measuring = &g_measuring;
 #endif
@@ -145,6 +177,9 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
     const burnout::BenchResult result = burnout::run_benchmark(options);
     std::ostringstream text;
     text << result.report << "host time for the whole pass: " << result.host_seconds << " s\n\n";
+#if defined(BURNOUT_VITA_GL)
+    text << burnout::render::report();
+#endif
     return text.str();
 }
 
@@ -180,9 +215,21 @@ int main() {
             std::istringstream lines(kDefaultScript);
             for (std::string line; std::getline(lines, line);) script.parse_line(line);
         }
+#if defined(BURNOUT_VITA_GL)
+        sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+        burnout::render::Options render;
+        render.enabled = true;
+        render.backend = burnout::render::Backend::OpenGL;
+        render.capture_vblanks = {2101u, 3001u};
+        render.capture_dir = "ux0:data/burnout-frames";
+        burnout::render::configure(render);
+        if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
+#endif
         const std::string report = run_pass(444, script);
         append_report(report);
+#if !defined(BURNOUT_VITA_GL)
         if (report.find("stop: benchmark window complete") == std::string::npos) ok = false;
+#endif
     } catch (const std::exception &e) {
         append_report(std::string("ERROR: ") + e.what() + "\n");
         std::fprintf(stderr, "[vita] error: %s\n", e.what());

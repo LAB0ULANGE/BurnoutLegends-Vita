@@ -10,6 +10,7 @@ namespace burnout {
 
 // Monotonic host time in milliseconds (process time on Vita, steady_clock elsewhere).
 [[nodiscard]] double host_now_ms();
+void host_sleep_ms(double ms);
 
 // Scripted controller input keyed on the PSP vblank counter.
 //   hold  <from> <to> <BUTTONS...>                 buttons held for vblanks [from, to)

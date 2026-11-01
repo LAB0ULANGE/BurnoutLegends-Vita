@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,11 @@ struct BenchOptions {
     bool verbose{};
     bool trace_files{};
     std::atomic<bool> *measuring{};  // optional: set while the window is open (profiler)
+    // Interactive builds: buttons OR-ed with the script (a real pad), pacing so
+    // virtual vblanks never run ahead of real time, and a quit request.
+    std::function<std::uint32_t()> live_buttons;
+    bool realtime{};
+    std::function<bool()> quit_requested;
 };
 
 struct BenchResult {

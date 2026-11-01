@@ -10,6 +10,10 @@
 
 #if defined(__vita__)
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
+#else
+#include <chrono>
+#include <thread>
 #endif
 
 namespace burnout {
@@ -65,6 +69,15 @@ double host_now_ms() {
 #else
     using Clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+#endif
+}
+
+void host_sleep_ms(double ms) {
+    if (ms <= 0.0) return;
+#if defined(__vita__)
+    sceKernelDelayThread(static_cast<SceUInt>(ms * 1000.0));
+#else
+    std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(ms));
 #endif
 }
 

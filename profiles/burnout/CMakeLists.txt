@@ -60,6 +60,26 @@ if(VITA)
     vita_create_vpk(burnout-bench.vpk BRNB00001 eboot.bin
         VERSION 01.00
         NAME "Burnout recomp bench")
+
+    # Rendering build: the same runtime with the GE translated to vitaGL, the
+    # real pad and real-time pacing. Separate title so the bench stays intact.
+    option(BURNOUT_VITA_GL "Also build the vitaGL rendering VPK" ON)
+    if(BURNOUT_VITA_GL)
+        add_executable(burnout_vita_gl host/main_vita.cpp host/ge_render.cpp host/ge_gl.cpp
+            host/gl_context_vita.cpp ${BURNOUT_HOST_SOURCES})
+        target_compile_definitions(burnout_vita_gl PRIVATE
+            BURNOUT_GENERATED_OPT="-O${PSPRECOMP_GENERATED_OPT_LEVEL}" BURNOUT_GE_RENDER=1 BURNOUT_VITA_GL=1)
+        target_include_directories(burnout_vita_gl PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+        target_link_libraries(burnout_vita_gl PRIVATE burnout_generated
+            vitaGL vitashark SceShaccCgExt mathneon taihen_stub SceShaccCg_stub SceKernelDmacMgr_stub
+            SceGxm_stub SceDisplay_stub SceCommonDialog_stub SceAppMgr_stub SceSysmodule_stub SceIme_stub
+            SceCtrl_stub SceSysmem_stub ScePower_stub SceKernelThreadMgr_stub SceProcessmgr_stub
+            SceLibKernel_stub pthread m)
+        vita_create_self(eboot_gl.bin burnout_vita_gl UNSAFE)
+        vita_create_vpk(burnout-gl.vpk BRNG00001 eboot_gl.bin
+            VERSION 01.00
+            NAME "Burnout recomp GL")
+    endif()
     return()
 endif()
 
