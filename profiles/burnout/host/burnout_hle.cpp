@@ -11,6 +11,9 @@
 #include "burnout_hle.hpp"
 
 #include "workload_stats.hpp"
+#if defined(BURNOUT_GE_RENDER)
+#include "ge_render.hpp"
+#endif
 
 #include "psprecomp/common.hpp"
 
@@ -729,7 +732,11 @@ void ge_scan(Runtime &rt, GeList &list) {
     const auto memory = rt.memory().aot_fast_view();
     // Without workload statistics only the control commands below matter, so
     // runs of other commands (nearly all of a list) are skipped in place.
+#if defined(BURNOUT_GE_RENDER)
+    const bool skip_plain = !workload::collecting() && !render::active();
+#else
     const bool skip_plain = !workload::collecting();
+#endif
     for (std::uint64_t count = 0; count < kCommandLimit && !list.done; ++count) {
         const std::uint32_t pc = list.pc & 0x0FFFFFFFu;
         if (list.stall != 0u && pc == (list.stall & 0x0FFFFFFFu)) return;
@@ -755,6 +762,9 @@ void ge_scan(Runtime &rt, GeList &list) {
         list.pc = pc + 4u;
         ++k.ge_commands_scanned;
         workload::ge_command(rt.memory(), pc, word, list.base, list.offset);
+#if defined(BURNOUT_GE_RENDER)
+        render::ge_command(rt.memory(), pc, word, list.base, list.offset);
+#endif
         const auto target = [&]() { return ((list.base | data) + list.offset) & 0x0FFFFFFCu; };
         switch (op) {
         case 0x08u: list.pc = target(); break;                         // JUMP
@@ -1270,6 +1280,9 @@ void install_display_input(Runtime &rt) {
     reg_value(rt, "sceDisplay", 0x0E20F177u, 0u);  // SetMode
     reg(rt, "sceDisplay", 0x289D82FEu, [](Runtime &r, AllegrexContext &ctx) {  // SetFrameBuf
         workload::end_frame(r.memory());
+#if defined(BURNOUT_GE_RENDER)
+        render::frame_buffer_set(r.memory(), arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), k.vblanks);
+#endif
         if (k.observer.on_set_frame_buffer) k.observer.on_set_frame_buffer(arg(ctx, 0), k.vblanks);
         ret(ctx, 0u);
     });

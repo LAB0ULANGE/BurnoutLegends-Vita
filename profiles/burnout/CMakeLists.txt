@@ -63,9 +63,27 @@ if(VITA)
     return()
 endif()
 
-add_executable(burnout_headless host/main_headless.cpp ${BURNOUT_HOST_SOURCES}
+# GE renderer: the VCS profile's software rasterizer, driven by the Burnout GE
+# command stream, with the GPU backend stubbed out.
+set(BURNOUT_VCS_HOST "${BURNOUT_PROFILE_DIR}/../vcs/host")
+add_library(burnout_ge_render STATIC
+    "${BURNOUT_VCS_HOST}/ge_renderer.cpp"
+    "${BURNOUT_VCS_HOST}/vcs_config.cpp"
+    "${BURNOUT_VCS_HOST}/vcs_camera_input.cpp"
+    "${BURNOUT_VCS_HOST}/vcs_vehicle_input.cpp"
+    "${BURNOUT_VCS_HOST}/vcs_project2dfx.cpp"
+    "${BURNOUT_VCS_HOST}/vcs_project2dfx_lights.cpp"
+    "${BURNOUT_VCS_HOST}/vcs_fps_overlay.cpp"
+    "${BURNOUT_VCS_HOST}/framebuffer_capture.cpp"
+    host/ge_gpu_backend_none.cpp)
+target_include_directories(burnout_ge_render PUBLIC "${BURNOUT_VCS_HOST}")
+target_link_libraries(burnout_ge_render PUBLIC psprecomp_core)
+psprecomp_enable_host_avx(burnout_ge_render)
+
+add_executable(burnout_headless host/main_headless.cpp host/ge_render.cpp ${BURNOUT_HOST_SOURCES}
     $<$<BOOL:${WIN32}>:host/sampling_profiler_win.cpp>)
-target_link_libraries(burnout_headless PRIVATE burnout_generated)
+target_link_libraries(burnout_headless PRIVATE burnout_generated burnout_ge_render)
+target_compile_definitions(burnout_headless PRIVATE BURNOUT_GE_RENDER=1)
 target_include_directories(burnout_headless PRIVATE "${BURNOUT_PROFILE_DIR}/host")
 if(MSVC)
     # Guest code runs on the host stack only one dispatch deep, but generated

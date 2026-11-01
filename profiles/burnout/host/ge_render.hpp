@@ -1,0 +1,39 @@
+#pragma once
+
+#include "psprecomp/guest_memory.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <set>
+#include <string>
+
+namespace burnout::render {
+
+// Software GE rendering for the PC builds: ge_scan feeds every display-list
+// command here and the VCS profile's rasterizer draws into guest VRAM. It only
+// observes the command stream (control flow and callbacks stay in ge_scan), so
+// the guest runs exactly as in the headless build.
+
+struct Options {
+    bool enabled{};
+    // Displayed frame buffers written as PNG at the first flip on or after each
+    // of these vblanks.
+    std::set<std::uint64_t> capture_vblanks;
+    std::filesystem::path capture_dir;
+    // Logs every PRIM drawn between these vblanks (inclusive) to stderr.
+    std::uint64_t trace_from{UINT64_MAX};
+    std::uint64_t trace_to{0u};
+};
+
+void configure(const Options &options);
+[[nodiscard]] bool active() noexcept;
+
+void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
+                std::uint32_t offset);
+// sceDisplaySetFrameBuf: the frame at `address` is about to be shown.
+void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stride,
+                      std::uint32_t format, std::uint64_t vblank);
+
+[[nodiscard]] std::string report();
+
+} // namespace burnout::render

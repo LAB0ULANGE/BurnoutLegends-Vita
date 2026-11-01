@@ -1,7 +1,9 @@
 // Headless Burnout Legends runner (PC): boots the recompiled executable with
 // the burnout HLE, drives it with a scripted controller and reports host time
-// per logical game frame. No rendering and no audio output.
+// per logical game frame. No audio output; --render draws the GE lists with the
+// software rasterizer and --capture writes PNG frames.
 #include "burnout_run.hpp"
+#include "ge_render.hpp"
 
 #include "psprecomp/common.hpp"
 
@@ -12,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -21,6 +24,7 @@ struct Cli {
     std::filesystem::path script;
     std::filesystem::path report{"burnout-bench.txt"};
     std::filesystem::path profile;
+    burnout::render::Options render{false, {}, "out/burnout-frames"};
 };
 
 Cli parse(int argc, char **argv) {
@@ -58,6 +62,20 @@ Cli parse(int argc, char **argv) {
         else if (key == "--profile") cli.profile = value();
         else if (key == "--verbose") o.verbose = true;
         else if (key == "--trace-files") o.trace_files = true;
+        else if (key == "--render") cli.render.enabled = true;
+        else if (key == "--capture-dir") cli.render.capture_dir = value();
+        else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
+            cli.render.enabled = true;
+            const std::string range = value();
+            const auto dash = range.find('-');
+            cli.render.trace_from = std::stoull(range.substr(0, dash));
+            cli.render.trace_to = dash == std::string::npos ? cli.render.trace_from : std::stoull(range.substr(dash + 1));
+        }
+        else if (key == "--capture") {  // comma-separated vblanks; implies --render
+            cli.render.enabled = true;
+            std::istringstream list(value());
+            for (std::string item; std::getline(list, item, ',');) cli.render.capture_vblanks.insert(std::stoull(item));
+        }
         else throw psprecomp::Error("unknown option " + key);
     }
     return cli;
@@ -77,7 +95,9 @@ int main(int argc, char **argv) {
             profiler = std::make_unique<burnout::SamplingProfiler>(measuring);
         }
 #endif
-        const burnout::BenchResult result = burnout::run_benchmark(cli.bench);
+        burnout::render::configure(cli.render);
+        burnout::BenchResult result = burnout::run_benchmark(cli.bench);
+        result.report += burnout::render::report();
 #if defined(_WIN32)
         if (profiler) profiler->write_report(cli.profile);
 #endif
