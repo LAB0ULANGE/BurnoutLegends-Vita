@@ -1201,8 +1201,20 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
     g_memory = &memory;
     const std::uint32_t op = word >> 24u;
     const std::uint32_t data = word & 0x00FFFFFFu;
-    const bool matrix_data = op == 0x2Bu || op == 0x3Bu || op == 0x3Du || op == 0x3Fu || op == 0x41u;
-    if (!batch_neutral(op) && (matrix_data || g_commands[op] != word || op == 0xC4u || op == 0xEAu)) flush();
+    // Matrix uploads only end the batch when they change an element: games
+    // often reload the matrix that is already there.
+    const auto matrix_changes = [&]() {
+        const float value = float24(data);
+        switch (op) {
+        case 0x3Bu: return g_world_cursor < 12u && g_world[g_world_cursor] != value;
+        case 0x3Du: return g_view_cursor < 12u && g_view[g_view_cursor] != value;
+        case 0x3Fu: return g_projection_cursor < 16u && g_projection[g_projection_cursor] != value;
+        case 0x41u: return g_texgen_cursor < 12u && g_texgen[g_texgen_cursor] != value;
+        case 0x2Bu: return true;
+        default: return false;
+        }
+    };
+    if (!batch_neutral(op) && (matrix_changes() || g_commands[op] != word || op == 0xC4u || op == 0xEAu)) flush();
     g_commands[op] = word;
     const auto address = [&]() { return ((base | data) + offset) & 0x0FFFFFFFu; };
     switch (op) {

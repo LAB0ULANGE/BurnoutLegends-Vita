@@ -406,6 +406,29 @@ void start_worker() {
 #endif
 }
 
+// Commands that cannot change what the worker draws are not queued: control
+// flow (ge_scan follows it), BASE/OFFSET (folded into each entry's base and
+// offset) and state commands repeating the value last sent.
+std::array<std::uint32_t, 256> g_last_forwarded{};
+std::array<bool, 256> g_forwarded_once{};
+
+bool forwarded(std::uint32_t op, std::uint32_t word) {
+    switch (op) {
+    case 0x00u: case 0x03u: case 0x08u: case 0x0Au: case 0x0Bu: case 0x0Eu: case 0x0Fu: case 0x10u: case 0x13u: case 0x14u:
+        return false;
+    // Actions, addresses and matrix uploads (a repeated select still resets
+    // the cursor) always go.
+    case 0x01u: case 0x02u: case 0x04u: case 0x0Cu: case 0x2Au: case 0x2Bu: case 0x3Au: case 0x3Bu: case 0x3Cu:
+    case 0x3Du: case 0x3Eu: case 0x3Fu: case 0x40u: case 0x41u: case 0xC4u: case 0xEAu:
+        return true;
+    default:
+        if (g_forwarded_once[op] && g_last_forwarded[op] == word) return false;
+        g_forwarded_once[op] = true;
+        g_last_forwarded[op] = word;
+        return true;
+    }
+}
+
 double g_emulation_wait_ms{};  // emulation thread blocked on the worker
 double g_scan_ms{};            // emulation thread walking display lists
 
@@ -427,6 +450,7 @@ void submit_pending() {
     job.kind = Job::Kind::Commands;
     job.commands.swap(g_pending);
     job.transfers.swap(g_pending_transfers);
+    g_pending.reserve(job.commands.size());
     job.snapshot.records.swap(g_pending_snapshot.records);
     job.snapshot.vertices.swap(g_pending_snapshot.vertices);
     // Room for the next list without regrowing.
@@ -491,6 +515,7 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
             }
             apply_transfer(memory, transfer);  // guest RAM: stays synchronous
         }
+        if (!forwarded(op, word)) return;
         if (g_async) {
             // The worker may draw this list while the game builds the next one.
             const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
