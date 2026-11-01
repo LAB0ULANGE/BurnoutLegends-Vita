@@ -1000,6 +1000,14 @@ struct SnapshotHeader {
 const std::uint8_t *g_snapshot{};
 const std::uint8_t *g_snapshot_vertices{};
 
+// Burnout keeps its track and car geometry where it was loaded; only the
+// display-list buffers and a small heap (0x09C00000-0x09DFFFFF) hold vertices
+// rebuilt every frame (measured: about 3% of the bytes drawn change between
+// frames). Static vertices are not copied: the worker reads guest memory.
+constexpr std::uint32_t kInGuestMemory = UINT32_MAX;
+
+bool static_vertices(std::uint32_t address) noexcept { return address >= 0x08800000u && address < 0x09C00000u; }
+
 // `bytes` of guest memory at `address`, from the current snapshot record when
 // there is one (`vertices` picks its part).
 const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t bytes, bool vertices) {
@@ -1008,7 +1016,9 @@ const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t ad
     std::memcpy(&header, g_snapshot, sizeof(header));
     const std::uint32_t have = vertices ? header.vertex_bytes : header.index_bytes;
     if (have == UINT32_MAX || have < bytes) return nullptr;
-    return vertices ? g_snapshot_vertices + header.vertex_offset : g_snapshot + sizeof(header);
+    if (!vertices) return g_snapshot + sizeof(header);
+    if (header.vertex_offset == kInGuestMemory) return memory.raw_pointer(address, bytes);
+    return g_snapshot_vertices + header.vertex_offset;
 }
 
 bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
@@ -1310,8 +1320,12 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
             if (const std::uint8_t *p = memory.raw_pointer(g_scan.vertex_address, bytes)) {
                 if (header.index_bytes == UINT32_MAX) header.index_bytes = 0u;
                 header.vertex_bytes = bytes;
-                header.vertex_offset = static_cast<std::uint32_t>(snapshot.vertices.size());
-                append(snapshot.vertices, p, bytes);
+                if (static_vertices(g_scan.vertex_address)) {
+                    header.vertex_offset = kInGuestMemory;
+                } else {
+                    header.vertex_offset = static_cast<std::uint32_t>(snapshot.vertices.size());
+                    append(snapshot.vertices, p, bytes);
+                }
             }
         }
         if (index == 0u) g_scan.vertex_address += count * stride;
