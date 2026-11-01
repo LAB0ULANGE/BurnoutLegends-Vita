@@ -706,7 +706,12 @@ std::int64_t file_read(Runtime &rt, std::int32_t fd, std::uint32_t buffer, std::
     if (it == k.files.end() || it->second.file == nullptr) return static_cast<std::int32_t>(kErrorBadFile);
     std::uint8_t *host = rt.memory().raw_pointer(buffer, size);
     if (host == nullptr && size != 0u) return static_cast<std::int32_t>(kErrorBadFile);
-    return static_cast<std::int64_t>(std::fread(host, 1u, size, it->second.file));
+    const double started = host_now_ms();
+    const auto read = static_cast<std::int64_t>(std::fread(host, 1u, size, it->second.file));
+    const double took = host_now_ms() - started;
+    gl::io_read_ms += took;
+    gl::io_read_max_ms = std::max(gl::io_read_max_ms, took);
+    return read;
 }
 
 // ---------------------------------------------------------------- GE

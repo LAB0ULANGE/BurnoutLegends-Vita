@@ -646,10 +646,20 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
             g_skip_frame = !g_skip_frame && g_queued_command_jobs >= 2u;
             if (g_skip_frame) ++g_skipped_frames;
         }
+        // Longest gap between two flips: the hitches a player sees.
+        static double last_flip = host_now_ms(), worst_flip = 0.0;
+        const double now = host_now_ms();
+        worst_flip = std::max(worst_flip, now - last_flip);
+        last_flip = now;
         if (++g_flips % 300u == 0u) {
-            char line[160];
-            std::snprintf(line, sizeof(line), "emulation: list scan %.1f ms/flip, waited %.1f ms/flip for the worker, %llu of 300 frames skipped",
-                          g_scan_ms / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames));
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                          "emulation: list scan %.1f ms/flip, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
+                          "worst flip %.0f ms; file reads %.0f ms (longest %.0f)",
+                          g_scan_ms / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
+                          worst_flip, gl::io_read_ms, gl::io_read_max_ms);
+            worst_flip = 0.0;
+            gl::io_read_ms = gl::io_read_max_ms = 0.0;
             g_skipped_frames = 0u;
             g_scan_ms = 0.0;
             gl::trace(line);

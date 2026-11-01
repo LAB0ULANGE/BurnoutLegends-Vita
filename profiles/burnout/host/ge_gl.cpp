@@ -29,6 +29,7 @@ namespace burnout::gl {
 
 volatile std::uint32_t phase{};
 volatile std::uint32_t emulation_phase{};
+double io_read_ms{}, io_read_max_ms{};
 
 namespace {
 
@@ -1398,27 +1399,95 @@ const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t ad
     return g_snapshot_vertices + header.vertex_offset;
 }
 
+// PSP skinning: the weighted sum of the vertex transformed by each bone
+// matrix (4x3, row vector), done on the CPU. The result is a vertex type with
+// float position and normal and no weights; the world matrix follows as usual.
+std::array<float, 8 * 12> g_bones{};
+std::uint32_t g_bone_cursor{};
+std::vector<std::uint8_t> g_skinned;
+
+std::uint32_t skinned_vtype(std::uint32_t vtype) {
+    const std::uint32_t nrm = (vtype >> 5u) & 3u;
+    return (vtype & 0x1Fu) | (nrm != 0u ? 3u << 5u : 0u) | 3u << 7u | (vtype & 0x1800u);
+}
+
+float component(const std::uint8_t *at, std::uint32_t format, std::uint32_t k, bool is_signed) {
+    switch (format) {
+    case 1u: return is_signed ? static_cast<float>(static_cast<std::int8_t>(at[k])) : static_cast<float>(at[k]);
+    case 2u: {
+        std::uint16_t v;
+        std::memcpy(&v, at + k * 2u, 2u);
+        return is_signed ? static_cast<float>(static_cast<std::int16_t>(v)) : static_cast<float>(v);
+    }
+    default: {
+        float v;
+        std::memcpy(&v, at + k * 4u, 4u);
+        return v;
+    }
+    }
+}
+
+const std::uint8_t *skin(const std::uint8_t *raw, std::uint32_t count, std::uint32_t vtype, const VertexLayout &from,
+                         const VertexLayout &to) {
+    const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
+    const std::uint32_t weight = (vtype >> 9u) & 3u, weights = ((vtype >> 14u) & 7u) + 1u;
+    const float weight_scale = weight == 1u ? 1.0f / 128.0f : weight == 2u ? 1.0f / 32768.0f : 1.0f;
+    const float pos_scale = pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f;
+    const float nrm_scale = nrm == 1u ? 1.0f / 127.0f : nrm == 2u ? 1.0f / 32767.0f : 1.0f;
+    const std::uint32_t pos_format = std::max<std::uint32_t>(pos, 1u);
+    g_skinned.resize(static_cast<std::size_t>(count) * to.stride);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint8_t *in = raw + static_cast<std::size_t>(i) * from.stride;
+        std::uint8_t *out = g_skinned.data() + static_cast<std::size_t>(i) * to.stride;
+        std::memcpy(out + to.tc, in + from.tc, sizes_tc[tc] * 2u);
+        std::memcpy(out + to.col, in + from.col, sizes_col[col]);
+        float p[3], n[3], sp[3]{}, sn[3]{};
+        for (std::uint32_t k = 0; k < 3u; ++k) {
+            p[k] = component(in + from.pos, pos_format, k, true) * pos_scale;
+            n[k] = nrm != 0u ? component(in + from.nrm, nrm, k, true) * nrm_scale : 0.0f;
+        }
+        for (std::uint32_t b = 0; b < weights; ++b) {
+            const float w = component(in, weight, b, false) * weight_scale;
+            if (w == 0.0f) continue;
+            const float *m = g_bones.data() + b * 12u;
+            for (std::uint32_t c = 0; c < 3u; ++c) {
+                sp[c] += w * (p[0] * m[c] + p[1] * m[3u + c] + p[2] * m[6u + c] + m[9u + c]);
+                sn[c] += w * (n[0] * m[c] + n[1] * m[3u + c] + n[2] * m[6u + c]);
+            }
+        }
+        std::memcpy(out + to.pos, sp, sizeof(sp));
+        if (nrm != 0u) std::memcpy(out + to.nrm, sn, sizeof(sn));
+    }
+    return g_skinned.data();
+}
+
 bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     phase = 1u;
     const std::uint32_t primitive = (data >> 16u) & 7u;
     const std::uint32_t count = data & 0xFFFFu;
-    const std::uint32_t vtype = cmd(0x12u);
-    const std::uint32_t weight = (vtype >> 9u) & 3u, index = (vtype >> 11u) & 3u;
-    const std::uint32_t weights = weight != 0u ? ((vtype >> 14u) & 7u) + 1u : 0u;
-    const std::uint32_t morphs = ((vtype >> 18u) & 7u) + 1u;
-    const bool through = (vtype & 0x800000u) != 0u;
+    const std::uint32_t psp_vtype = cmd(0x12u);
+    const std::uint32_t weight = (psp_vtype >> 9u) & 3u, index = (psp_vtype >> 11u) & 3u;
+    const std::uint32_t weights = weight != 0u ? ((psp_vtype >> 14u) & 7u) + 1u : 0u;
+    const std::uint32_t morphs = ((psp_vtype >> 18u) & 7u) + 1u;
+    const bool through = (psp_vtype & 0x800000u) != 0u;
 
     // The vertex type rarely changes between PRIMs.
     static std::uint32_t layout_vtype = UINT32_MAX;
-    static VertexLayout layout;
-    if (vtype != layout_vtype) {
-        layout_vtype = vtype;
-        layout = vertex_layout(vtype);
+    static VertexLayout psp_layout;
+    if (psp_vtype != layout_vtype) {
+        layout_vtype = psp_vtype;
+        psp_layout = vertex_layout(psp_vtype);
     }
-    const std::uint32_t stride = layout.stride;
+    const std::uint32_t stride = psp_layout.stride;
 
-    if (weights != 0u || morphs > 1u || primitive < 3u) {  // skinning/morphing/points/lines: not yet
+    if (morphs > 1u || primitive < 3u || (weights != 0u && through)) {  // morphing/points/lines: not yet
         ++g_stats.skipped_primitives;
+        static std::unordered_map<std::uint64_t, int> seen;
+        if (seen[(std::uint64_t{psp_vtype} << 8u) | primitive]++ == 0) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "skipped PRIM %u, vtype %06X, %u vertices", primitive, psp_vtype, count);
+            trace(line);
+        }
         if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
         else g_vertex_address += count * stride;
         return false;
@@ -1446,6 +1515,22 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const std::uint32_t vertex_count = count == 0u ? 0u : max_vertex + 1u;
     const std::uint8_t *raw = guest_bytes(memory, g_vertex_address, vertex_count * stride, true);
     if (raw == nullptr) { ++g_stats.skipped_primitives; return false; }
+    // Skinned vertices are blended here and drawn as plain float ones.
+    std::uint32_t vtype = psp_vtype;
+    const VertexLayout *source_layout = &psp_layout;
+    static std::uint32_t skinned_from = UINT32_MAX;
+    static VertexLayout skinned_layout;
+    if (weights != 0u) {
+        vtype = skinned_vtype(psp_vtype);
+        if (skinned_from != psp_vtype) {
+            skinned_from = psp_vtype;
+            skinned_layout = vertex_layout(vtype);
+        }
+        raw = skin(raw, vertex_count, psp_vtype, psp_layout, skinned_layout);
+        source_layout = &skinned_layout;
+    }
+    const VertexLayout &layout = *source_layout;
+    const std::uint32_t vertex_stride = layout.stride;
 
     if (!g_batch_indices.empty() && g_batch_vtype != vtype) flush();
     if (g_batch_count == 0u) {
@@ -1464,11 +1549,11 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         g_layout = batch_layout(vtype);
     }
     const BatchLayout &out = g_layout;
-    const auto vertex = [&](std::uint32_t i) { return raw + static_cast<std::size_t>(i) * stride; };
+    const auto vertex = [&](std::uint32_t i) { return raw + static_cast<std::size_t>(i) * vertex_stride; };
     // Snapshot vertices already in the batch layout are drawn where they are,
     // as long as they follow the batch's previous ones.
-    const bool in_place = g_snapshot != nullptr && out.same_as_psp && !flat && primitive != 6u;
-    const bool follows = g_batch_in_place != nullptr && raw == g_batch_in_place + static_cast<std::size_t>(g_batch_count) * stride;
+    const bool in_place = g_snapshot != nullptr && weights == 0u && out.same_as_psp && !flat && primitive != 6u;
+    const bool follows = g_batch_in_place != nullptr && raw == g_batch_in_place + static_cast<std::size_t>(g_batch_count) * vertex_stride;
     if (g_batch_count != 0u && (in_place ? !follows : g_batch_in_place != nullptr)) {
         flush();
         g_batch_vtype = vtype;
@@ -1491,7 +1576,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         g_batch_count += vertex_count;
     } else if (!flat && primitive != 6u) {
         std::uint8_t *dst = append_vertices(vertex_count);
-        if (out.same_as_psp) std::memcpy(dst, raw, static_cast<std::size_t>(vertex_count) * stride);
+        if (out.same_as_psp) std::memcpy(dst, raw, static_cast<std::size_t>(vertex_count) * vertex_stride);
         else
             for (std::uint32_t i = 0; i < vertex_count; ++i) copy_vertex(dst + i * out.stride, vertex(i), out, layout);
     }
@@ -1562,6 +1647,7 @@ bool batch_neutral(std::uint32_t op) noexcept {
     switch (op) {
     case 0x00u: case 0x01u: case 0x02u: case 0x04u: case 0x08u: case 0x0Au: case 0x0Bu: case 0x0Cu:
     case 0x0Eu: case 0x0Fu: case 0x10u: case 0x13u: case 0x14u:
+    case 0x2Au: case 0x2Bu:  // bones: skinning is applied as vertices are decoded
         return true;
     default:
         return false;
@@ -1673,8 +1759,8 @@ void use_program(std::uint32_t key) {
         }
         it = g_variants.emplace(key, program).first;
         char line[96];
-        std::snprintf(line, sizeof(line), "program variant %06X (%zu so far) in %.0f ms", key, g_variants.size(),
-                      host_now_ms() - started);
+        std::snprintf(line, sizeof(line), "program variant %06X (%u so far) in %.0f ms", static_cast<unsigned>(key),
+                      static_cast<unsigned>(g_variants.size()), host_now_ms() - started);
         trace(line);
     }
     if (g_bound != it->second) {
@@ -1682,6 +1768,13 @@ void use_program(std::uint32_t key) {
         glUseProgram(g_bound->id);
     }
 }
+
+// Variants the races use, compiled while the game boots rather than on
+// first use in a race (each costs the Vita's shader compiler a moment).
+constexpr std::uint32_t kKnownVariants[]{
+    0x000000u, 0x000001u, 0x000002u, 0x000340u, 0x00040Du, 0x004400u, 0x00440Du, 0x004740u,
+    0x005C00u, 0x005C02u, 0x00C602u, 0x01C626u, 0x024400u, 0x1A0000u, 0x1A4400u, 0x1A4540u,
+    0x1A4740u, 0x1E440Du, 0x1E4540u, 0x21C626u, 0x62C602u, 0x7AC602u};
 
 void sync_uniforms() {
     if (g_bound == nullptr) use_program(0u);
@@ -1872,6 +1965,11 @@ void gl_thread_main() {
         ok = ok && link(g_uber, kVertexShader, kFragmentShader, false, error);
         if (ok) trace("compiling the present shaders");
         ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error);
+        if (ok) {
+            trace("compiling the known program variants");
+            for (const std::uint32_t key : kKnownVariants) use_program(key);
+            g_bound = nullptr;
+        }
 #if defined(__vita__)
         if (ok) {
             glGenBuffers(1, &g_vertex_buffer);
@@ -1984,7 +2082,6 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
         case 0x3Du: return g_view_cursor < 12u && g_view[g_view_cursor] != value;
         case 0x3Fu: return g_projection_cursor < 16u && g_projection[g_projection_cursor] != value;
         case 0x41u: return g_texgen_cursor < 12u && g_texgen[g_texgen_cursor] != value;
-        case 0x2Bu: return true;
         default: return false;
         }
     };
@@ -1999,6 +2096,8 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
         ++g_stats.primitives;
         decode_prim(memory, data);
         break;
+    case 0x2Au: g_bone_cursor = data & 0x7Fu; break;
+    case 0x2Bu: if (g_bone_cursor < g_bones.size()) g_bones[g_bone_cursor++] = float24(data); break;
     case 0x3Au: g_world_cursor = data & 0xFu; break;
     case 0x3Bu: if (g_world_cursor < 12u) g_world[g_world_cursor++] = float24(data); break;
     case 0x3Cu: g_view_cursor = data & 0xFu; break;

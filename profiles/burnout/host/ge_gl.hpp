@@ -34,6 +34,8 @@ extern volatile std::uint32_t phase;
 // 3 PRIM index snapshot, 4 vertex snapshot, 5 palette snapshot, 6 block
 // transfer snapshot, 7 waiting for the worker.
 extern volatile std::uint32_t emulation_phase;
+// File reads on the emulation thread (sceIoRead*), for the pacing trace.
+extern double io_read_ms, io_read_max_ms;
 // One line in the log, flushed at once (bring-up on the Vita).
 void trace(const char *message);
 
