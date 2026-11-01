@@ -90,16 +90,16 @@ void main() {
         float a = floor(c.a * 255.0 + 0.5);
         float r = u_alpha.y;
         float func = u_alpha.x;
-        bool pass = true;
-        if (func < 0.5) pass = false;
-        else if (func < 1.5) pass = true;
-        else if (func < 2.5) pass = a == r;
-        else if (func < 3.5) pass = a != r;
-        else if (func < 4.5) pass = a < r;
-        else if (func < 5.5) pass = a <= r;
-        else if (func < 6.5) pass = a > r;
-        else pass = a >= r;
-        if (!pass) discard;
+        bool keep = true;
+        if (func < 0.5) keep = false;
+        else if (func < 1.5) keep = true;
+        else if (func < 2.5) keep = a == r;
+        else if (func < 3.5) keep = a != r;
+        else if (func < 4.5) keep = a < r;
+        else if (func < 5.5) keep = a <= r;
+        else if (func < 6.5) keep = a > r;
+        else keep = a >= r;
+        if (!keep) discard;
     }
     if (u_blendfix.w > 0.5) c.rgb *= u_blendfix.rgb;
     if (u_alphaout.x > 0.5) c.a = u_alphaout.y;
