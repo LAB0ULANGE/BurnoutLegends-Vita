@@ -274,6 +274,7 @@ std::uint32_t g_batch_count{}, g_batch_vtype{};
 const std::uint8_t *g_batch_in_place{};
 std::vector<std::uint16_t> g_batch_indices;
 bool g_lighting_dirty{true};  // a lighting or material command changed since the last upload
+bool g_drawing{true};         // false while a frame is skipped
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
 Program g_program, g_present;
@@ -770,7 +771,8 @@ void upload_vertex_state(bool through);
 void bind_vertices();
 
 void flush() {
-    if (g_batch_indices.empty()) {
+    if (g_batch_indices.empty() || !g_drawing) {
+        g_batch_indices.clear();
         g_batch.clear();
         g_batch_count = 0u;
         g_batch_in_place = nullptr;
@@ -1546,6 +1548,12 @@ void gl_thread_main() {
         }
         const double started = host_now_ms();
         replay(frame);
+        // Test knob: a slow GPU side (PC runs of the Vita pacing paths).
+        static const int delay_ms = [] {
+            const char *value = std::getenv("PSPRECOMP_BURNOUT_GL_DELAY_MS");
+            return value != nullptr ? std::atoi(value) : 0;
+        }();
+        if (delay_ms > 0) host_sleep_ms(static_cast<double>(delay_ms));
         g_gl_busy_ms.store(g_gl_busy_ms.load() + host_now_ms() - started);
         frame = Frame{};  // release snapshots and payloads before reporting idle
         std::lock_guard lock(g_gl.mutex);
@@ -1754,6 +1762,11 @@ void end_list(Snapshot &&snapshot) {
     if (!snapshot.vertices.empty()) g_frame.snapshots.push_back(std::move(snapshot));
 }
 
+void set_drawing(bool drawing) {
+    if (!drawing) flush();
+    g_drawing = drawing;
+}
+
 void invalidate_textures(std::uint32_t address, std::uint32_t size) {
     for (auto &[key, texture] : g_textures)
         if (texture.address < address + size && address < texture.address + texture.bytes) texture.stale = true;
@@ -1794,6 +1807,10 @@ void present(std::uint32_t address) {
         last_present = g_gl_present_ms.load();
     }
     const auto it = g_targets.find(target_key(address));
+    if (!g_drawing) {
+        phase = 0u;
+        return;  // skipped frame: the screen keeps the previous one
+    }
     record(Op::Present, {it != g_targets.end() ? it->second.texture : 0u,
                          it != g_targets.end() ? static_cast<std::uint32_t>(it->second.width) : 0u});
     forget_state();

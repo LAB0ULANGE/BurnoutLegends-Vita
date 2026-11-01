@@ -27,6 +27,9 @@ struct Options {
     // Logs every PRIM drawn between these vblanks (inclusive) to stderr.
     std::uint64_t trace_from{UINT64_MAX};
     std::uint64_t trace_to{0u};
+    // OpenGL: when the renderer is behind, skip drawing a frame (at most every
+    // other one) instead of making the game wait, so it keeps its speed.
+    bool frame_skip{};
 };
 
 void configure(const Options &options);

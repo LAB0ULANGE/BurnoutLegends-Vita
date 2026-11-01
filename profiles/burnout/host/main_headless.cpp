@@ -72,6 +72,7 @@ Cli parse(int argc, char **argv) {
             cli.render.backend = burnout::render::Backend::OpenGL;
         }
         else if (key == "--capture-dir") cli.render.capture_dir = value();
+        else if (key == "--frame-skip") cli.render.frame_skip = true;  // as on the Vita
         else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
             cli.render.enabled = true;
             const std::string range = value();

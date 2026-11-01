@@ -63,6 +63,10 @@ void invalidate_textures(std::uint32_t address, std::uint32_t size);
 // sceDisplaySetFrameBuf: flushes pending draws and shows `address` on the
 // Vita screen.
 void present(std::uint32_t address);
+// Frame skipping: while false, batches are dropped instead of drawn (state,
+// palettes and transfers still follow the lists) and present() keeps the
+// previous image.
+void set_drawing(bool drawing);
 // RGB888 copy of the 480x272 visible part of the render target at `address`,
 // handed to `done` on the GL thread once the frame so far has been drawn
 // (empty if there is no such target).

@@ -186,6 +186,7 @@ struct Job {
     std::vector<std::array<std::uint32_t, 3>> commands;
     std::vector<Transfer> transfers;  // TRXKICK entries carry their index here
     gl::Snapshot snapshot;  // PRIM/LOAD_CLUT entries carry their record offset here
+    bool skip{};            // frame skipped: commands followed, nothing drawn
     std::uint32_t address{};
     std::uint64_t vblank{};
 };
@@ -310,6 +311,7 @@ void worker_loop() {
         gl::phase = 0u;
         switch (job.kind) {
         case Job::Kind::Commands:
+            gl::set_drawing(!job.skip);
             for (const auto &c : job.commands) {
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
                 const std::uint32_t op = c[0] >> 24u;
@@ -333,7 +335,9 @@ void worker_loop() {
             break;
         case Job::Kind::Present:
             gl::account(0.0, started - waiting);
+            gl::set_drawing(!job.skip);
             gl::present(job.address);
+            gl::set_drawing(true);
             if (gl::stats().frames % 300u == 0u) trace_op_costs();
             break;
         case Job::Kind::Capture: {
@@ -423,6 +427,8 @@ bool forwarded(std::uint32_t op, std::uint32_t word) {
 }
 
 double g_emulation_wait_ms{};  // emulation thread blocked on the worker
+bool g_skip_frame{};             // the frame being built is not drawn (frame_skip)
+std::uint64_t g_skipped_frames{};
 double g_scan_ms{};            // emulation thread walking display lists
 
 void push_job(Job job) {
@@ -431,7 +437,9 @@ void push_job(Job job) {
         const double started = host_now_ms();
         const std::uint32_t outer = gl::emulation_phase;
         gl::emulation_phase = 7u;
-        g_jobs_cv.wait(lock, [] { return g_queued_command_jobs < 2u; });
+        // A skipped frame costs the worker little: no need to wait for it.
+        const std::uint32_t room = job.skip ? 4u : 2u;
+        g_jobs_cv.wait(lock, [room] { return g_queued_command_jobs < room; });
         gl::emulation_phase = outer;
         g_emulation_wait_ms += host_now_ms() - started;
         ++g_queued_command_jobs;
@@ -444,6 +452,7 @@ void submit_pending() {
     if (g_pending.empty()) return;
     Job job;
     job.kind = Job::Kind::Commands;
+    job.skip = g_skip_frame;
     job.commands.swap(g_pending);
     job.transfers.swap(g_pending_transfers);
     g_pending.reserve(job.commands.size());
@@ -657,11 +666,20 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         Job present;
         present.kind = Job::Kind::Present;
         present.address = address;
+        present.skip = g_skip_frame;
         push_job(std::move(present));
+        // Decide for the next frame: skip it when the worker is still busy
+        // with earlier lists, but never two frames in a row.
+        if (g_options.frame_skip) {
+            std::lock_guard lock(g_jobs_mutex);
+            g_skip_frame = !g_skip_frame && g_queued_command_jobs >= 2u;
+            if (g_skip_frame) ++g_skipped_frames;
+        }
         if (++g_flips % 300u == 0u) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "emulation: list scan %.1f ms/flip, waited %.1f ms/flip for the worker",
-                          g_scan_ms / 300.0, g_emulation_wait_ms / 300.0);
+            char line[160];
+            std::snprintf(line, sizeof(line), "emulation: list scan %.1f ms/flip, waited %.1f ms/flip for the worker, %llu of 300 frames skipped",
+                          g_scan_ms / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames));
+            g_skipped_frames = 0u;
             g_scan_ms = 0.0;
             gl::trace(line);
             g_emulation_wait_ms = 0.0;

@@ -240,6 +240,7 @@ int main() {
         render.backend = burnout::render::Backend::OpenGL;
         render.capture_vblanks = {2101u, 3001u};
         render.capture_dir = "ux0:data/burnout-frames";
+        render.frame_skip = true;
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::render::configure(render);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
