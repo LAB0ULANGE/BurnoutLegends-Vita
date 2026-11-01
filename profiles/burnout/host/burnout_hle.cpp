@@ -1308,8 +1308,9 @@ void install_display_input(Runtime &rt) {
             r.memory().zero(pad, 16u);
             r.memory().store32(pad + 0u, static_cast<std::uint32_t>(k.time_us));
             r.memory().store32(pad + 4u, buttons);
-            r.memory().store8(pad + 8u, 128u);
-            r.memory().store8(pad + 9u, 128u);
+            const std::uint32_t analog = k.observer.controller_analog ? k.observer.controller_analog() : 0x8080u;
+            r.memory().store8(pad + 8u, static_cast<std::uint8_t>(analog & 0xFFu));
+            r.memory().store8(pad + 9u, static_cast<std::uint8_t>((analog >> 8u) & 0xFFu));
         }
         ret(ctx, count);
     });

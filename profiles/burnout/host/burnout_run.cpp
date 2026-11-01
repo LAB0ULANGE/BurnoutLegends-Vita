@@ -89,6 +89,7 @@ BenchResult run_benchmark(const BenchOptions &options) {
     observer.controller_buttons = [&](std::uint64_t vblank) {
         return options.script.buttons_at(vblank) | (options.live_buttons ? options.live_buttons() : 0u);
     };
+    if (options.live_analog) observer.controller_analog = options.live_analog;
     observer.on_file_open = [&](const std::string &path) {
         const std::string key = lower(path);
         const std::uint64_t vblank = vblank_count();

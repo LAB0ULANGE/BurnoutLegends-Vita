@@ -166,6 +166,11 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
         sceCtrlPeekBufferPositive(0, &pad, 1);
         return static_cast<std::uint32_t>(pad.buttons) & 0xF3F9u;  // PSP-compatible bits
     };
+    options.live_analog = [] {
+        SceCtrlData pad{};
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        return static_cast<std::uint32_t>(pad.lx) | (static_cast<std::uint32_t>(pad.ly) << 8u);  // left stick
+    };
     options.quit_requested = [] {
         SceCtrlData pad{};
         sceCtrlPeekBufferPositive(0, &pad, 1);

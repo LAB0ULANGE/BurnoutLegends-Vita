@@ -38,6 +38,7 @@ struct BenchOptions {
     // Interactive builds: buttons OR-ed with the script (a real pad), pacing so
     // virtual vblanks never run ahead of real time, and a quit request.
     std::function<std::uint32_t()> live_buttons;
+    std::function<std::uint32_t()> live_analog;  // x | y << 8, 128 = centre
     bool realtime{};
     std::function<bool()> quit_requested;
 };

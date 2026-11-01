@@ -30,6 +30,8 @@ struct HleObserver {
     std::function<void(std::uint32_t frame_buffer, std::uint64_t vblank)> on_set_frame_buffer;
     std::function<void(const std::string &path)> on_file_open;
     std::function<std::uint32_t(std::uint64_t vblank)> controller_buttons;
+    // Analog stick: x in the low byte, y in the next (128 = centre).
+    std::function<std::uint32_t()> controller_analog;
 };
 
 void install_hle(psprecomp::Runtime &runtime, const HleOptions &options, HleObserver observer);
