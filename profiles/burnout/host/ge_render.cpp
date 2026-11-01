@@ -8,8 +8,16 @@
 
 #include "burnout_hle.hpp"
 
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#endif
+
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -109,27 +117,187 @@ void write_png(const std::filesystem::path &path, std::uint32_t width, std::uint
 }
 
 // TRXKICK: GE block copy between RAM and VRAM (textures are uploaded this way).
-void block_transfer(psprecomp::GuestMemory &memory, std::uint32_t data) {
+// The source rows are captured when ge_scan reaches the command; the copy into
+// the destination can then happen later, in command order, on the GL worker.
+struct Transfer {
+    std::uint32_t destination{}, destination_stride{}, destination_x{}, destination_y{};
+    std::uint32_t width{}, height{}, bpp{};
+    std::vector<std::uint8_t> rows;
+    bool valid{};
+};
+
+Transfer snapshot_transfer(const psprecomp::GuestMemory &memory, std::uint32_t data) {
     const auto c = [](std::uint32_t index) { return g_commands[index] & 0x00FFFFFFu; };
+    Transfer t;
     const std::uint32_t source = (c(0xB2u) & 0xFFFFF0u) | ((c(0xB3u) & 0xFF0000u) << 8u);
     const std::uint32_t source_stride = c(0xB3u) & 0x7F8u;
-    const std::uint32_t destination = (c(0xB4u) & 0xFFFFF0u) | ((c(0xB5u) & 0xFF0000u) << 8u);
-    const std::uint32_t destination_stride = c(0xB5u) & 0x7F8u;
+    t.destination = (c(0xB4u) & 0xFFFFF0u) | ((c(0xB5u) & 0xFF0000u) << 8u);
+    t.destination_stride = c(0xB5u) & 0x7F8u;
     const std::uint32_t source_x = c(0xEBu) & 0x3FFu, source_y = (c(0xEBu) >> 10u) & 0x3FFu;
-    const std::uint32_t destination_x = c(0xECu) & 0x3FFu, destination_y = (c(0xECu) >> 10u) & 0x3FFu;
-    const std::uint32_t width = (c(0xEEu) & 0x3FFu) + 1u, height = ((c(0xEEu) >> 10u) & 0x3FFu) + 1u;
-    const std::uint32_t bpp = (data & 1u) != 0u ? 4u : 2u;
+    t.destination_x = c(0xECu) & 0x3FFu;
+    t.destination_y = (c(0xECu) >> 10u) & 0x3FFu;
+    t.width = (c(0xEEu) & 0x3FFu) + 1u;
+    t.height = ((c(0xEEu) >> 10u) & 0x3FFu) + 1u;
+    t.bpp = (data & 1u) != 0u ? 4u : 2u;
+    const std::uint32_t row_bytes = t.width * t.bpp;
+    t.rows.resize(static_cast<std::size_t>(row_bytes) * t.height);
     ++g_transfers;
-    if ((destination & 0x0F000000u) != 0x04000000u) ++g_transfers_to_ram;
-    for (std::uint32_t y = 0; y < height; ++y) {
-        const std::uint32_t from = source + ((source_y + y) * source_stride + source_x) * bpp;
-        const std::uint32_t to = destination + ((destination_y + y) * destination_stride + destination_x) * bpp;
-        const std::uint8_t *src = memory.raw_pointer(from, width * bpp);
-        std::uint8_t *dst = memory.raw_pointer(to, width * bpp);
-        if (src == nullptr || dst == nullptr) { ++g_transfer_failures; return; }
-        std::memmove(dst, src, width * bpp);
-        g_transfer_bytes += width * bpp;
+    if ((t.destination & 0x0F000000u) != 0x04000000u) ++g_transfers_to_ram;
+    for (std::uint32_t y = 0; y < t.height; ++y) {
+        const std::uint32_t from = source + ((source_y + y) * source_stride + source_x) * t.bpp;
+        const std::uint8_t *src = memory.raw_pointer(from, row_bytes);
+        if (src == nullptr) { ++g_transfer_failures; return t; }
+        std::memcpy(&t.rows[static_cast<std::size_t>(y) * row_bytes], src, row_bytes);
     }
+    g_transfer_bytes += t.rows.size();
+    t.valid = true;
+    return t;
+}
+
+void apply_transfer(psprecomp::GuestMemory &memory, const Transfer &t) {
+    if (!t.valid) return;
+    const std::uint32_t row_bytes = t.width * t.bpp;
+    for (std::uint32_t y = 0; y < t.height; ++y) {
+        const std::uint32_t to = t.destination + ((t.destination_y + y) * t.destination_stride + t.destination_x) * t.bpp;
+        std::uint8_t *dst = memory.raw_pointer(to, row_bytes);
+        if (dst == nullptr) return;
+        std::memcpy(dst, &t.rows[static_cast<std::size_t>(y) * row_bytes], row_bytes);
+    }
+}
+
+void block_transfer(psprecomp::GuestMemory &memory, std::uint32_t data) {
+    apply_transfer(memory, snapshot_transfer(memory, data));
+}
+
+// ---------------------------------------------------------------- GL worker
+//
+// The game submits a whole frame's display list at the flip and only peeks at
+// the GE afterwards, so the frame can be drawn on another core while the
+// emulation thread runs the next one. ge_scan still walks the list on the
+// emulation thread (control flow, callbacks, block transfers); the worker gets
+// a copy of the commands and owns the GL context. At most two frames queue up.
+
+struct Job {
+    enum class Kind { Commands, Present, Capture } kind{};
+    std::vector<std::array<std::uint32_t, 3>> commands;
+    std::vector<Transfer> transfers;  // TRXKICK entries carry their index here
+    std::uint32_t address{};
+    std::uint64_t vblank{};
+};
+
+std::mutex g_jobs_mutex;
+std::condition_variable g_jobs_cv;
+std::deque<Job> g_jobs;
+std::size_t g_queued_command_jobs{};
+bool g_worker_busy{};
+bool g_worker_ready{};
+bool g_worker_failed{};
+std::string g_worker_error;
+std::vector<std::array<std::uint32_t, 3>> g_pending;
+std::vector<Transfer> g_pending_transfers;
+psprecomp::GuestMemory *g_memory{};
+
+void capture_rgb(const std::vector<std::uint8_t> &rgb, std::uint64_t vblank) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "frame_%06llu.png", static_cast<unsigned long long>(vblank));
+    write_png(g_options.capture_dir / name, 480u, 272u, rgb);
+    ++g_captures;
+}
+
+void worker_loop() {
+    {
+        std::string error;
+        const bool ok = gl::initialize(error);
+        std::lock_guard lock(g_jobs_mutex);
+        g_worker_ready = true;
+        g_worker_failed = !ok;
+        g_worker_error = error;
+        g_jobs_cv.notify_all();
+        if (!ok) return;
+    }
+    for (;;) {
+        Job job;
+        {
+            std::unique_lock lock(g_jobs_mutex);
+            g_jobs_cv.wait(lock, [] { return !g_jobs.empty(); });
+            job = std::move(g_jobs.front());
+            g_jobs.pop_front();
+            g_worker_busy = true;
+        }
+        switch (job.kind) {
+        case Job::Kind::Commands:
+            for (const auto &c : job.commands) {
+                // A TRXKICK carries the index of its snapshot instead of base/offset.
+                if ((c[0] >> 24u) == 0xEAu && c[2] == UINT32_MAX) apply_transfer(*g_memory, job.transfers[c[1]]);
+                gl::ge_command(*g_memory, c[0], c[1], c[2]);
+            }
+            break;
+        case Job::Kind::Present:
+            gl::present(job.address);
+            break;
+        case Job::Kind::Capture: {
+            std::vector<std::uint8_t> rgb;
+            if (gl::read_frame(job.address, rgb)) capture_rgb(rgb, job.vblank);
+            break;
+        }
+        }
+        std::lock_guard lock(g_jobs_mutex);
+        if (job.kind == Job::Kind::Commands) --g_queued_command_jobs;
+        g_worker_busy = false;
+        g_jobs_cv.notify_all();
+    }
+}
+
+#if defined(__vita__)
+int worker_entry(SceSize, void *) {
+    worker_loop();
+    return 0;
+}
+#endif
+
+void start_worker() {
+#if defined(__vita__)
+    // Core 1: core 0 runs the emulation, core 2 the profiler/vitaGL helpers.
+    const SceUID thread = sceKernelCreateThread("ge_gl", worker_entry, 0x10000100, 1024 * 1024, 0,
+                                                SCE_KERNEL_CPU_MASK_USER_1, nullptr);
+    if (thread >= 0) sceKernelStartThread(thread, 0, nullptr);
+#else
+    std::thread(worker_loop).detach();
+#endif
+}
+
+void push_job(Job job) {
+    std::unique_lock lock(g_jobs_mutex);
+    if (job.kind == Job::Kind::Commands) {
+        g_jobs_cv.wait(lock, [] { return g_queued_command_jobs < 2u; });
+        ++g_queued_command_jobs;
+    }
+    g_jobs.push_back(std::move(job));
+    g_jobs_cv.notify_all();
+}
+
+void submit_pending() {
+    if (g_pending.empty()) return;
+    Job job;
+    job.kind = Job::Kind::Commands;
+    job.commands.swap(g_pending);
+    job.transfers.swap(g_pending_transfers);
+    push_job(std::move(job));
+    // The worker reads vertices, indices and palettes from guest RAM, which the
+    // game rewrites while it builds the next frame, so overlapping corrupts the
+    // picture until those are snapshotted at scan time. Until then each list is
+    // waited for; PSPRECOMP_BURNOUT_GL_ASYNC=1 enables the overlap.
+    static const bool overlap = std::getenv("PSPRECOMP_BURNOUT_GL_ASYNC") != nullptr;
+    if (!overlap) {
+        std::unique_lock lock(g_jobs_mutex);
+        g_jobs_cv.wait(lock, [] { return g_jobs.empty() && !g_worker_busy; });
+    }
+}
+
+void drain_worker() {
+    submit_pending();
+    std::unique_lock lock(g_jobs_mutex);
+    g_jobs_cv.wait(lock, [] { return g_jobs.empty() && !g_worker_busy; });
 }
 
 } // namespace
@@ -143,9 +311,11 @@ void configure(const Options &options) {
     g_options.backend = Backend::OpenGL;
 #endif
     if (g_options.enabled && g_options.backend == Backend::OpenGL) {
-        std::string error;
-        if (!gl::initialize(error)) {
-            std::cerr << "[render] OpenGL unavailable: " << error << "\n";
+        start_worker();
+        std::unique_lock lock(g_jobs_mutex);
+        g_jobs_cv.wait(lock, [] { return g_worker_ready; });
+        if (g_worker_failed) {
+            std::cerr << "[render] OpenGL unavailable: " << g_worker_error << "\n";
             g_options.enabled = false;
         }
     }
@@ -163,8 +333,19 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
     const std::uint32_t data = word & 0x00FFFFFFu;
     g_commands[op] = word;
     if (g_options.backend == Backend::OpenGL) {
-        if (op == 0xEAu) block_transfer(memory, data);
-        gl::ge_command(memory, word, base, offset);
+        g_memory = &memory;
+        if (op == 0xEAu) {
+            Transfer transfer = snapshot_transfer(memory, data);
+            if ((transfer.destination & 0x0F000000u) == 0x04000000u) {
+                // Into VRAM, which only the GE reads: replay in command order.
+                g_pending.push_back({word, static_cast<std::uint32_t>(g_pending_transfers.size()), UINT32_MAX});
+                g_pending_transfers.push_back(std::move(transfer));
+                return;
+            }
+            apply_transfer(memory, transfer);  // guest RAM: stays synchronous
+        }
+        g_pending.push_back({word, base, offset});
+        if (op == 0x0Cu) submit_pending();  // END: hand the list to the worker
         return;
     }
 #if defined(BURNOUT_GE_SOFTWARE)
@@ -258,25 +439,32 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
 void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stride,
                       std::uint32_t format, std::uint64_t vblank) {
     if (!g_options.enabled) return;
-    if (g_options.backend == Backend::OpenGL) gl::present(address);
+    if (g_options.backend == Backend::OpenGL) {
+        submit_pending();
+        Job present;
+        present.kind = Job::Kind::Present;
+        present.address = address;
+        push_job(std::move(present));
+    }
     if (g_options.capture_vblanks.empty()) return;
     const auto next = g_options.capture_vblanks.begin();
     if (vblank < *next) return;
     g_options.capture_vblanks.erase(next);
     if (address == 0u || stride == 0u) return;
+    if (g_options.backend == Backend::OpenGL) {
+        Job capture;
+        capture.kind = Job::Kind::Capture;
+        capture.address = address;
+        capture.vblank = vblank;
+        push_job(std::move(capture));
+        return;
+    }
     try {
         std::vector<std::uint8_t> rgb;
-        if (g_options.backend == Backend::OpenGL) {
-            if (!gl::read_frame(address, rgb)) return;
-        } else {
 #if defined(BURNOUT_GE_SOFTWARE)
-            rgb = vcs::decode_framebuffer_rgb(memory, vcs::FramebufferDescription{address, 480u, 272u, stride, format});
+        rgb = vcs::decode_framebuffer_rgb(memory, vcs::FramebufferDescription{address, 480u, 272u, stride, format});
 #endif
-        }
-        char name[64];
-        std::snprintf(name, sizeof(name), "frame_%06llu.png", static_cast<unsigned long long>(vblank));
-        write_png(g_options.capture_dir / name, 480u, 272u, rgb);
-        ++g_captures;
+        capture_rgb(rgb, vblank);
     } catch (const std::exception &e) {
         std::cerr << "[render] capture at vblank " << vblank << " failed: " << e.what() << "\n";
     }
@@ -286,6 +474,7 @@ std::string report() {
     if (!g_options.enabled) return {};
     std::ostringstream out;
     if (g_options.backend == Backend::OpenGL) {
+        drain_worker();
         const auto &s = gl::stats();
         out << "GE OpenGL render: " << s.primitives << " PRIM in " << s.batches << " batches (" << s.vertices
             << " vertices, " << s.skipped_primitives << " PRIM skipped), " << s.texture_uploads << " texture uploads, "
