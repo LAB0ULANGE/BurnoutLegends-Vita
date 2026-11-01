@@ -18,6 +18,17 @@ namespace burnout::gl {
 bool initialize(std::string &error);
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset);
+
+// Emulation-thread side of the GL worker. Follows the vertex and index
+// pointers and appends to `arena` the guest bytes `word` will read (PRIM
+// vertices and indices, LOAD_CLUT palette), so the worker can draw the frame
+// while the game overwrites them. Returns the record's offset in `arena`, or
+// UINT32_MAX when the command reads no guest memory.
+std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base,
+                               std::uint32_t offset, std::vector<std::uint8_t> &arena);
+// The next ge_command reads `record` (from snapshot_command) instead of guest
+// memory; nullptr goes back to guest memory.
+void use_snapshot(const std::uint8_t *record);
 // GE block transfer just copied guest memory into [address, address + size).
 void invalidate_textures(std::uint32_t address, std::uint32_t size);
 

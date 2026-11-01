@@ -690,6 +690,56 @@ std::array<std::uint8_t, 4> light(const Decoded &v, const LightSetup &setup) {
     return out;
 }
 
+// Vertex layout: weights, texcoord, colour, normal, position; each aligned to its size.
+constexpr std::uint32_t sizes_tc[4]{0, 1, 2, 4}, sizes_col[8]{0, 0, 0, 0, 2, 2, 2, 4};
+constexpr std::uint32_t sizes_nrm[4]{0, 1, 2, 4}, sizes_pos[4]{0, 1, 2, 4}, sizes_w[4]{0, 1, 2, 4};
+
+struct VertexLayout {
+    std::uint32_t tc{}, col{}, nrm{}, pos{}, stride{};
+};
+
+VertexLayout vertex_layout(std::uint32_t vtype) {
+    const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
+    const std::uint32_t weight = (vtype >> 9u) & 3u;
+    const std::uint32_t weights = weight != 0u ? ((vtype >> 14u) & 7u) + 1u : 0u;
+    std::uint32_t offset = 0u, alignment = 1u;
+    const auto place = [&](std::uint32_t size, std::uint32_t n) {
+        offset = (offset + size - 1u) & ~(size - 1u);
+        const std::uint32_t at = offset;
+        offset += size * n;
+        alignment = std::max(alignment, size);
+        return at;
+    };
+    VertexLayout layout;
+    if (weights != 0u) place(sizes_w[weight], weights);
+    layout.tc = tc ? place(sizes_tc[tc], 2u) : 0u;
+    layout.col = col >= 4u ? place(sizes_col[col], 1u) : 0u;
+    layout.nrm = nrm ? place(sizes_nrm[nrm], 3u) : 0u;
+    layout.pos = place(std::max<std::uint32_t>(sizes_pos[pos], 1u), 3u);
+    layout.stride = (offset + alignment - 1u) & ~(alignment - 1u);
+    return layout;
+}
+
+// Snapshot record: header, then the index bytes, then the vertex bytes (a
+// LOAD_CLUT record keeps the palette in the index part). UINT32_MAX marks a
+// part the emulation thread could not read.
+struct SnapshotHeader {
+    std::uint32_t index_bytes{UINT32_MAX}, vertex_bytes{UINT32_MAX};
+};
+
+const std::uint8_t *g_snapshot{};
+
+// `bytes` of guest memory at `address`, from the current snapshot record when
+// there is one (`vertices` picks its part).
+const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t bytes, bool vertices) {
+    if (g_snapshot == nullptr) return memory.raw_pointer(address, bytes);
+    SnapshotHeader header;
+    std::memcpy(&header, g_snapshot, sizeof(header));
+    const std::uint32_t have = vertices ? header.vertex_bytes : header.index_bytes;
+    if (have == UINT32_MAX || have < bytes) return nullptr;
+    return g_snapshot + sizeof(header) + (vertices ? header.index_bytes : 0u);
+}
+
 bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const std::uint32_t primitive = (data >> 16u) & 7u;
     const std::uint32_t count = data & 0xFFFFu;
@@ -700,37 +750,14 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const std::uint32_t morphs = ((vtype >> 18u) & 7u) + 1u;
     const bool through = (vtype & 0x800000u) != 0u;
 
-    // Layout: weights, texcoord, colour, normal, position; each aligned to its size.
-    static constexpr std::uint32_t sizes_tc[4]{0, 1, 2, 4}, sizes_col[8]{0, 0, 0, 0, 2, 2, 2, 4};
-    static constexpr std::uint32_t sizes_nrm[4]{0, 1, 2, 4}, sizes_pos[4]{0, 1, 2, 4}, sizes_w[4]{0, 1, 2, 4};
-    std::uint32_t offset = 0u, alignment = 1u;
-    const auto place = [&](std::uint32_t size, std::uint32_t n) {
-        offset = (offset + size - 1u) & ~(size - 1u);
-        const std::uint32_t at = offset;
-        offset += size * n;
-        alignment = std::max(alignment, size);
-        return at;
-    };
-    if (weights != 0u) place(sizes_w[weight], weights);
-    const std::uint32_t tc_offset = tc ? place(sizes_tc[tc], 2u) : 0u;
-    const std::uint32_t col_offset = col >= 4u ? place(sizes_col[col], 1u) : 0u;
-    const std::uint32_t nrm_offset = nrm ? place(sizes_nrm[nrm], 3u) : 0u;
-    const std::uint32_t pos_offset = place(std::max<std::uint32_t>(sizes_pos[pos], 1u), 3u);
-    const std::uint32_t stride = (offset + alignment - 1u) & ~(alignment - 1u);
+    const VertexLayout layout = vertex_layout(vtype);
+    const std::uint32_t tc_offset = layout.tc, col_offset = layout.col, nrm_offset = layout.nrm, pos_offset = layout.pos;
+    const std::uint32_t stride = layout.stride;
 
     if (weights != 0u || morphs > 1u || primitive < 3u) {  // skinning/morphing/points/lines: not yet
         ++g_stats.skipped_primitives;
-        std::uint32_t used = count;
-        if (index != 0u) {
-            std::uint32_t max_index = 0u;
-            for (std::uint32_t i = 0; i < count; ++i)
-                max_index = std::max<std::uint32_t>(max_index, index == 1u ? memory.load8(g_index_address + i)
-                                                                            : memory.load16(g_index_address + i * 2u));
-            g_index_address += count * (index == 1u ? 1u : 2u);
-            used = 0u;
-            (void)max_index;
-        }
-        g_vertex_address += used * stride;
+        if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
+        else g_vertex_address += count * stride;
         return false;
     }
 
@@ -752,7 +779,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         for (std::uint32_t i = 0; i < count; ++i) indices[i] = i;
         max_vertex = count == 0u ? 0u : count - 1u;
     } else {
-        const std::uint8_t *index_data = memory.raw_pointer(g_index_address, count * (index == 1u ? 1u : 2u));
+        const std::uint8_t *index_data = guest_bytes(memory, g_index_address, count * (index == 1u ? 1u : 2u), false);
         if (index_data == nullptr) { ++g_stats.skipped_primitives; return false; }
         for (std::uint32_t i = 0; i < count; ++i) {
             indices[i] = index == 1u ? index_data[i]
@@ -761,7 +788,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         }
     }
     const std::uint32_t vertex_count = count == 0u ? 0u : max_vertex + 1u;
-    const std::uint8_t *raw = memory.raw_pointer(g_vertex_address, static_cast<std::size_t>(vertex_count) * stride);
+    const std::uint8_t *raw = guest_bytes(memory, g_vertex_address, vertex_count * stride, true);
     if (raw == nullptr) { ++g_stats.skipped_primitives; return false; }
 
     static std::vector<Vertex> vertices;
@@ -941,12 +968,85 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
     case 0xC4u: {  // LOAD_CLUT: the GE copies the palette on chip
         const std::uint32_t clut = (cmd(0xB0u) & 0xFFFFF0u) | ((cmd(0xB1u) << 8u) & 0x0F000000u);
         const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
-        if (const std::uint8_t *p = memory.raw_pointer(clut, bytes)) std::memcpy(g_clut.data(), p, bytes);
+        if (const std::uint8_t *p = guest_bytes(memory, clut, bytes, false)) std::memcpy(g_clut.data(), p, bytes);
         break;
     }
     default: break;
     }
 }
+
+namespace {
+
+// Pointer state of the emulation thread, kept apart from the worker's.
+struct SnapshotState {
+    std::uint32_t vtype{}, clut_low{}, clut_high{}, vertex_address{}, index_address{};
+} g_scan;
+
+void append(std::vector<std::uint8_t> &arena, const std::uint8_t *bytes, std::uint32_t size) {
+    arena.insert(arena.end(), bytes, bytes + size);
+}
+
+} // namespace
+
+std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base,
+                               std::uint32_t offset, std::vector<std::uint8_t> &arena) {
+    const std::uint32_t op = word >> 24u;
+    const std::uint32_t data = word & 0x00FFFFFFu;
+    switch (op) {
+    case 0x01u: g_scan.vertex_address = ((base | data) + offset) & 0x0FFFFFFFu; return UINT32_MAX;
+    case 0x02u: g_scan.index_address = ((base | data) + offset) & 0x0FFFFFFFu; return UINT32_MAX;
+    case 0x12u: g_scan.vtype = data; return UINT32_MAX;
+    case 0xB0u: g_scan.clut_low = data; return UINT32_MAX;
+    case 0xB1u: g_scan.clut_high = data; return UINT32_MAX;
+    case 0x04u: case 0xC4u: break;
+    default: return UINT32_MAX;
+    }
+    const auto record = static_cast<std::uint32_t>(arena.size());
+    SnapshotHeader header;
+    arena.resize(arena.size() + sizeof(header));
+    if (op == 0xC4u) {
+        const std::uint32_t clut = (g_scan.clut_low & 0xFFFFF0u) | ((g_scan.clut_high << 8u) & 0x0F000000u);
+        const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
+        if (const std::uint8_t *p = memory.raw_pointer(clut, bytes)) {
+            header.index_bytes = bytes;
+            append(arena, p, bytes);
+        }
+    } else {
+        // Same pointer arithmetic as decode_prim.
+        const std::uint32_t count = data & 0xFFFFu;
+        const std::uint32_t index = (g_scan.vtype >> 11u) & 3u;
+        const std::uint32_t stride = vertex_layout(g_scan.vtype).stride;
+        std::uint32_t vertex_count = count;
+        bool readable = true;
+        if (index != 0u) {
+            const std::uint32_t bytes = count * (index == 1u ? 1u : 2u);
+            const std::uint8_t *p = memory.raw_pointer(g_scan.index_address, bytes);
+            g_scan.index_address += bytes;
+            readable = p != nullptr;
+            if (readable) {
+                header.index_bytes = bytes;
+                append(arena, p, bytes);
+                std::uint32_t max_vertex = 0u;
+                for (std::uint32_t i = 0; i < count; ++i)
+                    max_vertex = std::max<std::uint32_t>(max_vertex, index == 1u ? p[i] : (p[i * 2u] | (p[i * 2u + 1u] << 8u)));
+                vertex_count = count == 0u ? 0u : max_vertex + 1u;
+            }
+        }
+        if (readable) {
+            const std::uint32_t bytes = vertex_count * stride;
+            if (const std::uint8_t *p = memory.raw_pointer(g_scan.vertex_address, bytes)) {
+                if (header.index_bytes == UINT32_MAX) header.index_bytes = 0u;
+                header.vertex_bytes = bytes;
+                append(arena, p, bytes);
+            }
+        }
+        if (index == 0u) g_scan.vertex_address += count * stride;
+    }
+    std::memcpy(&arena[record], &header, sizeof(header));
+    return record;
+}
+
+void use_snapshot(const std::uint8_t *record) { g_snapshot = record; }
 
 void invalidate_textures(std::uint32_t address, std::uint32_t size) {
     (void)address;

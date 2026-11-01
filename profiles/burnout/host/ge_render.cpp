@@ -181,6 +181,7 @@ struct Job {
     enum class Kind { Commands, Present, Capture } kind{};
     std::vector<std::array<std::uint32_t, 3>> commands;
     std::vector<Transfer> transfers;  // TRXKICK entries carry their index here
+    std::vector<std::uint8_t> arena;  // PRIM/LOAD_CLUT entries carry their record offset here
     std::uint32_t address{};
     std::uint64_t vblank{};
 };
@@ -195,6 +196,12 @@ bool g_worker_failed{};
 std::string g_worker_error;
 std::vector<std::array<std::uint32_t, 3>> g_pending;
 std::vector<Transfer> g_pending_transfers;
+std::vector<std::uint8_t> g_pending_arena;
+// Overlap: the worker draws frame N while the emulation runs frame N+1. The
+// guest bytes each list reads are snapshotted at scan time for that, since the
+// game rewrites them while it builds the next frame.
+// PSPRECOMP_BURNOUT_GL_SYNC=1 waits for each list instead.
+const bool g_async = std::getenv("PSPRECOMP_BURNOUT_GL_SYNC") == nullptr;
 psprecomp::GuestMemory *g_memory{};
 
 void capture_rgb(const std::vector<std::uint8_t> &rgb, std::uint64_t vblank) {
@@ -228,8 +235,12 @@ void worker_loop() {
         case Job::Kind::Commands:
             for (const auto &c : job.commands) {
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
-                if ((c[0] >> 24u) == 0xEAu && c[2] == UINT32_MAX) apply_transfer(*g_memory, job.transfers[c[1]]);
+                const std::uint32_t op = c[0] >> 24u;
+                const bool snapshot = c[2] == UINT32_MAX;
+                if (snapshot && op == 0xEAu) apply_transfer(*g_memory, job.transfers[c[1]]);
+                if (snapshot && op != 0xEAu) gl::use_snapshot(job.arena.data() + c[1]);
                 gl::ge_command(*g_memory, c[0], c[1], c[2]);
+                if (snapshot) gl::use_snapshot(nullptr);
             }
             break;
         case Job::Kind::Present:
@@ -282,13 +293,9 @@ void submit_pending() {
     job.kind = Job::Kind::Commands;
     job.commands.swap(g_pending);
     job.transfers.swap(g_pending_transfers);
+    job.arena.swap(g_pending_arena);
     push_job(std::move(job));
-    // The worker reads vertices, indices and palettes from guest RAM, which the
-    // game rewrites while it builds the next frame, so overlapping corrupts the
-    // picture until those are snapshotted at scan time. Until then each list is
-    // waited for; PSPRECOMP_BURNOUT_GL_ASYNC=1 enables the overlap.
-    static const bool overlap = std::getenv("PSPRECOMP_BURNOUT_GL_ASYNC") != nullptr;
-    if (!overlap) {
+    if (!g_async) {
         std::unique_lock lock(g_jobs_mutex);
         g_jobs_cv.wait(lock, [] { return g_jobs.empty() && !g_worker_busy; });
     }
@@ -343,6 +350,14 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
                 return;
             }
             apply_transfer(memory, transfer);  // guest RAM: stays synchronous
+        }
+        if (g_async) {
+            // The worker may draw this list while the game builds the next one.
+            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_arena);
+            if (record != UINT32_MAX) {
+                g_pending.push_back({word, record, UINT32_MAX});
+                return;
+            }
         }
         g_pending.push_back({word, base, offset});
         if (op == 0x0Cu) submit_pending();  // END: hand the list to the worker
