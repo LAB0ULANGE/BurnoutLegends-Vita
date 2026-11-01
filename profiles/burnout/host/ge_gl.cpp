@@ -142,6 +142,8 @@ struct Texture {
     GLuint name{};
     std::uint64_t hash{};
     std::uint64_t checked_frame{UINT64_MAX};
+    std::uint32_t address{}, bytes{};
+    bool stale{true};  // VRAM texture: a block transfer may have rewritten it
 };
 
 struct Program {
@@ -156,6 +158,7 @@ std::array<float, 16> g_projection{};
 std::uint32_t g_world_cursor{}, g_view_cursor{}, g_projection_cursor{}, g_texgen_cursor{};
 std::uint32_t g_vertex_address{}, g_index_address{};
 std::array<std::uint8_t, 1024> g_clut{};   // palette cached by LOAD_CLUT, as on the GE
+std::uint64_t g_clut_hash{};
 std::vector<Vertex> g_batch;
 std::vector<std::uint16_t> g_batch_indices;
 bool g_batch_through{};
@@ -346,13 +349,21 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     std::uint64_t key = (static_cast<std::uint64_t>(address) << 32u) ^ (static_cast<std::uint64_t>(format) << 28u) ^
                         (static_cast<std::uint64_t>(width) << 16u) ^ (static_cast<std::uint64_t>(height) << 4u) ^
                         (swizzled ? 1u : 0u) ^ (static_cast<std::uint64_t>(buffer_width) << 40u);
-    if (paletted) key ^= fnv(g_clut.data(), g_clut.size(), cmd(0xC5u)) * 31u;
+    if (paletted) key ^= (g_clut_hash ^ cmd(0xC5u)) * 31u;
     Texture &texture = g_textures[key];
     const bool fresh = texture.name == 0u;
-    if (fresh) glGenTextures(1, &texture.name);
+    if (fresh) {
+        glGenTextures(1, &texture.name);
+        texture.address = address;
+        texture.bytes = bytes;
+    }
     glBindTexture(GL_TEXTURE_2D, texture.name);
-    if (texture.checked_frame != g_stats.frames && source != nullptr) {
+    // Only block transfers write VRAM (see invalidate_textures); textures in
+    // RAM are re-hashed once per frame.
+    const bool in_vram = (address & 0x0F000000u) == 0x04000000u;
+    if ((in_vram ? texture.stale : texture.checked_frame != g_stats.frames) && source != nullptr) {
         texture.checked_frame = g_stats.frames;
+        texture.stale = false;
         const std::uint64_t hash = fnv(source, bytes);
         if (fresh || hash != texture.hash) {
             texture.hash = hash;
@@ -978,6 +989,7 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
         const std::uint32_t clut = (cmd(0xB0u) & 0xFFFFF0u) | ((cmd(0xB1u) << 8u) & 0x0F000000u);
         const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
         if (const std::uint8_t *p = guest_bytes(memory, clut, bytes, false)) std::memcpy(g_clut.data(), p, bytes);
+        g_clut_hash = fnv(g_clut.data(), g_clut.size());
         break;
     }
     default: break;
@@ -1058,18 +1070,35 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
 void use_snapshot(const std::uint8_t *record) { g_snapshot = record; }
 
 void invalidate_textures(std::uint32_t address, std::uint32_t size) {
-    (void)address;
-    (void)size;
-    // Texture contents are re-hashed once per frame, so new uploads are seen.
+    for (auto &[key, texture] : g_textures)
+        if (texture.address < address + size && address < texture.address + texture.bytes) texture.stale = true;
 }
 
 void present(std::uint32_t address) {
     flush();
     ++g_stats.frames;
-    if (g_stats.frames <= 3u || g_stats.frames % 600u == 0u) {
+    if (g_stats.frames <= 3u) {
         char line[64];
         std::snprintf(line, sizeof(line), "frame %llu", static_cast<unsigned long long>(g_stats.frames));
         trace(line);
+    }
+    if (g_stats.frames % 300u == 0u) {
+        // Per-frame averages since the previous line (worker thread time).
+        static Stats last;
+        static double last_wall = host_now_ms();
+        const double wall = host_now_ms();
+        const double n = static_cast<double>(g_stats.frames - last.frames);
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "frame %llu: %.1f ms/frame wall, decode %.1f, draw %.1f (textures %.1f), present %.1f; %.0f PRIM, %.0f batches, %.0f vertices, %llu texture uploads",
+                      static_cast<unsigned long long>(g_stats.frames), (wall - last_wall) / n, (g_stats.decode_ms - last.decode_ms) / n,
+                      (g_stats.draw_ms - last.draw_ms) / n, (g_stats.texture_ms - last.texture_ms) / n,
+                      (g_stats.present_ms - last.present_ms) / n, static_cast<double>(g_stats.primitives - last.primitives) / n,
+                      static_cast<double>(g_stats.batches - last.batches) / n, static_cast<double>(g_stats.vertices - last.vertices) / n,
+                      static_cast<unsigned long long>(g_stats.texture_uploads - last.texture_uploads));
+        trace(line);
+        last = g_stats;
+        last_wall = wall;
     }
     const double started = host_now_ms();
     const auto it = g_targets.find(target_key(address));

@@ -6,6 +6,7 @@
 #endif
 #include "ge_gl.hpp"
 
+#include "burnout_bench.hpp"
 #include "burnout_hle.hpp"
 
 #if defined(__vita__)
@@ -269,7 +270,14 @@ void worker_loop() {
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
                 const std::uint32_t op = c[0] >> 24u;
                 const bool snapshot = c[2] == UINT32_MAX;
-                if (snapshot && op == 0xEAu) apply_transfer(*g_memory, job.transfers[c[1]]);
+                if (snapshot && op == 0xEAu) {
+                    const Transfer &transfer = job.transfers[c[1]];
+                    apply_transfer(*g_memory, transfer);
+                    const std::uint32_t first = transfer.destination +
+                        (transfer.destination_y * transfer.destination_stride + transfer.destination_x) * transfer.bpp;
+                    gl::invalidate_textures(first, (transfer.height - 1u) * transfer.destination_stride * transfer.bpp +
+                                                       transfer.width * transfer.bpp);
+                }
                 if (snapshot && op != 0xEAu) gl::use_snapshot(job.arena.data() + c[1]);
                 gl::ge_command(*g_memory, c[0], c[1], c[2]);
                 if (snapshot) gl::use_snapshot(nullptr);
@@ -323,10 +331,14 @@ void start_worker() {
 #endif
 }
 
+double g_emulation_wait_ms{};  // emulation thread blocked on the worker
+
 void push_job(Job job) {
     std::unique_lock lock(g_jobs_mutex);
     if (job.kind == Job::Kind::Commands) {
+        const double started = host_now_ms();
         g_jobs_cv.wait(lock, [] { return g_queued_command_jobs < 2u; });
+        g_emulation_wait_ms += host_now_ms() - started;
         ++g_queued_command_jobs;
     }
     g_jobs.push_back(std::move(job));
@@ -506,6 +518,13 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         present.kind = Job::Kind::Present;
         present.address = address;
         push_job(std::move(present));
+        static std::uint64_t flips = 0;
+        if (++flips % 300u == 0u) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "emulation waited %.1f ms/flip for the worker", g_emulation_wait_ms / 300.0);
+            gl::trace(line);
+            g_emulation_wait_ms = 0.0;
+        }
     }
     if (g_options.capture_vblanks.empty()) return;
     const auto next = g_options.capture_vblanks.begin();
