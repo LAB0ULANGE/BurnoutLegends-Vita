@@ -24,7 +24,11 @@ struct Cli {
     std::filesystem::path script;
     std::filesystem::path report{"burnout-bench.txt"};
     std::filesystem::path profile;
-    burnout::render::Options render{false, {}, "out/burnout-frames"};
+    burnout::render::Options render = [] {
+        burnout::render::Options options;
+        options.capture_dir = "out/burnout-frames";
+        return options;
+    }();
 };
 
 Cli parse(int argc, char **argv) {
@@ -63,6 +67,10 @@ Cli parse(int argc, char **argv) {
         else if (key == "--verbose") o.verbose = true;
         else if (key == "--trace-files") o.trace_files = true;
         else if (key == "--render") cli.render.enabled = true;
+        else if (key == "--gl") {  // OpenGL backend (hidden window) instead of the software rasterizer
+            cli.render.enabled = true;
+            cli.render.backend = burnout::render::Backend::OpenGL;
+        }
         else if (key == "--capture-dir") cli.render.capture_dir = value();
         else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
             cli.render.enabled = true;

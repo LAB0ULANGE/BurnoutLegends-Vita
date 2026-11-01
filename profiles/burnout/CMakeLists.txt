@@ -80,10 +80,11 @@ target_include_directories(burnout_ge_render PUBLIC "${BURNOUT_VCS_HOST}")
 target_link_libraries(burnout_ge_render PUBLIC psprecomp_core)
 psprecomp_enable_host_avx(burnout_ge_render)
 
-add_executable(burnout_headless host/main_headless.cpp host/ge_render.cpp ${BURNOUT_HOST_SOURCES}
+add_executable(burnout_headless host/main_headless.cpp host/ge_render.cpp host/ge_gl.cpp host/gl_context_win.cpp
+    ${BURNOUT_HOST_SOURCES}
     $<$<BOOL:${WIN32}>:host/sampling_profiler_win.cpp>)
-target_link_libraries(burnout_headless PRIVATE burnout_generated burnout_ge_render)
-target_compile_definitions(burnout_headless PRIVATE BURNOUT_GE_RENDER=1)
+target_link_libraries(burnout_headless PRIVATE burnout_generated burnout_ge_render opengl32)
+target_compile_definitions(burnout_headless PRIVATE BURNOUT_GE_RENDER=1 BURNOUT_GE_SOFTWARE=1)
 target_include_directories(burnout_headless PRIVATE "${BURNOUT_PROFILE_DIR}/host")
 if(MSVC)
     # Guest code runs on the host stack only one dispatch deep, but generated

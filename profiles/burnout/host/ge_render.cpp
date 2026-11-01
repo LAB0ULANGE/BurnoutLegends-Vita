@@ -1,7 +1,10 @@
 #include "ge_render.hpp"
 
+#if defined(BURNOUT_GE_SOFTWARE)
 #include "framebuffer_capture.hpp"
 #include "ge_renderer.hpp"
+#endif
+#include "ge_gl.hpp"
 
 #include "burnout_hle.hpp"
 
@@ -21,7 +24,9 @@ namespace {
 
 Options g_options;
 std::array<std::uint32_t, 256> g_commands{};
+#if defined(BURNOUT_GE_SOFTWARE)
 vcs::GeTransformState g_transform{};
+#endif
 std::uint32_t g_vertex_address{};
 std::uint32_t g_index_address{};
 std::uint32_t g_clut_loaded_from{};
@@ -132,7 +137,18 @@ void block_transfer(psprecomp::GuestMemory &memory, std::uint32_t data) {
 void configure(const Options &options) {
     g_options = options;
     g_commands.fill(0u);
+#if defined(BURNOUT_GE_SOFTWARE)
     vcs::reset_ge_transform_state(g_transform);
+#else
+    g_options.backend = Backend::OpenGL;
+#endif
+    if (g_options.enabled && g_options.backend == Backend::OpenGL) {
+        std::string error;
+        if (!gl::initialize(error)) {
+            std::cerr << "[render] OpenGL unavailable: " << error << "\n";
+            g_options.enabled = false;
+        }
+    }
     if (g_options.enabled && !g_options.capture_vblanks.empty())
         std::filesystem::create_directories(g_options.capture_dir);
 }
@@ -146,6 +162,12 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
     const std::uint32_t op = word >> 24u;
     const std::uint32_t data = word & 0x00FFFFFFu;
     g_commands[op] = word;
+    if (g_options.backend == Backend::OpenGL) {
+        if (op == 0xEAu) block_transfer(memory, data);
+        gl::ge_command(memory, word, base, offset);
+        return;
+    }
+#if defined(BURNOUT_GE_SOFTWARE)
     if (op >= 0x2Au && op <= 0x41u) vcs::update_ge_transform_state(g_transform, op, data);
     const auto address = [&]() { return ((base | data) + offset) & 0x0FFFFFFFu; };
     switch (op) {
@@ -210,13 +232,13 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
             const auto c = [&](std::uint32_t index) { return g_commands[index] & 0x00FFFFFFu; };
             std::fprintf(stderr,
                          "[draw] vb=%llu prim=%u n=%u vtype=%06x vaddr=%08x tex=%u fmt=%u taddr=%08x clut=%08x loaded=%08x/%02x cfmt=%06x tfunc=%06x "
-                         "light=%u blend=%u/%06x atest=%u/%06x ztest=%u/%06x zw=%u fog=%u mat=%06x amb=%06x "
+                         "light=%u blend=%u/%06x fix=%06x/%06x atest=%u/%06x ztest=%u/%06x zw=%u fog=%u mat=%06x amb=%06x "
                          "fb=%06x map=%06x shade=%06x tsize=%06x tmode=%06x uv=%06x,%06x,%06x,%06x wrap=%06x tflt=%06x tested=%llu written=%llu tris=%llu culled=%llu scr=[%.0f,%.0f:%.0f,%.0f]\n",
                          static_cast<unsigned long long>(vblank), (data >> 16u) & 7u, data & 0xFFFFu, c(0x12u),
                          draw_vertex_address, c(0x1Eu) & 1u, c(0xC3u) & 0xFu, (c(0xA0u) & 0xFFFFF0u) | ((c(0xA8u) << 8u) & 0x0F000000u),
                          (c(0xB0u) & 0xFFFFF0u) | ((c(0xB1u) << 8u) & 0x0F000000u), g_clut_loaded_from, g_clut_load_word & 0x3Fu,
                          c(0xC5u), c(0xC9u), c(0x17u) & 1u,
-                         c(0x21u) & 1u, c(0xDFu), c(0x22u) & 1u, c(0xDBu), c(0x23u) & 1u, c(0xDEu), c(0xE7u) & 1u,
+                         c(0x21u) & 1u, c(0xDFu), c(0xE0u), c(0xE1u), c(0x22u) & 1u, c(0xDBu), c(0x23u) & 1u, c(0xDEu), c(0xE7u) & 1u,
                          c(0x1Fu) & 1u, c(0x53u), c(0x55u), c(0x9Cu), c(0xC0u), c(0xC1u), c(0xB8u), c(0xC2u), c(0x48u), c(0x49u),
                          c(0x4Au), c(0x4Bu), c(0xC7u), c(0xC6u),
                          static_cast<unsigned long long>(stats.pixels_tested),
@@ -230,21 +252,30 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
     }
     default: break;
     }
+#endif
 }
 
 void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stride,
                       std::uint32_t format, std::uint64_t vblank) {
-    if (!g_options.enabled || g_options.capture_vblanks.empty()) return;
+    if (!g_options.enabled) return;
+    if (g_options.backend == Backend::OpenGL) gl::present(address);
+    if (g_options.capture_vblanks.empty()) return;
     const auto next = g_options.capture_vblanks.begin();
     if (vblank < *next) return;
     g_options.capture_vblanks.erase(next);
     if (address == 0u || stride == 0u) return;
-    vcs::FramebufferDescription fb{address, 480u, 272u, stride, format};
     try {
-        const auto rgb = vcs::decode_framebuffer_rgb(memory, fb);
+        std::vector<std::uint8_t> rgb;
+        if (g_options.backend == Backend::OpenGL) {
+            if (!gl::read_frame(address, rgb)) return;
+        } else {
+#if defined(BURNOUT_GE_SOFTWARE)
+            rgb = vcs::decode_framebuffer_rgb(memory, vcs::FramebufferDescription{address, 480u, 272u, stride, format});
+#endif
+        }
         char name[64];
         std::snprintf(name, sizeof(name), "frame_%06llu.png", static_cast<unsigned long long>(vblank));
-        write_png(g_options.capture_dir / name, fb.width, fb.height, rgb);
+        write_png(g_options.capture_dir / name, 480u, 272u, rgb);
         ++g_captures;
     } catch (const std::exception &e) {
         std::cerr << "[render] capture at vblank " << vblank << " failed: " << e.what() << "\n";
@@ -254,6 +285,12 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
 std::string report() {
     if (!g_options.enabled) return {};
     std::ostringstream out;
+    if (g_options.backend == Backend::OpenGL) {
+        const auto &s = gl::stats();
+        out << "GE OpenGL render: " << s.primitives << " PRIM in " << s.batches << " batches (" << s.vertices
+            << " vertices, " << s.skipped_primitives << " PRIM skipped), " << s.texture_uploads << " texture uploads, "
+            << s.render_targets << " render targets, " << s.frames << " frames, " << g_captures << " captures\n";
+    }
     out << "GE software render: " << g_primitives << " PRIM, " << g_failures << " failed"
         << (g_first_error.empty() ? "" : " (first: " + g_first_error + ")") << ", " << g_render_ms / 1000.0
         << " s in the rasterizer, " << g_captures << " captures\n"
