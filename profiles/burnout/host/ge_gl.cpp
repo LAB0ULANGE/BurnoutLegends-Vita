@@ -1326,6 +1326,10 @@ struct GlThread {
 } g_gl;
 
 std::vector<GLuint> g_gl_textures, g_gl_framebuffers;  // GL names by id (GL thread)
+// Render targets are drawn at this multiple of the PSP resolution. Only the
+// GL thread applies it: targets, viewports and scissors are recorded in PSP
+// pixels and the shader works in normalized coordinates.
+int g_scale{1};
 std::atomic<double> g_gl_busy_ms{0.0}, g_gl_present_ms{0.0};
 
 GLuint gl_texture(GLuint id) {
@@ -1451,12 +1455,22 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
     std::vector<std::uint8_t> rgb;
     if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_gl_framebuffers[framebuffer_id]);
-        std::vector<std::uint8_t> rgba(480u * 272u * 4u);
-        glReadPixels(0, height - 272, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        // The visible 480x272 at the render scale, averaged back to PSP size.
+        const auto s = static_cast<std::uint32_t>(g_scale);
+        const std::uint32_t w = 480u * s, h = 272u * s;
+        std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4u);
+        glReadPixels(0, (height - 272) * g_scale, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE,
+                     rgba.data());
         rgb.resize(480u * 272u * 3u);
         for (std::uint32_t y = 0; y < 272u; ++y)
             for (std::uint32_t x = 0; x < 480u; ++x)
-                for (int c = 0; c < 3; ++c) rgb[(y * 480u + x) * 3u + c] = rgba[((271u - y) * 480u + x) * 4u + c];
+                for (int c = 0; c < 3; ++c) {
+                    std::uint32_t sum = 0u;
+                    for (std::uint32_t dy = 0; dy < s; ++dy)
+                        for (std::uint32_t dx = 0; dx < s; ++dx)
+                            sum += rgba[(((271u - y) * s + dy) * w + x * s + dx) * 4u + c];
+                    rgb[(y * 480u + x) * 3u + c] = static_cast<std::uint8_t>(sum / (s * s));
+                }
     }
     done(rgb);
 }
@@ -1481,10 +1495,14 @@ void replay(const Frame &frame) {
         }
         case Op::FrontFace: glFrontFace(op[0]); op += 1; break;
         case Op::Scissor:
-            glScissor(static_cast<GLint>(op[0]), static_cast<GLint>(op[1]), static_cast<GLsizei>(op[2]), static_cast<GLsizei>(op[3]));
+            glScissor(static_cast<GLint>(op[0]) * g_scale, static_cast<GLint>(op[1]) * g_scale,
+                      static_cast<GLsizei>(op[2]) * g_scale, static_cast<GLsizei>(op[3]) * g_scale);
             op += 4;
             break;
-        case Op::Viewport: glViewport(0, 0, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1])); op += 2; break;
+        case Op::Viewport:
+            glViewport(0, 0, static_cast<GLsizei>(op[0]) * g_scale, static_cast<GLsizei>(op[1]) * g_scale);
+            op += 2;
+            break;
         case Op::UseProgram: glUseProgram(op[0]); op += 1; break;
         case Op::BindFramebuffer:
             glBindFramebuffer(GL_FRAMEBUFFER, op[0] < g_gl_framebuffers.size() ? g_gl_framebuffers[op[0]] : 0u);
@@ -1501,7 +1519,7 @@ void replay(const Frame &frame) {
         case Op::UniformMatrix: glUniformMatrix4fv(static_cast<GLint>(op[0]), 1, GL_FALSE, floats(op[1])); op += 2; break;
         case Op::Draw: draw(frame, op); op += 7; break;
         case Op::CreateTarget:
-            create_target(op[0], op[1], static_cast<int>(op[2]), static_cast<int>(op[3]));
+            create_target(op[0], op[1], static_cast<int>(op[2]) * g_scale, static_cast<int>(op[3]) * g_scale);
             op += 4;
             break;
         case Op::Present: {
@@ -1586,6 +1604,8 @@ void trace(const char *message) {
     std::fprintf(stderr, "[gl] %s\n", message);
     std::fflush(stderr);
 }
+
+void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
 
 bool initialize(std::string &error) {
     trace("creating the context");

@@ -30,6 +30,8 @@ struct Options {
     // OpenGL: when the renderer is behind, skip drawing a frame (at most every
     // other one) instead of making the game wait, so it keeps its speed.
     bool frame_skip{};
+    // OpenGL: internal resolution, a multiple of 480x272.
+    int render_scale{1};
 };
 
 void configure(const Options &options);

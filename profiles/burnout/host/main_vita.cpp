@@ -241,6 +241,15 @@ int main() {
         render.capture_vblanks = {2101u, 3001u};
         render.capture_dir = "ux0:data/burnout-frames";
         render.frame_skip = true;
+        // 960x544 (the Vita screen) by default; ux0:data/burnout/render_scale.txt
+        // holding 1 renders at the PSP's 480x272.
+        render.render_scale = 2;
+        if (std::FILE *scale = std::fopen((std::string(kRoot) + "render_scale.txt").c_str(), "r")) {
+            int value = 2;
+            if (std::fscanf(scale, "%d", &value) == 1) render.render_scale = value;
+            std::fclose(scale);
+        }
+        std::fprintf(stderr, "[vita] render scale %d\n", render.render_scale);
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::render::configure(render);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");

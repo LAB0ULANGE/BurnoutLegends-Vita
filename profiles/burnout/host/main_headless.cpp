@@ -73,6 +73,7 @@ Cli parse(int argc, char **argv) {
         }
         else if (key == "--capture-dir") cli.render.capture_dir = value();
         else if (key == "--frame-skip") cli.render.frame_skip = true;  // as on the Vita
+        else if (key == "--scale") cli.render.render_scale = std::stoi(value());  // internal resolution x480x272
         else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
             cli.render.enabled = true;
             const std::string range = value();

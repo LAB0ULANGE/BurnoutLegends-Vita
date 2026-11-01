@@ -20,6 +20,8 @@ namespace burnout::gl {
 // Starts the GL thread, which creates the context and replays what the draw
 // path records (see ge_gl.cpp).
 bool initialize(std::string &error);
+// Internal resolution as a multiple of the PSP's 480x272 (before initialize).
+void set_render_scale(int scale);
 // Waits until the GL thread has replayed everything recorded so far.
 void finish();
 

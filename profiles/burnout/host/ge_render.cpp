@@ -490,6 +490,7 @@ void configure(const Options &options) {
     g_options.backend = Backend::OpenGL;
 #endif
     if (g_options.enabled && g_options.backend == Backend::OpenGL) {
+        gl::set_render_scale(g_options.render_scale);
         start_worker();
         std::unique_lock lock(g_jobs_mutex);
         g_jobs_cv.wait(lock, [] { return g_worker_ready; });
