@@ -79,6 +79,7 @@ void capture(std::uint32_t address, std::function<void(std::vector<std::uint8_t>
 struct Stats {
     std::uint64_t primitives{}, batches{}, vertices{}, skipped_primitives{}, lit_vertices{};
     std::uint64_t texture_uploads{}, render_targets{}, frames{};
+    std::uint64_t texture_bytes_hashed{};
     // Reading the clock is a system call on the Vita, so it is not done per
     // PRIM: list_ms covers whole command lists (decode plus draw), draw_ms
     // the GL submission inside them.

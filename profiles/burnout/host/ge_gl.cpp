@@ -484,7 +484,7 @@ struct RenderTarget {
 
 struct Texture {
     GLuint name{};
-    std::uint64_t hash{};
+    std::uint64_t hash{}, probe{};
     std::uint64_t checked_frame{UINT64_MAX};
     std::uint32_t address{}, bytes{};
     bool stale{true};  // VRAM texture: a block transfer may have rewritten it
@@ -523,7 +523,12 @@ std::uint32_t g_batch_count{}, g_batch_vtype{};
 // Non-null: the batch vertices are read in place from the snapshot instead of
 // g_batch (PSP layout already fits, see BatchLayout).
 const std::uint8_t *g_batch_in_place{};
-std::vector<std::uint16_t> g_batch_indices;
+std::vector<std::uint16_t> g_batch_indices;  // explicit indices (indexed, flat and sprite PRIMs)
+// The batch's triangles as runs of two words: first vertex (or, kind 7, first
+// explicit index) and count | kind << 24, kind being the PRIM type for lists,
+// strips and fans of consecutive vertices. The GL thread expands them.
+std::vector<std::uint32_t> g_batch_runs;
+std::uint32_t g_batch_index_total{};
 bool g_lighting_dirty{true};  // a lighting or material command changed since the last upload
 bool g_drawing{true};         // false while a frame is skipped
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
@@ -768,6 +773,19 @@ std::array<std::uint8_t, 4> clut_color(std::uint32_t index) noexcept {
     return color16(static_cast<std::uint16_t>(p[0] | (p[1] << 8u)), clut_format & 3u);
 }
 
+// Hash of one 16-byte block in every 128 (a quarter of the cache lines): the
+// per-frame check of a texture in RAM, the full hash only following a change.
+std::uint64_t probe_hash(const std::uint8_t *data, std::size_t size) noexcept {
+    std::uint32_t a = 0x811C9DC5u, b = 0x01000193u;
+    for (std::size_t i = 0; i + 16u <= size; i += 128u) {
+        std::uint32_t w[4];
+        std::memcpy(w, data + i, 16u);
+        a = (a ^ w[0] ^ w[2]) * 0x01000193u;
+        b = (b ^ w[1] ^ w[3]) * 0x85EBCA6Bu;
+    }
+    return (static_cast<std::uint64_t>(a) << 32u) | b;
+}
+
 std::uint64_t fnv(const std::uint8_t *data, std::size_t size, std::uint64_t hash = 0xCBF29CE484222325ull) noexcept {
     std::size_t i = 0;
     for (; i + 8u <= size; i += 8u) {
@@ -825,7 +843,12 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     if ((in_vram ? texture.stale : texture.checked_frame != g_stats.frames) && source != nullptr) {
         texture.checked_frame = g_stats.frames;
         texture.stale = false;
-        const std::uint64_t hash = fnv(source, bytes);
+        // Every 64 frames (staggered) the whole texture is hashed anyway.
+        const std::uint64_t probe = probe_hash(source, bytes);
+        const bool full = fresh || probe != texture.probe || ((g_stats.frames + texture.name) & 63u) == 0u;
+        texture.probe = probe;
+        if (full) g_stats.texture_bytes_hashed += bytes;
+        const std::uint64_t hash = full ? fnv(source, bytes) : texture.hash;
         if (fresh || hash != texture.hash) {
             texture.hash = hash;
             std::vector<std::uint8_t> linear_bytes;
@@ -1005,8 +1028,10 @@ std::uint32_t upload_vertex_state(bool through);
 void bind_vertices();
 
 void flush() {
-    if (g_batch_indices.empty() || !g_drawing) {
+    if (g_batch_runs.empty() || !g_drawing) {
         g_batch_indices.clear();
+        g_batch_runs.clear();
+        g_batch_index_total = 0u;
         g_batch.clear();
         g_batch_count = 0u;
         g_batch_in_place = nullptr;
@@ -1130,6 +1155,8 @@ void flush() {
     g_batch_count = 0u;
     g_batch_in_place = nullptr;
     g_batch_indices.clear();
+    g_batch_runs.clear();
+    g_batch_index_total = 0u;
     g_stats.draw_ms += host_now_ms() - started;
     phase = outer_phase;
 }
@@ -1363,8 +1390,10 @@ void bind_vertices() {
     }
     record(Op::Draw, {in_frame, source, static_cast<std::uint32_t>(bytes), g_layout.stride,
                       record_data(attribs.data(), sizeof(attribs)),
+                      record_data(g_batch_runs.data(), g_batch_runs.size() * sizeof(std::uint32_t)),
+                      static_cast<std::uint32_t>(g_batch_runs.size()),
                       record_data(g_batch_indices.data(), g_batch_indices.size() * sizeof(std::uint16_t)),
-                      static_cast<std::uint32_t>(g_batch_indices.size())});
+                      g_batch_index_total});
 }
 
 // Snapshot record: header, then the index bytes (a LOAD_CLUT record keeps the
@@ -1499,8 +1528,12 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     std::uint32_t max_vertex = 0u;
     static std::vector<std::uint32_t> indices;
     indices.resize(count);
+    // Flat shading needs per-triangle colours, so it copies vertices.
+    const bool flat = (cmd(0x50u) & 1u) == 0u && (cmd(0xD3u) & 1u) == 0u;
     if (index == 0u) {
-        for (std::uint32_t i = 0; i < count; ++i) indices[i] = i;
+        // Consecutive lists, strips and fans never look at the indices.
+        if (flat || primitive == 6u)
+            for (std::uint32_t i = 0; i < count; ++i) indices[i] = i;
         max_vertex = count == 0u ? 0u : count - 1u;
     } else {
         const std::uint8_t *index_data = guest_bytes(memory, g_index_address, count * (index == 1u ? 1u : 2u), false);
@@ -1532,15 +1565,14 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const VertexLayout &layout = *source_layout;
     const std::uint32_t vertex_stride = layout.stride;
 
-    if (!g_batch_indices.empty() && g_batch_vtype != vtype) flush();
+    if (!g_batch_runs.empty() && g_batch_vtype != vtype) flush();
     if (g_batch_count == 0u) {
         g_batch_vtype = vtype;
         g_layout = batch_layout(vtype);
     }
     if (lit) g_stats.lit_vertices += vertex_count;
     // Indexed batch: the PRIM's vertices are appended once and triangles index
-    // them. Flat shading needs per-triangle colours, so it copies vertices.
-    const bool flat = (cmd(0x50u) & 1u) == 0u && (cmd(0xD3u) & 1u) == 0u;
+    // them.
     const std::size_t worst = flat ? static_cast<std::size_t>(count) * 3u
         : primitive == 6u ? static_cast<std::size_t>(count) * 2u : vertex_count;
     if (g_batch_count + worst > 65535u) {
@@ -1561,9 +1593,10 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     }
     if (in_place && g_batch_count == 0u) g_batch_in_place = raw;
     const auto base = g_batch_count;
-    // At most three indices per PRIM vertex (strips, fans, sprites).
-    const std::size_t index_start = g_batch_indices.size();
-    g_batch_indices.resize(index_start + static_cast<std::size_t>(count) * 3u);
+    // Lists, strips and fans of consecutive vertices only go down as a run.
+    const bool generated = index == 0u && !flat && primitive >= 3u && primitive <= 5u;
+    std::size_t index_start = g_batch_indices.size();
+    if (!generated) g_batch_indices.resize(index_start + static_cast<std::size_t>(count) * 3u);
     std::uint16_t *next = g_batch_indices.data() + index_start;
     const auto put = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
         next[0] = static_cast<std::uint16_t>(a);
@@ -1598,6 +1631,16 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         put(base + indices[a], base + indices[b], base + indices[c]);
     };
     phase = 5u;
+    if (generated) {
+        const std::uint32_t triangles = primitive == 3u ? count / 3u : count >= 3u ? count - 2u : 0u;
+        g_batch_runs.push_back(base);
+        g_batch_runs.push_back(count | primitive << 24u);
+        g_batch_index_total += triangles * 3u;
+        if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
+        else g_vertex_address += count * stride;
+        phase = 0u;
+        return true;
+    }
     switch (primitive) {
     case 3u:
         for (std::uint32_t i = 0; i + 2u < count; i += 3u) emit(i, i + 1u, i + 2u);
@@ -1635,7 +1678,11 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         break;
     default: break;
     }
-    g_batch_indices.resize(static_cast<std::size_t>(next - g_batch_indices.data()));
+    const auto written = static_cast<std::uint32_t>(next - (g_batch_indices.data() + index_start));
+    g_batch_indices.resize(index_start + written);
+    g_batch_runs.push_back(static_cast<std::uint32_t>(index_start));
+    g_batch_runs.push_back(written | 7u << 24u);
+    g_batch_index_total += written;
     if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
     else g_vertex_address += count * stride;
     phase = 0u;
@@ -1645,7 +1692,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
 // Commands that do not change how the pending batch is drawn.
 bool batch_neutral(std::uint32_t op) noexcept {
     switch (op) {
-    case 0x00u: case 0x01u: case 0x02u: case 0x04u: case 0x08u: case 0x0Au: case 0x0Bu: case 0x0Cu:
+    case 0x00u: case 0x01u: case 0x02u: case 0x03u: case 0x04u: case 0x08u: case 0x0Au: case 0x0Bu: case 0x0Cu:
     case 0x0Eu: case 0x0Fu: case 0x10u: case 0x13u: case 0x14u:
     case 0x2Au: case 0x2Bu:  // bones: skinning is applied as vertices are decoded
         return true;
@@ -1789,9 +1836,46 @@ void sync_uniforms() {
     }
 }
 
+// Triangle indices of a batch from its runs (see g_batch_runs).
+void expand_indices(std::uint16_t *out, const std::uint32_t *runs, std::uint32_t run_words, const std::uint16_t *explicit_indices) {
+    for (std::uint32_t r = 0; r + 1u < run_words; r += 2u) {
+        const std::uint32_t first = runs[r], count = runs[r + 1u] & 0xFFFFFFu, kind = runs[r + 1u] >> 24u;
+        switch (kind) {
+        case 3u:
+            for (std::uint32_t i = 0; i + 2u < count; i += 3u) {
+                out[0] = static_cast<std::uint16_t>(first + i);
+                out[1] = static_cast<std::uint16_t>(first + i + 1u);
+                out[2] = static_cast<std::uint16_t>(first + i + 2u);
+                out += 3;
+            }
+            break;
+        case 4u:
+            for (std::uint32_t i = 0; i + 2u < count; ++i) {
+                out[0] = static_cast<std::uint16_t>(first + i + (i & 1u));
+                out[1] = static_cast<std::uint16_t>(first + i + 1u - (i & 1u));
+                out[2] = static_cast<std::uint16_t>(first + i + 2u);
+                out += 3;
+            }
+            break;
+        case 5u:
+            for (std::uint32_t i = 1; i + 1u < count; ++i) {
+                out[0] = static_cast<std::uint16_t>(first);
+                out[1] = static_cast<std::uint16_t>(first + i);
+                out[2] = static_cast<std::uint16_t>(first + i + 1u);
+                out += 3;
+            }
+            break;
+        default:
+            std::memcpy(out, explicit_indices + first, count * sizeof(std::uint16_t));
+            out += count;
+            break;
+        }
+    }
+}
+
 void draw(const Frame &frame, const std::uint32_t *a) {
     const std::uint32_t in_frame = a[0], source = a[1], bytes = a[2], stride = a[3], attribs_at = a[4];
-    const std::uint32_t indices_at = a[5], index_count = a[6];
+    const std::uint32_t runs_at = a[5], run_words = a[6], explicit_at = a[7], index_count = a[8];
     const std::uint8_t *vertices = frame.data.data() + source;
     if (in_frame == 0u) {
         std::uintptr_t pointer;
@@ -1800,7 +1884,11 @@ void draw(const Frame &frame, const std::uint32_t *a) {
     }
     std::array<AttribSetup, 4> attribs;
     std::memcpy(attribs.data(), frame.data.data() + attribs_at, sizeof(attribs));
-    const void *indices = frame.data.data() + indices_at;
+    static std::vector<std::uint16_t> expanded;
+    expanded.resize(index_count);
+    expand_indices(expanded.data(), reinterpret_cast<const std::uint32_t *>(frame.data.data() + runs_at), run_words,
+                   reinterpret_cast<const std::uint16_t *>(frame.data.data() + explicit_at));
+    const void *indices = expanded.data();
     std::uintptr_t base = reinterpret_cast<std::uintptr_t>(vertices);
 #if defined(__vita__)
     // One copy into GPU-visible scratch memory, wrapped as a vertex buffer:
@@ -1940,7 +2028,7 @@ void replay(const Frame &frame) {
             break;
         case Op::Uniform4: set_slot(op[0], floats(op[2]), op[1] * 4u, false); op += 3; break;
         case Op::UniformMatrix: set_slot(op[0], floats(op[1]), 16u, true); op += 2; break;
-        case Op::Draw: draw(frame, op); op += 7; break;
+        case Op::Draw: draw(frame, op); op += 9; break;
         case Op::CreateTarget:
             create_target(op[0], op[1], static_cast<int>(op[2]) * g_scale, static_cast<int>(op[3]) * g_scale);
             op += 4;
@@ -2248,7 +2336,9 @@ void present(std::uint32_t address) {
                       static_cast<double>(g_stats.lit_vertices - last.lit_vertices) / n,
                       static_cast<unsigned long long>(g_stats.texture_uploads - last.texture_uploads));
         trace(line);
-        std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame", (g_gl_busy_ms.load() - last_busy) / n);
+        std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame",
+                      (g_gl_busy_ms.load() - last_busy) / n,
+                      static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0);
         trace(line);
         last = g_stats;
         last_wall = wall;

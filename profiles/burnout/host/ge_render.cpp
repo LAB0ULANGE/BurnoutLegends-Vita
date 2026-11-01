@@ -185,6 +185,10 @@ void block_transfer(psprecomp::GuestMemory &memory, std::uint32_t data) {
 struct Job {
     enum class Kind { Commands, Present, Capture } kind{};
     std::vector<std::array<std::uint32_t, 3>> commands;
+    // Runs of plain commands, copied whole: a commands entry {start, count,
+    // kRun} with base and offset in the two words before start.
+    std::vector<std::uint32_t> words;
+    std::vector<std::uint32_t> records;  // snapshot records of the runs' PRIM/LOAD_CLUT, in order
     std::vector<Transfer> transfers;  // TRXKICK entries carry their index here
     gl::Snapshot snapshot;  // PRIM/LOAD_CLUT entries carry their record offset here
     bool skip{};            // frame skipped: commands followed, nothing drawn
@@ -201,6 +205,8 @@ bool g_worker_ready{};
 bool g_worker_failed{};
 std::string g_worker_error;
 std::vector<std::array<std::uint32_t, 3>> g_pending;
+std::vector<std::uint32_t> g_pending_words, g_pending_records;
+constexpr std::uint32_t kRun = UINT32_MAX - 1u;  // commands entry tag (offsets are multiples of 256)
 std::vector<Transfer> g_pending_transfers;
 gl::Snapshot g_pending_snapshot;
 // Overlap: the worker draws frame N while the emulation runs frame N+1. The
@@ -280,9 +286,25 @@ void worker_loop() {
         const double started = host_now_ms();
         gl::phase = 0u;
         switch (job.kind) {
-        case Job::Kind::Commands:
+        case Job::Kind::Commands: {
             gl::set_drawing(!job.skip);
+            std::size_t next_record = 0u;
             for (const auto &c : job.commands) {
+                if (c[2] == kRun) {
+                    const std::uint32_t *words = job.words.data() + c[0];
+                    const std::uint32_t base = words[-2], offset = words[-1];
+                    for (std::uint32_t i = 0; i < c[1]; ++i) {
+                        const std::uint32_t op = words[i] >> 24u;
+                        if (op == 0x04u || op == 0xC4u) {
+                            gl::use_snapshot(&job.snapshot, job.records[next_record++]);
+                            gl::ge_command(*g_memory, words[i], base, offset);
+                            gl::use_snapshot(nullptr, 0u);
+                        } else {
+                            gl::ge_command(*g_memory, words[i], base, offset);
+                        }
+                    }
+                    continue;
+                }
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
                 const std::uint32_t op = c[0] >> 24u;
                 const bool snapshot = c[2] == UINT32_MAX;
@@ -303,6 +325,7 @@ void worker_loop() {
             gl::end_list(std::move(job.snapshot));
             gl::account(host_now_ms() - started, started - waiting);
             break;
+        }
         case Job::Kind::Present:
             gl::account(0.0, started - waiting);
             gl::set_drawing(!job.skip);
@@ -425,7 +448,11 @@ void submit_pending() {
     job.skip = g_skip_frame;
     job.commands.swap(g_pending);
     job.transfers.swap(g_pending_transfers);
+    job.words.swap(g_pending_words);
+    job.records.swap(g_pending_records);
     g_pending.reserve(job.commands.size());
+    g_pending_words.reserve(job.words.size());
+    g_pending_records.reserve(job.records.size());
     job.snapshot.records.swap(g_pending_snapshot.records);
     job.snapshot.vertices.swap(g_pending_snapshot.vertices);
     // Room for the next list without regrowing.
@@ -519,11 +546,48 @@ void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std:
     if (!g_options.enabled || g_options.backend != Backend::OpenGL) return;
     g_memory = &memory;
     gl::emulation_phase = 2u;
+    if (!g_async) {
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::uint32_t word;
+            std::memcpy(&word, words + i * 4u, 4u);
+            forward_command(memory, word, base, offset);
+        }
+        gl::emulation_phase = 1u;
+        return;
+    }
+    // The run goes to the worker as one block (it ignores repeated state
+    // itself); only the commands snapshots and transfers need are looked at.
+    std::uint32_t start = 0u;
+    const auto emit_run = [&](std::uint32_t end) {
+        if (end == start) return;
+        g_pending_words.push_back(base);
+        g_pending_words.push_back(offset);
+        const auto at = static_cast<std::uint32_t>(g_pending_words.size());
+        g_pending_words.resize(at + (end - start));
+        std::memcpy(g_pending_words.data() + at, words + start * 4u, (end - start) * 4u);
+        g_pending.push_back({at, end - start, kRun});
+    };
     for (std::uint32_t i = 0; i < count; ++i) {
         std::uint32_t word;
         std::memcpy(&word, words + i * 4u, 4u);
-        forward_command(memory, word, base, offset);
+        const std::uint32_t op = word >> 24u;
+        g_commands[op] = word;
+        switch (op) {
+        case 0x01u: case 0x02u: case 0x04u: case 0x12u: case 0xB0u: case 0xB1u: case 0xC4u: {
+            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
+            if (record != UINT32_MAX) g_pending_records.push_back(record);
+            gl::emulation_phase = 2u;
+            break;
+        }
+        case 0xEAu:
+            emit_run(i);
+            forward_command(memory, word, base, offset);
+            start = i + 1u;
+            break;
+        default: break;
+        }
     }
+    emit_run(count);
     gl::emulation_phase = 1u;
 }
 
