@@ -187,8 +187,39 @@ struct Job {
     std::uint64_t vblank{};
 };
 
+#if defined(__vita__)
+// pthread-embedded's mutexes do not order the SCE main thread (the emulation)
+// against a pthread, which corrupted the job queue, so the handshake uses
+// kernel objects there.
+class KernelMutex {
+public:
+    KernelMutex() : id_(sceKernelCreateMutex("ge_jobs", 0, 0, nullptr)) {}
+    void lock() { sceKernelLockMutex(id_, 1, nullptr); }
+    void unlock() { sceKernelUnlockMutex(id_, 1); }
+    SceUID id() const { return id_; }
+
+private:
+    SceUID id_;
+};
+
+class KernelCondition {
+public:
+    explicit KernelCondition(const KernelMutex &mutex) : id_(sceKernelCreateCond("ge_jobs", 0, mutex.id(), nullptr)) {}
+    template <typename Predicate> void wait(std::unique_lock<KernelMutex> &, Predicate ready) {
+        while (!ready()) sceKernelWaitCond(id_, nullptr);
+    }
+    void notify_all() { sceKernelSignalCondAll(id_); }
+
+private:
+    SceUID id_;
+};
+
+KernelMutex g_jobs_mutex;
+KernelCondition g_jobs_cv(g_jobs_mutex);
+#else
 std::mutex g_jobs_mutex;
 std::condition_variable g_jobs_cv;
+#endif
 std::deque<Job> g_jobs;
 std::size_t g_queued_command_jobs{};
 bool g_worker_busy{};
