@@ -16,6 +16,8 @@ namespace burnout::gl {
 // address is a render target samples that object.
 
 bool initialize(std::string &error);
+// One line in the log, flushed at once (bring-up on the Vita).
+void trace(const char *message);
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset);
 

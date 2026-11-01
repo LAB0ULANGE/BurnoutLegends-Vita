@@ -930,10 +930,19 @@ bool batch_neutral(std::uint32_t op) noexcept {
 
 } // namespace
 
+void trace(const char *message) {
+    std::fprintf(stderr, "[gl] %s\n", message);
+    std::fflush(stderr);
+}
+
 bool initialize(std::string &error) {
+    trace("creating the context");
     if (!create_context(error)) return false;
+    trace("compiling the draw shaders");
     if (!link(g_program, kVertexShader, kFragmentShader, false, error)) return false;
+    trace("compiling the present shaders");
     if (!link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error)) return false;
+    trace("ready");
     g_commands.fill(0u);
     return true;
 }
@@ -1057,6 +1066,11 @@ void invalidate_textures(std::uint32_t address, std::uint32_t size) {
 void present(std::uint32_t address) {
     flush();
     ++g_stats.frames;
+    if (g_stats.frames <= 3u || g_stats.frames % 600u == 0u) {
+        char line[64];
+        std::snprintf(line, sizeof(line), "frame %llu", static_cast<unsigned long long>(g_stats.frames));
+        trace(line);
+    }
     const double started = host_now_ms();
     const auto it = g_targets.find(target_key(address));
 #if defined(__vita__)

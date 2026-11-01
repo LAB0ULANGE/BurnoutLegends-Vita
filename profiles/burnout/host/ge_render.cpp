@@ -10,6 +10,7 @@
 
 #if defined(__vita__)
 #include <psp2/kernel/threadmgr.h>
+#include <pthread.h>
 #endif
 
 #include <array>
@@ -260,18 +261,32 @@ void worker_loop() {
 }
 
 #if defined(__vita__)
-int worker_entry(SceSize, void *) {
+void *worker_entry(void *) {
+    // Core 1: core 0 runs the emulation.
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
+    gl::trace("worker started");
     worker_loop();
-    return 0;
+    return nullptr;
 }
 #endif
 
 void start_worker() {
 #if defined(__vita__)
-    // Core 1: core 0 runs the emulation, core 2 the profiler/vitaGL helpers.
-    const SceUID thread = sceKernelCreateThread("ge_gl", worker_entry, 0x10000100, 1024 * 1024, 0,
-                                                SCE_KERNEL_CPU_MASK_USER_1, nullptr);
-    if (thread >= 0) sceKernelStartThread(thread, 0, nullptr);
+    // A pthread, so the std::mutex/condition_variable handshakes work; the
+    // shader compiler wants a large stack.
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 4 * 1024 * 1024);
+    pthread_t thread;
+    const int result = pthread_create(&thread, &attributes, worker_entry, nullptr);
+    pthread_attr_destroy(&attributes);
+    if (result != 0) {
+        std::lock_guard lock(g_jobs_mutex);
+        g_worker_ready = g_worker_failed = true;
+        g_worker_error = "pthread_create failed";
+        return;
+    }
+    pthread_detach(thread);
 #else
     std::thread(worker_loop).detach();
 #endif

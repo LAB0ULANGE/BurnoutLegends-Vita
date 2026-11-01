@@ -2,6 +2,8 @@
 // run time by vitaShaRK (libshacccg.suprx must be installed).
 #include "gl_api.hpp"
 
+#include "ge_gl.hpp"
+
 #include <psp2/kernel/sysmem.h>
 
 #include <algorithm>
@@ -23,11 +25,13 @@ bool create_context(std::string &error) {
     std::snprintf(detail, sizeof(detail), "free user %d KiB, cdram %d KiB, phycont %d KiB; pools ram %d cdram %d phycont %d KiB",
                   info.size_user / 1024, info.size_cdram / 1024, info.size_phycont / 1024, ram / 1024, cdram / 1024,
                   phycont / 1024);
-    if (!vglInitWithCustomSizes(0, 960, 544, ram, cdram, phycont, 0, SCE_GXM_MULTISAMPLE_NONE)) {
-        error = std::string("vglInitWithCustomSizes failed (") + detail + ")";
-        return false;
-    }
-    std::fprintf(stderr, "[gl] %s\n", detail);
+    trace(detail);
+    // The result only says whether the resolution had to fall back (GL_TRUE);
+    // vitaGL has no failure return here.
+    if (vglInitWithCustomSizes(0, 960, 544, ram, cdram, phycont, 0, SCE_GXM_MULTISAMPLE_NONE))
+        trace("vitaGL initialised (resolution fell back)");
+    else
+        trace("vitaGL initialised");
     return true;
 }
 

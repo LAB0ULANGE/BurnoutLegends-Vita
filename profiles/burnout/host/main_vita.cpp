@@ -187,6 +187,7 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
 
 int main() {
     std::freopen(kLog, "w", stderr);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     show_status(0xFF804000u);  // blue: running
     const SceUID awake = sceKernelCreateThread("keep_awake", keep_awake, 0x10000100, 0x1000, 0, 0, nullptr);
     if (awake >= 0) sceKernelStartThread(awake, 0, nullptr);
@@ -222,7 +223,9 @@ int main() {
         render.backend = burnout::render::Backend::OpenGL;
         render.capture_vblanks = {2101u, 3001u};
         render.capture_dir = "ux0:data/burnout-frames";
+        std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::render::configure(render);
+        std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
 #endif
         const std::string report = run_pass(444, script);
