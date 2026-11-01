@@ -228,6 +228,7 @@ void main() {
 struct RenderTarget {
     GLuint framebuffer{}, texture{}, depth{};
     int width{}, height{};
+    GLint sampling[4]{-1, -1, -1, -1};
 };
 
 struct Texture {
@@ -236,6 +237,7 @@ struct Texture {
     std::uint64_t checked_frame{UINT64_MAX};
     std::uint32_t address{}, bytes{};
     bool stale{true};  // VRAM texture: a block transfer may have rewritten it
+    GLint sampling[4]{-1, -1, -1, -1};
 };
 
 struct Program {
@@ -260,6 +262,7 @@ std::uint32_t g_batch_count{}, g_batch_vtype{};
 // g_batch (PSP layout already fits, see BatchLayout).
 const std::uint8_t *g_batch_in_place{};
 std::vector<std::uint16_t> g_batch_indices;
+bool g_lighting_dirty{true};  // a lighting or material command changed since the last upload
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
 Program g_program, g_present;
@@ -341,6 +344,76 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
     return true;
 }
 
+// GL state of the draw path, so unchanged state is not sent again (vitaGL
+// does work on every call). present(), read_frame() and render target
+// creation change state behind it and call forget_state().
+struct GlState {
+    GLuint framebuffer{~0u}, program{~0u}, texture{~0u};
+    int viewport_w{-1}, viewport_h{-1};
+    int scissor[4]{-1, -1, -1, -1};
+    int blend{-1}, depth_test{-1}, cull{-1}, scissor_test{-1};
+    GLenum blend_src{}, blend_dst{}, blend_equation{}, depth_func{}, front_face{};
+    int depth_mask{-1}, color_mask{-1};
+} g_state;
+
+void forget_state() { g_state = GlState{}; }
+
+void set_capability(GLenum cap, int &cached, bool on) {
+    if (cached == static_cast<int>(on)) return;
+    cached = on ? 1 : 0;
+    if (on) glEnable(cap);
+    else glDisable(cap);
+}
+
+void set_blend_func(GLenum src, GLenum dst) {
+    if (g_state.blend_src == src && g_state.blend_dst == dst) return;
+    g_state.blend_src = src;
+    g_state.blend_dst = dst;
+    glBlendFunc(src, dst);
+}
+
+void set_blend_equation(GLenum equation) {
+    if (g_state.blend_equation == equation) return;
+    g_state.blend_equation = equation;
+    glBlendEquation(equation);
+}
+
+void set_depth(GLenum func, bool write) {
+    if (g_state.depth_func != func) {
+        g_state.depth_func = func;
+        glDepthFunc(func);
+    }
+    if (g_state.depth_mask != static_cast<int>(write)) {
+        g_state.depth_mask = write ? 1 : 0;
+        glDepthMask(write ? GL_TRUE : GL_FALSE);
+    }
+}
+
+void set_color_mask(bool rgb, bool alpha) {
+    const int mask = (rgb ? 1 : 0) | (alpha ? 2 : 0);
+    if (g_state.color_mask == mask) return;
+    g_state.color_mask = mask;
+    glColorMask(rgb, rgb, rgb, alpha);
+}
+
+void bind_texture_object(GLuint name) {
+    if (g_state.texture == name) return;
+    g_state.texture = name;
+    glBindTexture(GL_TEXTURE_2D, name);
+}
+
+// Sampler parameters live in the texture object: only set when they change.
+void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v) {
+    const GLint wanted[4]{linear ? GL_LINEAR : GL_NEAREST, linear ? GL_LINEAR : GL_NEAREST,
+                          clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT, clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT};
+    static constexpr GLenum names[4]{GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T};
+    for (int i = 0; i < 4; ++i)
+        if (current[i] != wanted[i]) {
+            current[i] = wanted[i];
+            glTexParameteri(GL_TEXTURE_2D, names[i], wanted[i]);
+        }
+}
+
 // ---------------------------------------------------------------- render targets
 
 std::uint32_t target_key(std::uint32_t address) noexcept { return address & 0x001FFFF0u; }
@@ -375,6 +448,7 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     glDepthMask(GL_TRUE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    forget_state();
     ++g_stats.render_targets;
     return target;
 }
@@ -444,9 +518,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     if ((address & 0x0F000000u) == 0x04000000u) {
         const auto it = g_targets.find(target_key(address));
         if (it != g_targets.end()) {
-            glBindTexture(GL_TEXTURE_2D, it->second.texture);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            bind_texture_object(it->second.texture);
+            set_sampling(it->second.sampling, linear, true, true);
             return {static_cast<float>(width) / static_cast<float>(it->second.width),
                     -static_cast<float>(height) / static_cast<float>(it->second.height), 0.0f, 1.0f};
         }
@@ -468,7 +541,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
         texture.address = address;
         texture.bytes = bytes;
     }
-    glBindTexture(GL_TEXTURE_2D, texture.name);
+    bind_texture_object(texture.name);
     // Only block transfers write VRAM (see invalidate_textures); textures in
     // RAM are re-hashed once per frame.
     const bool in_vram = (address & 0x0F000000u) == 0x04000000u;
@@ -514,10 +587,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             ++g_stats.texture_uploads;
         }
     }
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    set_sampling(texture.sampling, linear, clamp_u, clamp_v);
     return {1.0f, 1.0f, 0.0f, 0.0f};
 }
 
@@ -540,8 +610,11 @@ struct BlendShader {
 
 BlendShader set_blend() {
     BlendShader shader;
-    if ((cmd(0x21u) & 1u) == 0u || (cmd(0xD3u) & 1u) != 0u) { glDisable(GL_BLEND); return shader; }
-    glEnable(GL_BLEND);
+    if ((cmd(0x21u) & 1u) == 0u || (cmd(0xD3u) & 1u) != 0u) {
+        set_capability(GL_BLEND, g_state.blend, false);
+        return shader;
+    }
+    set_capability(GL_BLEND, g_state.blend, true);
     const std::uint32_t blend = cmd(0xDFu);
     const std::uint32_t fix_a = cmd(0xE0u), fix_b = cmd(0xE1u);
     static constexpr GLenum source_table[10]{GL_DST_COLOR, GL_ONE_MINUS_DST_COLOR, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
@@ -568,23 +641,40 @@ BlendShader set_blend() {
             shader.alpha = 1.0f - grey;
         }
     }
-    glBlendFunc(source, destination);
+    set_blend_func(source, destination);
     static constexpr GLenum equations[6]{GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT, GL_MIN, GL_MAX, GL_FUNC_ADD};
-    glBlendEquation(equations[std::min<std::uint32_t>((blend >> 8u) & 7u, 5u)]);
+    set_blend_equation(equations[std::min<std::uint32_t>((blend >> 8u) & 7u, 5u)]);
     return shader;
 }
 
 // Every glUniform makes vitaGL rebuild the program's uniform buffer, so values
-// that did not change since the previous draw are not sent again.
-std::unordered_map<GLint, std::vector<float>> g_uniforms;
+// that did not change since the previous draw are not sent again. A short
+// flat table: the draw program has about twenty uniforms.
+struct CachedUniform {
+    GLint location{-1};
+    std::uint32_t count{};
+    std::array<float, 30 * 4> values{};
+};
+std::array<CachedUniform, 32> g_uniforms;
+std::size_t g_uniform_count{};
 
 bool uniform_changed(GLint location, const float *values, std::size_t count) {
     if (location < 0) return false;
-    std::vector<float> &cached = g_uniforms[location];
-    if (cached.size() == count && std::equal(values, values + count, cached.begin())) return false;
-    cached.assign(values, values + count);
+    CachedUniform *cached = nullptr;
+    for (std::size_t i = 0; i < g_uniform_count; ++i)
+        if (g_uniforms[i].location == location) { cached = &g_uniforms[i]; break; }
+    if (cached == nullptr) {
+        if (g_uniform_count == g_uniforms.size() || count > g_uniforms[0].values.size()) return true;
+        cached = &g_uniforms[g_uniform_count++];
+        cached->location = location;
+    } else if (cached->count == count && std::memcmp(cached->values.data(), values, count * sizeof(float)) == 0) {
+        return false;
+    }
+    cached->count = static_cast<std::uint32_t>(count);
+    std::memcpy(cached->values.data(), values, count * sizeof(float));
     return true;
 }
+
 
 void uniform4(GLint location, float x, float y, float z, float w) {
     const float values[4]{x, y, z, w};
@@ -646,9 +736,19 @@ void flush() {
     const std::uint32_t address = cmd(0x9Cu);
     const std::uint32_t stride = cmd(0x9Du) & 0x7FCu;
     RenderTarget &target = render_target(target_key(address), stride);
-    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-    glViewport(0, 0, target.width, target.height);
-    glUseProgram(g_program.id);
+    if (g_state.framebuffer != target.framebuffer) {
+        g_state.framebuffer = target.framebuffer;
+        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    }
+    if (g_state.viewport_w != target.width || g_state.viewport_h != target.height) {
+        g_state.viewport_w = target.width;
+        g_state.viewport_h = target.height;
+        glViewport(0, 0, target.width, target.height);
+    }
+    if (g_state.program != g_program.id) {
+        g_state.program = g_program.id;
+        glUseProgram(g_program.id);
+    }
 
     const bool clear_mode = (cmd(0xD3u) & 1u) != 0u;
     const bool through = (g_batch_vtype & 0x800000u) != 0u;
@@ -667,7 +767,6 @@ void flush() {
 
     const bool textured = !clear_mode && (cmd(0x1Eu) & 1u) != 0u;
     if (textured) {
-        glActiveTexture(GL_TEXTURE0);
         phase = 7u;
         const auto texmap = bind_texture(*g_memory);
         phase = 8u;
@@ -688,41 +787,39 @@ void flush() {
     const std::uint32_t s1 = cmd(0xD4u), s2 = cmd(0xD5u);
     const int x1 = static_cast<int>(s1 & 0x3FFu), y1 = static_cast<int>((s1 >> 10u) & 0x3FFu);
     const int x2 = static_cast<int>(s2 & 0x3FFu), y2 = static_cast<int>((s2 >> 10u) & 0x3FFu);
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(x1, target.height - (y2 + 1), std::max(0, x2 - x1 + 1), std::max(0, y2 - y1 + 1));
+    set_capability(GL_SCISSOR_TEST, g_state.scissor_test, true);
+    const int scissor[4]{x1, target.height - (y2 + 1), std::max(0, x2 - x1 + 1), std::max(0, y2 - y1 + 1)};
+    if (std::memcmp(scissor, g_state.scissor, sizeof(scissor)) != 0) {
+        std::memcpy(g_state.scissor, scissor, sizeof(scissor));
+        glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+    }
 
     if (clear_mode) {
         const std::uint32_t clear = cmd(0xD3u);
-        glDisable(GL_BLEND);
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_ALWAYS);
-        glDepthMask((clear & 0x400u) != 0u ? GL_TRUE : GL_FALSE);
-        const GLboolean color = (clear & 0x100u) != 0u ? GL_TRUE : GL_FALSE;
-        glColorMask(color, color, color, (clear & 0x200u) != 0u ? GL_TRUE : GL_FALSE);
-        glDisable(GL_CULL_FACE);
+        set_capability(GL_BLEND, g_state.blend, false);
+        set_capability(GL_DEPTH_TEST, g_state.depth_test, true);
+        set_depth(GL_ALWAYS, (clear & 0x400u) != 0u);
+        set_color_mask((clear & 0x100u) != 0u, (clear & 0x200u) != 0u);
+        set_capability(GL_CULL_FACE, g_state.cull, false);
         uniform4(g_program.blendfix, 1.0f, 1.0f, 1.0f, 0.0f);
         uniform4(g_program.alphaout, 0.0f, 0.0f, 0.0f, 0.0f);
     } else {
         const BlendShader blend = set_blend();
         uniform4(g_program.blendfix, blend.scale[0], blend.scale[1], blend.scale[2], blend.scaled ? 1.0f : 0.0f);
         uniform4(g_program.alphaout, blend.alpha >= 0.0f ? 1.0f : 0.0f, std::max(blend.alpha, 0.0f), 0.0f, 0.0f);
-        if ((cmd(0x23u) & 1u) != 0u) {
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(compare(cmd(0xDEu)));
-        } else {
-            // Depth writes still happen with the test off.
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(GL_ALWAYS);
-        }
-        glDepthMask((cmd(0xE7u) & 1u) == 0u ? GL_TRUE : GL_FALSE);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        // Depth writes still happen with the test off.
+        set_capability(GL_DEPTH_TEST, g_state.depth_test, true);
+        set_depth((cmd(0x23u) & 1u) != 0u ? compare(cmd(0xDEu)) : GL_ALWAYS, (cmd(0xE7u) & 1u) == 0u);
+        set_color_mask(true, true);
         static const bool no_cull = std::getenv("PSPRECOMP_BURNOUT_NOCULL") != nullptr;
-        if (!no_cull && !through && (cmd(0x1Du) & 1u) != 0u) {
-            glEnable(GL_CULL_FACE);
-            glCullFace(GL_BACK);
-            glFrontFace((cmd(0x9Bu) & 1u) != 0u ? GL_CW : GL_CCW);  // y is flipped on the way to GL
-        } else {
-            glDisable(GL_CULL_FACE);
+        const bool cull = !no_cull && !through && (cmd(0x1Du) & 1u) != 0u;
+        set_capability(GL_CULL_FACE, g_state.cull, cull);
+        if (cull) {
+            const GLenum front = (cmd(0x9Bu) & 1u) != 0u ? GL_CW : GL_CCW;  // y is flipped on the way to GL
+            if (g_state.front_face != front) {
+                g_state.front_face = front;
+                glFrontFace(front);
+            }
         }
     }
 
@@ -934,8 +1031,11 @@ void upload_vertex_state(bool through) {
         const float shade[8]{lu[0], lu[1], lu[2], 0.0f, lv[0], lv[1], lv[2], 0.0f};
         uniform4v(g_program.shade, shade, 2);
     }
-    if (lit) {
-        const auto lighting = lighting_uniforms(col >= 4u);
+    static bool lighting_has_color = false;
+    if (lit && (g_lighting_dirty || lighting_has_color != (col >= 4u))) {
+        g_lighting_dirty = false;
+        lighting_has_color = col >= 4u;
+        const auto lighting = lighting_uniforms(lighting_has_color);
         uniform4v(g_program.lighting, lighting.data(), 30);
     }
 }
@@ -1226,6 +1326,7 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
         }
     };
     if (!batch_neutral(op) && (matrix_changes() || g_commands[op] != word || op == 0xC4u || op == 0xEAu)) flush();
+    if (g_commands[op] != word && ((op >= 0x18u && op <= 0x1Bu) || (op >= 0x53u && op <= 0x92u))) g_lighting_dirty = true;
     g_commands[op] = word;
     const auto address = [&]() { return ((base | data) + offset) & 0x0FFFFFFFu; };
     switch (op) {
@@ -1407,6 +1508,7 @@ void present(std::uint32_t address) {
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
     swap_buffers();
+    forget_state();
 #else
     (void)it;
 #endif
@@ -1419,6 +1521,7 @@ bool read_frame(std::uint32_t address, std::vector<std::uint8_t> &rgb) {
     const auto it = g_targets.find(target_key(address));
     if (it == g_targets.end()) return false;
     glBindFramebuffer(GL_FRAMEBUFFER, it->second.framebuffer);
+    forget_state();
     std::vector<std::uint8_t> rgba(480u * 272u * 4u);
     glReadPixels(0, it->second.height - 272, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     rgb.resize(480u * 272u * 3u);
