@@ -146,7 +146,7 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
     const std::uint32_t op = word >> 24u;
     const std::uint32_t data = word & 0x00FFFFFFu;
     g_commands[op] = word;
-    if (op >= 0x2Au && op <= 0x3Fu) vcs::update_ge_transform_state(g_transform, op, data);
+    if (op >= 0x2Au && op <= 0x41u) vcs::update_ge_transform_state(g_transform, op, data);
     const auto address = [&]() { return ((base | data) + offset) & 0x0FFFFFFFu; };
     switch (op) {
     case 0xC4u:                                        // LOAD_CLUT
@@ -167,6 +167,15 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
         break;
     }
     case 0x04u: {                                      // PRIM
+        // Bring-up knob: PSPRECOMP_BURNOUT_SKIP_TEXTURE=addr skips textured draws
+        // sampling that address.
+        static const std::uint32_t skip_texture = [] {
+            const char *env = std::getenv("PSPRECOMP_BURNOUT_SKIP_TEXTURE");
+            return env != nullptr ? static_cast<std::uint32_t>(std::stoul(env, nullptr, 16)) : 0u;
+        }();
+        if (skip_texture != 0u && (g_commands[0x1Eu] & 1u) != 0u &&
+            ((g_commands[0xA0u] & 0xFFFFF0u) | ((g_commands[0xA8u] << 8u) & 0x0F000000u)) == skip_texture)
+            break;
         const auto started = std::chrono::steady_clock::now();
         vcs::GeRenderStats stats{};
         std::string error;
@@ -202,13 +211,14 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
             std::fprintf(stderr,
                          "[draw] vb=%llu prim=%u n=%u vtype=%06x vaddr=%08x tex=%u fmt=%u taddr=%08x clut=%08x loaded=%08x/%02x cfmt=%06x tfunc=%06x "
                          "light=%u blend=%u/%06x atest=%u/%06x ztest=%u/%06x zw=%u fog=%u mat=%06x amb=%06x "
-                         "fb=%06x tested=%llu written=%llu tris=%llu culled=%llu scr=[%.0f,%.0f:%.0f,%.0f]\n",
+                         "fb=%06x map=%06x shade=%06x tsize=%06x tmode=%06x uv=%06x,%06x,%06x,%06x wrap=%06x tflt=%06x tested=%llu written=%llu tris=%llu culled=%llu scr=[%.0f,%.0f:%.0f,%.0f]\n",
                          static_cast<unsigned long long>(vblank), (data >> 16u) & 7u, data & 0xFFFFu, c(0x12u),
                          draw_vertex_address, c(0x1Eu) & 1u, c(0xC3u) & 0xFu, (c(0xA0u) & 0xFFFFF0u) | ((c(0xA8u) << 8u) & 0x0F000000u),
                          (c(0xB0u) & 0xFFFFF0u) | ((c(0xB1u) << 8u) & 0x0F000000u), g_clut_loaded_from, g_clut_load_word & 0x3Fu,
                          c(0xC5u), c(0xC9u), c(0x17u) & 1u,
                          c(0x21u) & 1u, c(0xDFu), c(0x22u) & 1u, c(0xDBu), c(0x23u) & 1u, c(0xDEu), c(0xE7u) & 1u,
-                         c(0x1Fu) & 1u, c(0x53u), c(0x55u), c(0x9Cu),
+                         c(0x1Fu) & 1u, c(0x53u), c(0x55u), c(0x9Cu), c(0xC0u), c(0xC1u), c(0xB8u), c(0xC2u), c(0x48u), c(0x49u),
+                         c(0x4Au), c(0x4Bu), c(0xC7u), c(0xC6u),
                          static_cast<unsigned long long>(stats.pixels_tested),
                          static_cast<unsigned long long>(stats.pixels_written),
                          static_cast<unsigned long long>(stats.triangles),
