@@ -15,6 +15,8 @@
 
 namespace burnout::gl {
 
+volatile std::uint32_t phase{};
+
 namespace {
 
 // ---------------------------------------------------------------- shaders
@@ -253,10 +255,16 @@ std::uint64_t g_clut_hash{};
 // all of one vertex type.
 std::vector<std::uint8_t> g_batch;
 std::uint32_t g_batch_count{}, g_batch_vtype{};
+// Non-null: the batch vertices are read in place from the snapshot instead of
+// g_batch (PSP layout already fits, see BatchLayout).
+const std::uint8_t *g_batch_in_place{};
 std::vector<std::uint16_t> g_batch_indices;
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
 Program g_program, g_present;
+#if defined(__vita__)
+GLuint g_vertex_buffer{}, g_index_buffer{};  // wrap per-draw scratch memory (vglBufferData)
+#endif
 Stats g_stats;
 psprecomp::GuestMemory *g_memory{};
 
@@ -628,8 +636,11 @@ void flush() {
     if (g_batch_indices.empty()) {
         g_batch.clear();
         g_batch_count = 0u;
+        g_batch_in_place = nullptr;
         return;
     }
+    const std::uint32_t outer_phase = phase;
+    phase = 6u;
     const double started = host_now_ms();
     const std::uint32_t address = cmd(0x9Cu);
     const std::uint32_t stride = cmd(0x9Du) & 0x7FCu;
@@ -656,7 +667,9 @@ void flush() {
     const bool textured = !clear_mode && (cmd(0x1Eu) & 1u) != 0u;
     if (textured) {
         glActiveTexture(GL_TEXTURE0);
+        phase = 7u;
         const auto texmap = bind_texture(*g_memory);
+        phase = 8u;
         uniform4(g_program.texmap, texmap[0], texmap[1], texmap[2], texmap[3]);
     }
     const std::uint32_t texfunc = cmd(0xC9u);
@@ -712,14 +725,30 @@ void flush() {
         }
     }
 
+    phase = 9u;
     bind_vertices();
-    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(g_batch_indices.size()), GL_UNSIGNED_SHORT, g_batch_indices.data());
+    phase = 10u;
+    const void *indices = g_batch_indices.data();
+#if defined(__vita__)
+    const std::size_t index_bytes = g_batch_indices.size() * sizeof(std::uint16_t);
+    if (void *gpu = vglAllocFromScratch(index_bytes)) {
+        std::memcpy(gpu, indices, index_bytes);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_index_buffer);
+        vglBufferData(GL_ELEMENT_ARRAY_BUFFER, gpu);
+        indices = nullptr;
+    } else {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
+#endif
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(g_batch_indices.size()), GL_UNSIGNED_SHORT, indices);
     ++g_stats.batches;
     g_stats.vertices += g_batch_count;
     g_batch.clear();
     g_batch_count = 0u;
+    g_batch_in_place = nullptr;
     g_batch_indices.clear();
     g_stats.draw_ms += host_now_ms() - started;
+    phase = outer_phase;
 }
 
 // ---------------------------------------------------------------- vertices
@@ -834,6 +863,15 @@ BatchLayout batch_layout(std::uint32_t vtype) {
     offset += align4(layout.pos_size * 3u);
     layout.stride = offset;
     const VertexLayout psp = vertex_layout(vtype);
+    if (psp.stride % 4u == 0u) {
+        // The PSP aligns each field to its component size; with a 4-byte
+        // multiple stride that layout is used as it is.
+        layout.tc = psp.tc;
+        layout.col = psp.col;
+        layout.nrm = psp.nrm;
+        layout.pos = psp.pos;
+        layout.stride = psp.stride;
+    }
     layout.same_as_psp = (tc == 0u || psp.tc == layout.tc) && (layout.col_size == 0u || psp.col == layout.col) &&
                          (nrm == 0u || psp.nrm == layout.nrm) && psp.pos == layout.pos && psp.stride == layout.stride;
     return layout;
@@ -905,22 +943,37 @@ void bind_vertices() {
     const std::uint32_t vtype = g_batch_vtype;
     const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
     const auto stride = static_cast<GLsizei>(g_layout.stride);
-    const std::uint8_t *base = g_batch.data();
+    const std::uint8_t *source = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+    std::uintptr_t base = reinterpret_cast<std::uintptr_t>(source);
+#if defined(__vita__)
+    // One copy into GPU-visible scratch memory, wrapped as a vertex buffer:
+    // vitaGL then draws from it instead of copying every attribute stream.
+    const std::size_t bytes = static_cast<std::size_t>(g_batch_count) * g_layout.stride;
+    if (void *gpu = vglAllocFromScratch(bytes)) {
+        std::memcpy(gpu, source, bytes);
+        glBindBuffer(GL_ARRAY_BUFFER, g_vertex_buffer);
+        vglBufferData(GL_ARRAY_BUFFER, gpu);
+        base = 0u;
+    } else {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+#endif
+    const auto at = [&](std::uint32_t offset) { return reinterpret_cast<const void *>(base + offset); };
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, component_type(pos, true), GL_FALSE, stride, base + g_layout.pos);
+    glVertexAttribPointer(0, 3, component_type(pos, true), GL_FALSE, stride, at(g_layout.pos));
     if (tc != 0u) {
         glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, component_type(tc, false), GL_FALSE, stride, base + g_layout.tc);
+        glVertexAttribPointer(1, 2, component_type(tc, false), GL_FALSE, stride, at(g_layout.tc));
     } else {
         glDisableVertexAttribArray(1);
         glVertexAttrib4f(1, 0.0f, 0.0f, 0.0f, 1.0f);
     }
     if (col == 7u) {
         glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, base + g_layout.col);
+        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, at(g_layout.col));
     } else if (col >= 4u) {
         glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 1, GL_UNSIGNED_SHORT, GL_FALSE, stride, base + g_layout.col);
+        glVertexAttribPointer(2, 1, GL_UNSIGNED_SHORT, GL_FALSE, stride, at(g_layout.col));
     } else {
         // No vertex colour: the material ambient colour.
         glDisableVertexAttribArray(2);
@@ -929,21 +982,22 @@ void bind_vertices() {
     }
     if (nrm != 0u) {
         glEnableVertexAttribArray(3);
-        glVertexAttribPointer(3, 3, component_type(nrm, true), GL_FALSE, stride, base + g_layout.nrm);
+        glVertexAttribPointer(3, 3, component_type(nrm, true), GL_FALSE, stride, at(g_layout.nrm));
     } else {
         glDisableVertexAttribArray(3);
         glVertexAttrib4f(3, 0.0f, 0.0f, 1.0f, 1.0f);
     }
 }
 
-// Snapshot record: header, then the index bytes, then the vertex bytes (a
-// LOAD_CLUT record keeps the palette in the index part). UINT32_MAX marks a
-// part the emulation thread could not read.
+// Snapshot record: header, then the index bytes (a LOAD_CLUT record keeps the
+// palette there); the vertex bytes are in Snapshot::vertices. UINT32_MAX marks
+// a part the emulation thread could not read.
 struct SnapshotHeader {
-    std::uint32_t index_bytes{UINT32_MAX}, vertex_bytes{UINT32_MAX};
+    std::uint32_t index_bytes{UINT32_MAX}, vertex_bytes{UINT32_MAX}, vertex_offset{};
 };
 
 const std::uint8_t *g_snapshot{};
+const std::uint8_t *g_snapshot_vertices{};
 
 // `bytes` of guest memory at `address`, from the current snapshot record when
 // there is one (`vertices` picks its part).
@@ -953,10 +1007,11 @@ const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t ad
     std::memcpy(&header, g_snapshot, sizeof(header));
     const std::uint32_t have = vertices ? header.vertex_bytes : header.index_bytes;
     if (have == UINT32_MAX || have < bytes) return nullptr;
-    return g_snapshot + sizeof(header) + (vertices ? header.index_bytes : 0u);
+    return vertices ? g_snapshot_vertices + header.vertex_offset : g_snapshot + sizeof(header);
 }
 
 bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
+    phase = 1u;
     const std::uint32_t primitive = (data >> 16u) & 7u;
     const std::uint32_t count = data & 0xFFFFu;
     const std::uint32_t vtype = cmd(0x12u);
@@ -977,6 +1032,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
 
     const bool lit = !through && (cmd(0x17u) & 1u) != 0u;
 
+    phase = 2u;
     std::uint32_t max_vertex = 0u;
     static std::vector<std::uint32_t> indices;
     indices.resize(count);
@@ -992,6 +1048,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
             max_vertex = std::max(max_vertex, indices[i]);
         }
     }
+    phase = 3u;
     const std::uint32_t vertex_count = count == 0u ? 0u : max_vertex + 1u;
     const std::uint8_t *raw = guest_bytes(memory, g_vertex_address, vertex_count * stride, true);
     if (raw == nullptr) { ++g_stats.skipped_primitives; return false; }
@@ -1014,6 +1071,16 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     }
     const BatchLayout &out = g_layout;
     const auto vertex = [&](std::uint32_t i) { return raw + static_cast<std::size_t>(i) * stride; };
+    // Snapshot vertices already in the batch layout are drawn where they are,
+    // as long as they follow the batch's previous ones.
+    const bool in_place = g_snapshot != nullptr && out.same_as_psp && !flat && primitive != 6u;
+    const bool follows = g_batch_in_place != nullptr && raw == g_batch_in_place + static_cast<std::size_t>(g_batch_count) * stride;
+    if (g_batch_count != 0u && (in_place ? !follows : g_batch_in_place != nullptr)) {
+        flush();
+        g_batch_vtype = vtype;
+        g_layout = batch_layout(vtype);
+    }
+    if (in_place && g_batch_count == 0u) g_batch_in_place = raw;
     const auto base = g_batch_count;
     // At most three indices per PRIM vertex (strips, fans, sprites).
     const std::size_t index_start = g_batch_indices.size();
@@ -1025,7 +1092,10 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         next[2] = static_cast<std::uint16_t>(c);
         next += 3;
     };
-    if (!flat && primitive != 6u) {
+    phase = 4u;
+    if (in_place) {
+        g_batch_count += vertex_count;
+    } else if (!flat && primitive != 6u) {
         std::uint8_t *dst = append_vertices(vertex_count);
         if (out.same_as_psp) std::memcpy(dst, raw, static_cast<std::size_t>(vertex_count) * stride);
         else
@@ -1048,6 +1118,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         }
         put(base + indices[a], base + indices[b], base + indices[c]);
     };
+    phase = 5u;
     switch (primitive) {
     case 3u:
         for (std::uint32_t i = 0; i + 2u < count; i += 3u) emit(i, i + 1u, i + 2u);
@@ -1088,6 +1159,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     g_batch_indices.resize(static_cast<std::size_t>(next - g_batch_indices.data()));
     if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
     else g_vertex_address += count * stride;
+    phase = 0u;
     return true;
 }
 
@@ -1116,6 +1188,10 @@ bool initialize(std::string &error) {
     if (!link(g_program, kVertexShader, kFragmentShader, false, error)) return false;
     trace("compiling the present shaders");
     if (!link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error)) return false;
+#if defined(__vita__)
+    glGenBuffers(1, &g_vertex_buffer);
+    glGenBuffers(1, &g_index_buffer);
+#endif
     trace("ready");
     g_commands.fill(0u);
     return true;
@@ -1169,7 +1245,8 @@ void append(std::vector<std::uint8_t> &arena, const std::uint8_t *bytes, std::ui
 } // namespace
 
 std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base,
-                               std::uint32_t offset, std::vector<std::uint8_t> &arena) {
+                               std::uint32_t offset, Snapshot &snapshot) {
+    std::vector<std::uint8_t> &arena = snapshot.records;
     const std::uint32_t op = word >> 24u;
     const std::uint32_t data = word & 0x00FFFFFFu;
     switch (op) {
@@ -1217,7 +1294,8 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
             if (const std::uint8_t *p = memory.raw_pointer(g_scan.vertex_address, bytes)) {
                 if (header.index_bytes == UINT32_MAX) header.index_bytes = 0u;
                 header.vertex_bytes = bytes;
-                append(arena, p, bytes);
+                header.vertex_offset = static_cast<std::uint32_t>(snapshot.vertices.size());
+                append(snapshot.vertices, p, bytes);
             }
         }
         if (index == 0u) g_scan.vertex_address += count * stride;
@@ -1226,7 +1304,14 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
     return record;
 }
 
-void use_snapshot(const std::uint8_t *record) { g_snapshot = record; }
+void use_snapshot(const Snapshot *snapshot, std::uint32_t record) {
+    g_snapshot = snapshot != nullptr ? snapshot->records.data() + record : nullptr;
+    g_snapshot_vertices = snapshot != nullptr ? snapshot->vertices.data() : nullptr;
+}
+
+void end_list() {
+    if (g_batch_in_place != nullptr) flush();
+}
 
 void invalidate_textures(std::uint32_t address, std::uint32_t size) {
     for (auto &[key, texture] : g_textures)
@@ -1235,6 +1320,7 @@ void invalidate_textures(std::uint32_t address, std::uint32_t size) {
 
 void present(std::uint32_t address) {
     flush();
+    phase = 11u;
     ++g_stats.frames;
     if (g_stats.frames <= 3u) {
         char line[64];
@@ -1281,6 +1367,8 @@ void present(std::uint32_t address) {
         glUniform1i(g_present.texture, 0);
         glDisableVertexAttribArray(2);
         glDisableVertexAttribArray(3);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glEnableVertexAttribArray(0);
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
@@ -1292,6 +1380,7 @@ void present(std::uint32_t address) {
     (void)it;
 #endif
     g_stats.present_ms += host_now_ms() - started;
+    phase = 0u;
 }
 
 bool read_frame(std::uint32_t address, std::vector<std::uint8_t> &rgb) {

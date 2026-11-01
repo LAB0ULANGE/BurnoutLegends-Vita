@@ -14,7 +14,9 @@
 #include <pthread.h>
 #endif
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -183,7 +185,7 @@ struct Job {
     enum class Kind { Commands, Present, Capture } kind{};
     std::vector<std::array<std::uint32_t, 3>> commands;
     std::vector<Transfer> transfers;  // TRXKICK entries carry their index here
-    std::vector<std::uint8_t> arena;  // PRIM/LOAD_CLUT entries carry their record offset here
+    gl::Snapshot snapshot;  // PRIM/LOAD_CLUT entries carry their record offset here
     std::uint32_t address{};
     std::uint64_t vblank{};
 };
@@ -229,7 +231,7 @@ bool g_worker_failed{};
 std::string g_worker_error;
 std::vector<std::array<std::uint32_t, 3>> g_pending;
 std::vector<Transfer> g_pending_transfers;
-std::vector<std::uint8_t> g_pending_arena;
+gl::Snapshot g_pending_snapshot;
 // Overlap: the worker draws frame N while the emulation runs frame N+1. The
 // guest bytes each list reads are snapshotted at scan time for that, since the
 // game rewrites them while it builds the next frame.
@@ -243,6 +245,47 @@ void capture_rgb(const std::vector<std::uint8_t> &rgb, std::uint64_t vblank) {
     std::snprintf(name, sizeof(name), "frame_%06llu.png", static_cast<unsigned long long>(vblank));
     write_png(g_options.capture_dir / name, 480u, 272u, rgb);
     ++g_captures;
+}
+
+// Estimated worker time per GE command type (see the command loop).
+std::uint32_t g_op_samples{};
+std::array<double, 256> g_op_ms{};
+std::array<std::uint64_t, 256> g_op_count{};
+
+// Sampling thread: histogram of gl::phase every ~100 us.
+std::array<std::atomic<std::uint32_t>, 16> g_phase_samples{};
+
+void sample_phases() {
+    for (;;) {
+        ++g_phase_samples[gl::phase & 15u];
+        host_sleep_ms(0.1);
+    }
+}
+
+void trace_op_costs() {
+    std::array<int, 256> order{};
+    for (int i = 0; i < 256; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [](int a, int b) { return g_op_ms[a] > g_op_ms[b]; });
+    std::string line = "per 300 frames, ms/frame by command:";
+    for (int i = 0; i < 8; ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %02X %.1f (%llu)", order[i], g_op_ms[order[i]] / 300.0,
+                      static_cast<unsigned long long>(g_op_count[order[i]] / 300u));
+        line += item;
+    }
+    gl::trace(line.c_str());
+    line = "worker phases (% of samples):";
+    std::uint32_t total = 0;
+    for (auto &n : g_phase_samples) total += n.load();
+    for (int i = 0; i < 14; ++i) {
+        char item[24];
+        std::snprintf(item, sizeof(item), " %d:%.1f", i, total ? 100.0 * g_phase_samples[i].load() / total : 0.0);
+        line += item;
+        g_phase_samples[i] = 0u;
+    }
+    gl::trace(line.c_str());
+    g_op_ms.fill(0.0);
+    g_op_count.fill(0u);
 }
 
 void worker_loop() {
@@ -259,6 +302,7 @@ void worker_loop() {
     for (;;) {
         Job job;
         const double waiting = host_now_ms();
+        gl::phase = 12u;
         {
             std::unique_lock lock(g_jobs_mutex);
             g_jobs_cv.wait(lock, [] { return !g_jobs.empty(); });
@@ -267,29 +311,39 @@ void worker_loop() {
             g_worker_busy = true;
         }
         const double started = host_now_ms();
+        gl::phase = 0u;
         switch (job.kind) {
         case Job::Kind::Commands:
             for (const auto &c : job.commands) {
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
                 const std::uint32_t op = c[0] >> 24u;
+                // Every 16th command is timed (includes any draw it flushes).
+                const bool sampled = (++g_op_samples & 15u) == 0u;
+                const double op_started = sampled ? host_now_ms() : 0.0;
+                ++g_op_count[op];
                 const bool snapshot = c[2] == UINT32_MAX;
                 if (snapshot && op == 0xEAu) {
                     const Transfer &transfer = job.transfers[c[1]];
+                    gl::phase = 13u;
                     apply_transfer(*g_memory, transfer);
                     const std::uint32_t first = transfer.destination +
                         (transfer.destination_y * transfer.destination_stride + transfer.destination_x) * transfer.bpp;
                     gl::invalidate_textures(first, (transfer.height - 1u) * transfer.destination_stride * transfer.bpp +
                                                        transfer.width * transfer.bpp);
                 }
-                if (snapshot && op != 0xEAu) gl::use_snapshot(job.arena.data() + c[1]);
+                gl::phase = 0u;
+                if (snapshot && op != 0xEAu) gl::use_snapshot(&job.snapshot, c[1]);
                 gl::ge_command(*g_memory, c[0], c[1], c[2]);
-                if (snapshot) gl::use_snapshot(nullptr);
+                if (snapshot) gl::use_snapshot(nullptr, 0u);
+                if (sampled) g_op_ms[op] += (host_now_ms() - op_started) * 16.0;
             }
+            gl::end_list();
             gl::account(host_now_ms() - started, started - waiting);
             break;
         case Job::Kind::Present:
             gl::account(0.0, started - waiting);
             gl::present(job.address);
+            if (gl::stats().frames % 300u == 0u) trace_op_costs();
             break;
         case Job::Kind::Capture: {
             std::vector<std::uint8_t> rgb;
@@ -305,6 +359,11 @@ void worker_loop() {
 }
 
 #if defined(__vita__)
+int sampler_entry(SceSize, void *) {
+    sample_phases();
+    return 0;
+}
+
 void *worker_entry(void *) {
     // Core 1: core 0 runs the emulation.
     const int affinity = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
@@ -338,8 +397,12 @@ void start_worker() {
         return;
     }
     pthread_detach(thread);
+    const SceUID sampler = sceKernelCreateThread("ge_gl_sampler", sampler_entry, 0x10000100, 0x4000, 0,
+                                                 SCE_KERNEL_CPU_MASK_USER_2, nullptr);
+    if (sampler >= 0) sceKernelStartThread(sampler, 0, nullptr);
 #else
     std::thread(worker_loop).detach();
+    std::thread(sample_phases).detach();
 #endif
 }
 
@@ -363,7 +426,11 @@ void submit_pending() {
     job.kind = Job::Kind::Commands;
     job.commands.swap(g_pending);
     job.transfers.swap(g_pending_transfers);
-    job.arena.swap(g_pending_arena);
+    job.snapshot.records.swap(g_pending_snapshot.records);
+    job.snapshot.vertices.swap(g_pending_snapshot.vertices);
+    // Room for the next list without regrowing.
+    g_pending_snapshot.records.reserve(job.snapshot.records.size());
+    g_pending_snapshot.vertices.reserve(job.snapshot.vertices.size());
     push_job(std::move(job));
     if (!g_async) {
         std::unique_lock lock(g_jobs_mutex);
@@ -423,7 +490,7 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
         }
         if (g_async) {
             // The worker may draw this list while the game builds the next one.
-            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_arena);
+            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
             if (record != UINT32_MAX) {
                 g_pending.push_back({word, record, UINT32_MAX});
                 return;

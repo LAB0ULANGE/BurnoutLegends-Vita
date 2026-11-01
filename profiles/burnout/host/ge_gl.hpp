@@ -17,21 +17,37 @@ namespace burnout::gl {
 // address is a render target samples that object.
 
 bool initialize(std::string &error);
+
+// What the worker is doing, for a sampling thread (bring-up profiling):
+// 0 other, 1-5 PRIM (setup, indices, checks, vertex copy, index emit),
+// 6-10 draw (state, texture, state, attributes, glDrawElements), 11 present,
+// 12 waiting for work, 13 block transfer.
+extern volatile std::uint32_t phase;
 // One line in the log, flushed at once (bring-up on the Vita).
 void trace(const char *message);
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset);
 
+// Guest bytes a command list reads, copied on the emulation thread: records
+// (PRIM indices, LOAD_CLUT palettes) and PRIM vertices. Vertices are kept
+// apart so consecutive PRIMs stay contiguous and can be drawn in place.
+struct Snapshot {
+    std::vector<std::uint8_t> records, vertices;
+};
+
 // Emulation-thread side of the GL worker. Follows the vertex and index
-// pointers and appends to `arena` the guest bytes `word` will read (PRIM
-// vertices and indices, LOAD_CLUT palette), so the worker can draw the frame
-// while the game overwrites them. Returns the record's offset in `arena`, or
-// UINT32_MAX when the command reads no guest memory.
+// pointers and appends to `snapshot` the guest bytes `word` will read, so the
+// worker can draw the frame while the game overwrites them. Returns the
+// record's offset in `snapshot.records`, or UINT32_MAX when the command reads
+// no guest memory.
 std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base,
-                               std::uint32_t offset, std::vector<std::uint8_t> &arena);
-// The next ge_command reads `record` (from snapshot_command) instead of guest
-// memory; nullptr goes back to guest memory.
-void use_snapshot(const std::uint8_t *record);
+                               std::uint32_t offset, Snapshot &snapshot);
+// The next ge_command reads `record` of `snapshot` instead of guest memory;
+// nullptr goes back to guest memory.
+void use_snapshot(const Snapshot *snapshot, std::uint32_t record);
+// The command list ends and its snapshot goes away: draws what still points
+// into it.
+void end_list();
 // GE block transfer just copied guest memory into [address, address + size).
 void invalidate_textures(std::uint32_t address, std::uint32_t size);
 
