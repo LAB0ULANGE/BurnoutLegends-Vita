@@ -38,6 +38,11 @@ extern "C" {
 // Runtime state is heap-allocated (32 MiB guest RAM plus dispatch tables); the
 // generated units chain natively up to 48 frames deep.
 int _newlib_heap_size_user = 160 * 1024 * 1024;
+// vita-elf-create (Windows build) writes the SCE module tables past the end of
+// its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
+// unless the segment ends early in a page. When it crashes again, grow this
+// pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
+__attribute__((used)) const unsigned char burnout_text_pad[0x768] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 

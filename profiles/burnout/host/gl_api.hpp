@@ -58,7 +58,9 @@ using GLsizeiptr = std::ptrdiff_t;
     X(void, glUniform1f, (GLint location, GLfloat v0))                                                   \
     X(void, glUniform2f, (GLint location, GLfloat v0, GLfloat v1))                                       \
     X(void, glUniform4f, (GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3))               \
+    X(void, glUniform4fv, (GLint location, GLsizei count, const GLfloat *v))                             \
     X(void, glUniformMatrix4fv, (GLint location, GLsizei count, GLboolean transpose, const GLfloat *v))  \
+    X(void, glVertexAttrib4f, (GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w))                \
     X(void, glVertexAttribPointer,                                                                       \
       (GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer)) \
     X(void, glEnableVertexAttribArray, (GLuint index))                                                   \

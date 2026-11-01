@@ -20,26 +20,104 @@ namespace {
 // ---------------------------------------------------------------- shaders
 
 const char *kVertexShader = R"(
-attribute vec3 a_position;
-attribute vec3 a_texcoord;
-attribute vec4 a_color;
+attribute vec3 a_position;   // PSP formats as stored, scaled here
+attribute vec2 a_texcoord;
+attribute vec4 a_color;      // 8888 normalised, or the raw 16-bit value in x
+attribute vec3 a_normal;
+uniform mat4 u_world;
 uniform mat4 u_world_view;
 uniform mat4 u_projection;
 uniform vec4 u_viewport;   // scale x, scale y, centre x - offset x, centre y - offset y
 uniform vec4 u_depth;      // scale z, centre z, through (1/0), fog enabled (1/0)
 uniform vec4 u_target;     // render target width, height
-uniform vec2 u_fog;        // PSP fog end, fog scale
+uniform vec4 u_fog;        // PSP fog end, fog scale
+uniform vec4 u_format;     // position, texcoord, normal scales; colour format (0 constant, 4-6 16-bit, 7 8888)
+uniform vec4 u_texgen;     // mode (0 scale/offset, 1 matrix, 2 shade map, 3 through), source, unsigned z, lit
+uniform vec4 u_uvscale;    // u/v scale and offset (through: 1/width, 1/height)
+uniform mat4 u_texmatrix;
+uniform vec4 u_shade[2];   // shade map light directions
+uniform vec4 u_lighting[30];
 varying vec3 v_texcoord;
 varying vec4 v_color;
 varying float v_fog;
+
+vec4 vertex_color() {
+    float f = u_format.w;
+    if (f < 3.5 || f > 6.5) return a_color;
+    float v = a_color.x;
+    if (f < 4.5) return vec4(mod(v, 32.0) / 31.0, mod(floor(v / 32.0), 64.0) / 63.0, floor(v / 2048.0) / 31.0, 1.0);
+    if (f < 5.5)
+        return vec4(mod(v, 32.0) / 31.0, mod(floor(v / 32.0), 32.0) / 31.0, mod(floor(v / 1024.0), 32.0) / 31.0,
+                    floor(v / 32768.0));
+    return vec4(mod(v, 16.0), mod(floor(v / 16.0), 16.0), mod(floor(v / 256.0), 16.0), floor(v / 4096.0)) / 15.0;
+}
+
+vec3 unit(vec3 v) {
+    float l = length(v);
+    return l > 0.0 ? v / l : vec3(0.0, 0.0, 1.0);
+}
+
+float power(float x, float y) {
+    return x > 0.0 ? pow(x, y) : (y == 0.0 ? 1.0 : 0.0);
+}
+
+// PSP vertex lighting; u_lighting: [0] material from vertex colour (x ambient,
+// y diffuse, z specular), w specular power; [1] emissive; [2] global ambient;
+// [3-5] material ambient, diffuse, specular; then six per light: vector and
+// type (w < 0: off), attenuation and computation, spot direction and cutoff,
+// ambient and spot exponent, diffuse, specular.
+vec4 light(vec4 vertex, vec3 position, vec3 normal) {
+    vec4 info = u_lighting[0];
+    vec4 ambient = info.x > 0.5 ? vertex : u_lighting[3];
+    vec4 diffuse = info.y > 0.5 ? vertex : u_lighting[4];
+    vec4 specular = info.z > 0.5 ? vertex : u_lighting[5];
+    vec4 result = vec4(u_lighting[1].rgb + ambient.rgb * u_lighting[2].rgb, ambient.a * u_lighting[2].a);
+    for (int l = 0; l < 4; ++l) {
+        vec4 l0 = u_lighting[6 + l * 6];
+        if (l0.w > -0.5) {
+            vec4 l1 = u_lighting[7 + l * 6];
+            vec4 l2 = u_lighting[8 + l * 6];
+            vec4 l3 = u_lighting[9 + l * 6];
+            vec3 to_light = l0.xyz;
+            float factor = 1.0;
+            if (l0.w > 0.5) {
+                to_light -= position;
+                float distance = length(to_light);
+                float d = l1.x + l1.y * distance + l1.z * distance * distance;
+                factor = d > 0.0 ? clamp(1.0 / d, 0.0, 1.0) : 0.0;
+                to_light = unit(to_light);
+            }
+            if (l0.w > 1.5) {
+                float spot = dot(l2.xyz, to_light);
+                factor *= spot >= l2.w ? max(0.0, power(max(spot, 0.0), l3.w)) : 0.0;
+            }
+            result.rgb += l3.rgb * ambient.rgb * factor;
+            float lambert = dot(to_light, normal);
+            if (l1.w > 1.5) lambert = power(max(lambert, 0.0), info.w);
+            if (lambert > 0.0) result.rgb += u_lighting[10 + l * 6].rgb * diffuse.rgb * factor * lambert;
+            if (l1.w > 0.5 && l1.w < 1.5 && lambert >= 0.0) {
+                vec3 half_vector = unit(to_light + vec3(0.0, 0.0, 1.0));
+                float sp = power(max(dot(half_vector, normal), 0.0), info.w);
+                result.rgb += u_lighting[11 + l * 6].rgb * specular.rgb * factor * sp;
+            }
+        }
+    }
+    return clamp(result, 0.0, 1.0);
+}
+
 void main() {
+    vec3 position = a_position * u_format.x;
+    vec3 normal = a_normal * u_format.z;
+    vec2 texcoord = a_texcoord * u_format.y;
+    vec4 color = vertex_color();
     vec3 screen;
     float w = 1.0;
     v_fog = 1.0;
     if (u_depth.z > 0.5) {
-        screen = a_position;
+        if (u_texgen.z > 0.5 && position.z < 0.0) position.z += 65536.0;
+        screen = position;
     } else {
-        vec4 view = u_world_view * vec4(a_position, 1.0);
+        vec4 view = u_world_view * vec4(position, 1.0);
         vec4 clip = u_projection * view;
         w = clip.w;
         vec3 ndc = clip.xyz / clip.w;
@@ -48,8 +126,25 @@ void main() {
     }
     gl_Position = vec4((screen.x / u_target.x * 2.0 - 1.0) * w, (1.0 - screen.y / u_target.y * 2.0) * w,
                        (screen.z / 65535.0 * 2.0 - 1.0) * w, w);
-    v_texcoord = a_texcoord;
-    v_color = a_color;
+    if (u_texgen.w > 0.5)
+        color = light(color, (u_world * vec4(position, 1.0)).xyz, unit((u_world * vec4(normal, 0.0)).xyz));
+    v_color = color;
+    float mode = u_texgen.x;
+    if (mode > 2.5) {
+        v_texcoord = vec3(texcoord * u_uvscale.xy, 1.0);
+    } else if (mode > 1.5) {
+        vec3 n = unit((u_world * vec4(normal, 0.0)).xyz);
+        v_texcoord = vec3((1.0 + dot(n, u_shade[0].xyz)) * 0.5, (1.0 + dot(n, u_shade[1].xyz)) * 0.5, 1.0);
+    } else if (mode > 0.5) {
+        float source = u_texgen.y;
+        vec3 s = position;
+        if (source > 2.5) s = normal;
+        else if (source > 1.5) s = unit(normal);
+        else if (source > 0.5) s = vec3(texcoord, 0.0);
+        v_texcoord = (u_texmatrix * vec4(s, 1.0)).xyz;
+    } else {
+        v_texcoord = vec3(texcoord * u_uvscale.xy + u_uvscale.zw, 1.0);
+    }
 }
 )";
 
@@ -127,12 +222,6 @@ void main() {
 
 // ---------------------------------------------------------------- state
 
-struct Vertex {
-    float position[3];
-    float texcoord[3];
-    std::array<std::uint8_t, 4> color;
-};
-
 struct RenderTarget {
     GLuint framebuffer{}, texture{}, depth{};
     int width{}, height{};
@@ -148,7 +237,8 @@ struct Texture {
 
 struct Program {
     GLuint id{};
-    GLint world_view{}, projection{}, viewport{}, depth{}, target{}, fog{};
+    GLint world{}, world_view{}, projection{}, viewport{}, depth{}, target{}, fog{};
+    GLint format{}, texgen{}, uvscale{}, texmatrix{}, shade{}, lighting{};
     GLint texmap{}, texenv{}, envcolor{}, alpha{}, fogcolor{}, texture{}, blendfix{}, alphaout{};
 };
 
@@ -159,9 +249,11 @@ std::uint32_t g_world_cursor{}, g_view_cursor{}, g_projection_cursor{}, g_texgen
 std::uint32_t g_vertex_address{}, g_index_address{};
 std::array<std::uint8_t, 1024> g_clut{};   // palette cached by LOAD_CLUT, as on the GE
 std::uint64_t g_clut_hash{};
-std::vector<Vertex> g_batch;
+// Pending batch: vertices in the PSP component formats (see BatchLayout),
+// all of one vertex type.
+std::vector<std::uint8_t> g_batch;
+std::uint32_t g_batch_count{}, g_batch_vtype{};
 std::vector<std::uint16_t> g_batch_indices;
-bool g_batch_through{};
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
 Program g_program, g_present;
@@ -201,7 +293,10 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
     glAttachShader(program.id, fs);
     glBindAttribLocation(program.id, 0, "a_position");
     glBindAttribLocation(program.id, 1, "a_texcoord");
-    if (!present) glBindAttribLocation(program.id, 2, "a_color");
+    if (!present) {
+        glBindAttribLocation(program.id, 2, "a_color");
+        glBindAttribLocation(program.id, 3, "a_normal");
+    }
     glLinkProgram(program.id);
     GLint ok = 0;
     glGetProgramiv(program.id, GL_LINK_STATUS, &ok);
@@ -214,7 +309,14 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
     const auto u = [&](const char *name) { return glGetUniformLocation(program.id, name); };
     program.texture = u("u_texture");
     if (present) return true;
+    program.world = u("u_world");
     program.world_view = u("u_world_view");
+    program.format = u("u_format");
+    program.texgen = u("u_texgen");
+    program.uvscale = u("u_uvscale");
+    program.texmatrix = u("u_texmatrix");
+    program.shade = u("u_shade");
+    program.lighting = u("u_lighting");
     program.projection = u("u_projection");
     program.viewport = u("u_viewport");
     program.depth = u("u_depth");
@@ -463,6 +565,40 @@ BlendShader set_blend() {
     return shader;
 }
 
+// Every glUniform makes vitaGL rebuild the program's uniform buffer, so values
+// that did not change since the previous draw are not sent again.
+std::unordered_map<GLint, std::vector<float>> g_uniforms;
+
+bool uniform_changed(GLint location, const float *values, std::size_t count) {
+    if (location < 0) return false;
+    std::vector<float> &cached = g_uniforms[location];
+    if (cached.size() == count && std::equal(values, values + count, cached.begin())) return false;
+    cached.assign(values, values + count);
+    return true;
+}
+
+void uniform4(GLint location, float x, float y, float z, float w) {
+    const float values[4]{x, y, z, w};
+    if (uniform_changed(location, values, 4u)) glUniform4f(location, x, y, z, w);
+}
+
+void uniform4v(GLint location, const float *values, int count) {
+    if (uniform_changed(location, values, static_cast<std::size_t>(count) * 4u)) glUniform4fv(location, count, values);
+}
+
+void uniform_matrix(GLint location, const float *values) {
+    if (uniform_changed(location, values, 16u)) glUniformMatrix4fv(location, 1, GL_FALSE, values);
+}
+
+// PSP 4x3 row-vector matrix (v * M) as a GL matrix: stored row-major, it is
+// exactly the column-major M^T.
+void psp_matrix(const float *m, float *out) {
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 3; ++c) out[r * 4 + c] = m[r * 3 + c];
+    out[3] = out[7] = out[11] = 0.0f;
+    out[15] = 1.0f;
+}
+
 void upload_matrices() {
     // PSP 4x3 matrices are row-vector (v * M); GL wants column-major M^T.
     float world[16]{}, view[16]{}, world_view[16]{};
@@ -480,12 +616,20 @@ void upload_matrices() {
             world_view[r * 4 + c] = sum;
         }
     // A row-vector matrix stored row-major is exactly a column-major GL matrix.
-    glUniformMatrix4fv(g_program.world_view, 1, GL_FALSE, world_view);
-    glUniformMatrix4fv(g_program.projection, 1, GL_FALSE, g_projection.data());
+    uniform_matrix(g_program.world, world);
+    uniform_matrix(g_program.world_view, world_view);
+    uniform_matrix(g_program.projection, g_projection.data());
 }
 
+void upload_vertex_state(bool through);
+void bind_vertices();
+
 void flush() {
-    if (g_batch_indices.empty()) { g_batch.clear(); return; }
+    if (g_batch_indices.empty()) {
+        g_batch.clear();
+        g_batch_count = 0u;
+        return;
+    }
     const double started = host_now_ms();
     const std::uint32_t address = cmd(0x9Cu);
     const std::uint32_t stride = cmd(0x9Du) & 0x7FCu;
@@ -495,35 +639,35 @@ void flush() {
     glUseProgram(g_program.id);
 
     const bool clear_mode = (cmd(0xD3u) & 1u) != 0u;
-    const bool through = g_batch_through;
-    upload_matrices();
-    glUniform4f(g_program.viewport, float24(cmd(0x42u)), float24(cmd(0x43u)),
-                float24(cmd(0x45u)) - static_cast<float>(cmd(0x4Cu) & 0xFFFFu) / 16.0f,
-                float24(cmd(0x46u)) - static_cast<float>(cmd(0x4Du) & 0xFFFFu) / 16.0f);
+    const bool through = (g_batch_vtype & 0x800000u) != 0u;
+    if (!through) upload_matrices();
+    upload_vertex_state(through);
+    uniform4(g_program.viewport, float24(cmd(0x42u)), float24(cmd(0x43u)),
+             float24(cmd(0x45u)) - static_cast<float>(cmd(0x4Cu) & 0xFFFFu) / 16.0f,
+             float24(cmd(0x46u)) - static_cast<float>(cmd(0x4Du) & 0xFFFFu) / 16.0f);
     const bool fog = !through && !clear_mode && (cmd(0x1Fu) & 1u) != 0u;
-    glUniform4f(g_program.depth, float24(cmd(0x44u)), float24(cmd(0x47u)), through ? 1.0f : 0.0f, fog ? 1.0f : 0.0f);
-    glUniform4f(g_program.target, static_cast<float>(target.width), static_cast<float>(target.height), 0.0f, 0.0f);
-    glUniform2f(g_program.fog, float24(cmd(0xCDu)), float24(cmd(0xCEu)));
+    uniform4(g_program.depth, float24(cmd(0x44u)), float24(cmd(0x47u)), through ? 1.0f : 0.0f, fog ? 1.0f : 0.0f);
+    uniform4(g_program.target, static_cast<float>(target.width), static_cast<float>(target.height), 0.0f, 0.0f);
+    uniform4(g_program.fog, float24(cmd(0xCDu)), float24(cmd(0xCEu)), 0.0f, 0.0f);
     const std::uint32_t fog_color = cmd(0xCFu);
-    glUniform4f(g_program.fogcolor, static_cast<float>(fog_color & 0xFFu) / 255.0f,
+    uniform4(g_program.fogcolor, static_cast<float>(fog_color & 0xFFu) / 255.0f,
                 static_cast<float>((fog_color >> 8u) & 0xFFu) / 255.0f, static_cast<float>((fog_color >> 16u) & 0xFFu) / 255.0f, 1.0f);
 
     const bool textured = !clear_mode && (cmd(0x1Eu) & 1u) != 0u;
     if (textured) {
         glActiveTexture(GL_TEXTURE0);
         const auto texmap = bind_texture(*g_memory);
-        glUniform4f(g_program.texmap, texmap[0], texmap[1], texmap[2], texmap[3]);
-        glUniform1i(g_program.texture, 0);
+        uniform4(g_program.texmap, texmap[0], texmap[1], texmap[2], texmap[3]);
     }
     const std::uint32_t texfunc = cmd(0xC9u);
-    glUniform4f(g_program.texenv, textured ? 1.0f : 0.0f, static_cast<float>(std::min<std::uint32_t>(texfunc & 7u, 4u)),
+    uniform4(g_program.texenv, textured ? 1.0f : 0.0f, static_cast<float>(std::min<std::uint32_t>(texfunc & 7u, 4u)),
                 (texfunc & 0x100u) != 0u ? 1.0f : 0.0f, (texfunc & 0x10000u) != 0u ? 1.0f : 0.0f);
     const std::uint32_t env = cmd(0xCAu);
-    glUniform4f(g_program.envcolor, static_cast<float>(env & 0xFFu) / 255.0f, static_cast<float>((env >> 8u) & 0xFFu) / 255.0f,
+    uniform4(g_program.envcolor, static_cast<float>(env & 0xFFu) / 255.0f, static_cast<float>((env >> 8u) & 0xFFu) / 255.0f,
                 static_cast<float>((env >> 16u) & 0xFFu) / 255.0f, 1.0f);
     const std::uint32_t alpha_test = cmd(0xDBu);
     const bool alpha_enabled = !clear_mode && (cmd(0x22u) & 1u) != 0u;
-    glUniform4f(g_program.alpha, static_cast<float>(alpha_test & 7u), static_cast<float>((alpha_test >> 8u) & 0xFFu),
+    uniform4(g_program.alpha, static_cast<float>(alpha_test & 7u), static_cast<float>((alpha_test >> 8u) & 0xFFu),
                 alpha_enabled ? 1.0f : 0.0f, 0.0f);
 
     // Scissor (inclusive PSP rectangle, y down) in GL window coordinates.
@@ -542,12 +686,12 @@ void flush() {
         const GLboolean color = (clear & 0x100u) != 0u ? GL_TRUE : GL_FALSE;
         glColorMask(color, color, color, (clear & 0x200u) != 0u ? GL_TRUE : GL_FALSE);
         glDisable(GL_CULL_FACE);
-        glUniform4f(g_program.blendfix, 1.0f, 1.0f, 1.0f, 0.0f);
-        glUniform4f(g_program.alphaout, 0.0f, 0.0f, 0.0f, 0.0f);
+        uniform4(g_program.blendfix, 1.0f, 1.0f, 1.0f, 0.0f);
+        uniform4(g_program.alphaout, 0.0f, 0.0f, 0.0f, 0.0f);
     } else {
         const BlendShader blend = set_blend();
-        glUniform4f(g_program.blendfix, blend.scale[0], blend.scale[1], blend.scale[2], blend.scaled ? 1.0f : 0.0f);
-        glUniform4f(g_program.alphaout, blend.alpha >= 0.0f ? 1.0f : 0.0f, std::max(blend.alpha, 0.0f), 0.0f, 0.0f);
+        uniform4(g_program.blendfix, blend.scale[0], blend.scale[1], blend.scale[2], blend.scaled ? 1.0f : 0.0f);
+        uniform4(g_program.alphaout, blend.alpha >= 0.0f ? 1.0f : 0.0f, std::max(blend.alpha, 0.0f), 0.0f, 0.0f);
         if ((cmd(0x23u) & 1u) != 0u) {
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(compare(cmd(0xDEu)));
@@ -568,36 +712,17 @@ void flush() {
         }
     }
 
-    const auto *base = reinterpret_cast<const std::uint8_t *>(g_batch.data());
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + offsetof(Vertex, position));
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + offsetof(Vertex, texcoord));
-    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), base + offsetof(Vertex, color));
+    bind_vertices();
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(g_batch_indices.size()), GL_UNSIGNED_SHORT, g_batch_indices.data());
     ++g_stats.batches;
-    g_stats.vertices += g_batch.size();
+    g_stats.vertices += g_batch_count;
     g_batch.clear();
+    g_batch_count = 0u;
     g_batch_indices.clear();
     g_stats.draw_ms += host_now_ms() - started;
 }
 
 // ---------------------------------------------------------------- vertices
-
-struct Decoded {
-    float position[3]{};
-    float normal[3]{0.0f, 0.0f, 1.0f};
-    float texcoord[2]{};
-    std::array<std::uint8_t, 4> color{255u, 255u, 255u, 255u};
-};
-
-std::array<float, 3> world_point(const float *p, bool translate) {
-    const float w = translate ? 1.0f : 0.0f;
-    return {p[0] * g_world[0] + p[1] * g_world[3] + p[2] * g_world[6] + w * g_world[9],
-            p[0] * g_world[1] + p[1] * g_world[4] + p[2] * g_world[7] + w * g_world[10],
-            p[0] * g_world[2] + p[1] * g_world[5] + p[2] * g_world[8] + w * g_world[11]};
-}
 
 std::array<float, 3> normalized(std::array<float, 3> v) {
     const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
@@ -611,92 +736,43 @@ std::array<float, 4> rgb_command(std::uint32_t index, float alpha) {
             static_cast<float>((v >> 16u) & 0xFFu) / 255.0f, alpha};
 }
 
-// PSP vertex lighting (the model the VCS software renderer implements). The
-// register state is decoded once per PRIM.
-struct LightSetup {
-    struct Light {
-        bool enabled{};
-        std::uint32_t computation{}, type{};
-        std::array<float, 3> vector{}, attenuation{}, direction{};
-        float cutoff{}, exponent{};
-        std::array<float, 4> ambient{}, diffuse{}, specular{};
-    };
-    std::uint32_t update{};
-    std::array<float, 4> ambient{}, diffuse{}, specular{}, global{}, emissive{};
-    float exponent{};
-    std::array<Light, 4> lights{};
-};
-
-LightSetup prepare_lighting(bool has_color) {
-    LightSetup setup;
-    setup.update = cmd(0x53u) & (has_color ? 7u : 0u);
+// PSP vertex lighting state for the vertex shader (layout in kVertexShader).
+std::array<float, 30 * 4> lighting_uniforms(bool has_color) {
+    std::array<float, 30 * 4> u{};
+    const auto put = [&](int slot, std::array<float, 4> v) { std::copy(v.begin(), v.end(), u.begin() + slot * 4); };
+    const std::uint32_t update = cmd(0x53u) & (has_color ? 7u : 0u);
+    float exponent = float24(cmd(0x5Bu));
+    if (!std::isfinite(exponent) || exponent < 0.0f) exponent = 0.0f;
+    put(0, {(update & 1u) ? 1.0f : 0.0f, (update & 2u) ? 1.0f : 0.0f, (update & 4u) ? 1.0f : 0.0f, exponent});
+    put(1, rgb_command(0x54u, 0.0f));
+    put(2, rgb_command(0x5Cu, static_cast<float>(cmd(0x5Du) & 0xFFu) / 255.0f));
     const float material_alpha = static_cast<float>(cmd(0x58u) & 0xFFu) / 255.0f;
-    setup.ambient = rgb_command(0x55u, material_alpha);
-    setup.diffuse = rgb_command(0x56u, material_alpha);
-    setup.specular = rgb_command(0x57u, material_alpha);
-    setup.global = rgb_command(0x5Cu, static_cast<float>(cmd(0x5Du) & 0xFFu) / 255.0f);
-    setup.emissive = rgb_command(0x54u, 0.0f);
-    setup.exponent = float24(cmd(0x5Bu));
-    if (!std::isfinite(setup.exponent) || setup.exponent < 0.0f) setup.exponent = 0.0f;
+    put(3, rgb_command(0x55u, material_alpha));
+    put(4, rgb_command(0x56u, material_alpha));
+    put(5, rgb_command(0x57u, material_alpha));
     for (std::uint32_t l = 0; l < 4u; ++l) {
-        LightSetup::Light &light = setup.lights[l];
-        light.enabled = (cmd(0x18u + l) & 1u) != 0u;
-        if (!light.enabled) continue;
+        const int base = 6 + static_cast<int>(l) * 6;
+        if ((cmd(0x18u + l) & 1u) == 0u) {
+            put(base, {0.0f, 0.0f, 0.0f, -1.0f});
+            continue;
+        }
         const std::uint32_t type_data = cmd(0x5Fu + l);
-        light.computation = type_data & 3u;
-        light.type = (type_data >> 8u) & 3u;
-        light.vector = {float24(cmd(0x63u + l * 3u)), float24(cmd(0x64u + l * 3u)), float24(cmd(0x65u + l * 3u))};
-        if (light.type == 0u) light.vector = normalized(light.vector);
-        light.attenuation = {float24(cmd(0x7Bu + l * 3u)), float24(cmd(0x7Cu + l * 3u)), float24(cmd(0x7Du + l * 3u))};
-        light.direction = normalized({float24(cmd(0x6Fu + l * 3u)), float24(cmd(0x70u + l * 3u)), float24(cmd(0x71u + l * 3u))});
-        light.cutoff = float24(cmd(0x8Bu + l));
-        light.exponent = float24(cmd(0x87u + l));
-        light.ambient = rgb_command(0x8Fu + l * 3u, 1.0f);
-        light.diffuse = rgb_command(0x90u + l * 3u, 1.0f);
-        light.specular = rgb_command(0x91u + l * 3u, 1.0f);
+        const std::uint32_t type = (type_data >> 8u) & 3u;
+        std::array<float, 3> vector{float24(cmd(0x63u + l * 3u)), float24(cmd(0x64u + l * 3u)), float24(cmd(0x65u + l * 3u))};
+        if (type == 0u) vector = normalized(vector);
+        put(base, {vector[0], vector[1], vector[2], static_cast<float>(type)});
+        put(base + 1, {float24(cmd(0x7Bu + l * 3u)), float24(cmd(0x7Cu + l * 3u)), float24(cmd(0x7Du + l * 3u)),
+                       static_cast<float>(type_data & 3u)});
+        const auto direction =
+            normalized({float24(cmd(0x6Fu + l * 3u)), float24(cmd(0x70u + l * 3u)), float24(cmd(0x71u + l * 3u))});
+        put(base + 2, {direction[0], direction[1], direction[2], float24(cmd(0x8Bu + l))});
+        auto ambient = rgb_command(0x8Fu + l * 3u, 1.0f);
+        ambient[3] = float24(cmd(0x87u + l));
+        put(base + 3, ambient);
+        put(base + 4, rgb_command(0x90u + l * 3u, 1.0f));
+        put(base + 5, rgb_command(0x91u + l * 3u, 1.0f));
     }
-    return setup;
-}
-
-std::array<std::uint8_t, 4> light(const Decoded &v, const LightSetup &setup) {
-    const std::array<float, 4> vertex{v.color[0] / 255.0f, v.color[1] / 255.0f, v.color[2] / 255.0f, v.color[3] / 255.0f};
-    const auto &ambient = (setup.update & 1u) ? vertex : setup.ambient;
-    const auto &diffuse = (setup.update & 2u) ? vertex : setup.diffuse;
-    const auto &specular = (setup.update & 4u) ? vertex : setup.specular;
-    std::array<float, 4> result = setup.emissive;
-    for (int i = 0; i < 3; ++i) result[i] += ambient[i] * setup.global[i];
-    result[3] = ambient[3] * setup.global[3];
-    const auto position = world_point(v.position, true);
-    const auto normal = normalized(world_point(v.normal, false));
-    for (const LightSetup::Light &l : setup.lights) {
-        if (!l.enabled) continue;
-        std::array<float, 3> to_light = l.vector;
-        float factor = 1.0f;
-        if (l.type != 0u) {
-            for (int i = 0; i < 3; ++i) to_light[i] -= position[i];
-            const float distance = std::sqrt(to_light[0] * to_light[0] + to_light[1] * to_light[1] + to_light[2] * to_light[2]);
-            const float d = l.attenuation[0] + l.attenuation[1] * distance + l.attenuation[2] * distance * distance;
-            factor = d > 0.0f ? std::clamp(1.0f / d, 0.0f, 1.0f) : 0.0f;
-            to_light = normalized(to_light);
-        }
-        if (l.type >= 2u) {
-            const float spot = l.direction[0] * to_light[0] + l.direction[1] * to_light[1] + l.direction[2] * to_light[2];
-            factor *= spot >= l.cutoff ? std::max(0.0f, std::pow(std::max(spot, 0.0f), l.exponent)) : 0.0f;
-        }
-        for (int i = 0; i < 3; ++i) result[i] += l.ambient[i] * ambient[i] * factor;
-        float lambert = to_light[0] * normal[0] + to_light[1] * normal[1] + to_light[2] * normal[2];
-        if (l.computation == 2u) lambert = std::pow(std::max(lambert, 0.0f), setup.exponent);
-        if (lambert > 0.0f)
-            for (int i = 0; i < 3; ++i) result[i] += l.diffuse[i] * diffuse[i] * factor * lambert;
-        if (l.computation == 1u && lambert >= 0.0f) {
-            const auto half = normalized({to_light[0], to_light[1], to_light[2] + 1.0f});
-            const float sp = std::pow(std::max(half[0] * normal[0] + half[1] * normal[1] + half[2] * normal[2], 0.0f), setup.exponent);
-            for (int i = 0; i < 3; ++i) result[i] += l.specular[i] * specular[i] * factor * sp;
-        }
-    }
-    std::array<std::uint8_t, 4> out{};
-    for (int i = 0; i < 4; ++i) out[i] = static_cast<std::uint8_t>(std::clamp(result[i], 0.0f, 1.0f) * 255.0f + 0.5f);
-    return out;
+    return u;
 }
 
 // Vertex layout: weights, texcoord, colour, normal, position; each aligned to its size.
@@ -729,6 +805,137 @@ VertexLayout vertex_layout(std::uint32_t vtype) {
     return layout;
 }
 
+// Batch vertices keep the PSP component formats, which the vertex shader
+// scales and converts; each field sits in a 4-byte aligned slot, as GXM
+// vertex streams want. Common types already have this layout and are copied
+// as one block.
+struct BatchLayout {
+    std::uint32_t tc{}, col{}, nrm{}, pos{}, stride{};
+    std::uint32_t tc_size{}, col_size{}, nrm_size{}, pos_size{};  // bytes per component (colour: whole value)
+    bool same_as_psp{};
+};
+
+BatchLayout batch_layout(std::uint32_t vtype) {
+    const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
+    const auto align4 = [](std::uint32_t v) { return (v + 3u) & ~3u; };
+    BatchLayout layout;
+    layout.tc_size = sizes_tc[tc];
+    layout.col_size = sizes_col[col];
+    layout.nrm_size = sizes_nrm[nrm];
+    layout.pos_size = std::max<std::uint32_t>(sizes_pos[pos], 1u);
+    std::uint32_t offset = 0u;
+    layout.tc = offset;
+    offset += align4(layout.tc_size * 2u);
+    layout.col = offset;
+    offset += align4(layout.col_size);
+    layout.nrm = offset;
+    offset += align4(layout.nrm_size * 3u);
+    layout.pos = offset;
+    offset += align4(layout.pos_size * 3u);
+    layout.stride = offset;
+    const VertexLayout psp = vertex_layout(vtype);
+    layout.same_as_psp = (tc == 0u || psp.tc == layout.tc) && (layout.col_size == 0u || psp.col == layout.col) &&
+                         (nrm == 0u || psp.nrm == layout.nrm) && psp.pos == layout.pos && psp.stride == layout.stride;
+    return layout;
+}
+
+void copy_vertex(std::uint8_t *out, const std::uint8_t *in, const BatchLayout &to, const VertexLayout &from) {
+    std::memcpy(out + to.tc, in + from.tc, to.tc_size * 2u);
+    std::memcpy(out + to.col, in + from.col, to.col_size);
+    std::memcpy(out + to.nrm, in + from.nrm, to.nrm_size * 3u);
+    std::memcpy(out + to.pos, in + from.pos, to.pos_size * 3u);
+}
+
+BatchLayout g_layout;
+
+std::uint8_t *append_vertices(std::uint32_t count) {
+    const std::size_t at = g_batch.size();
+    g_batch.resize(at + static_cast<std::size_t>(count) * g_layout.stride);
+    g_batch_count += count;
+    return g_batch.data() + at;
+}
+
+GLenum component_type(std::uint32_t format, bool is_signed) {
+    switch (format) {
+    case 1u: return is_signed ? GL_BYTE : GL_UNSIGNED_BYTE;
+    case 2u: return is_signed ? GL_SHORT : GL_UNSIGNED_SHORT;
+    default: return GL_FLOAT;
+    }
+}
+
+// Vertex format, texture-coordinate generation and lighting uniforms of the
+// pending batch.
+void upload_vertex_state(bool through) {
+    const std::uint32_t vtype = g_batch_vtype;
+    const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
+    const float tc_scale = through ? 1.0f : (tc == 1u ? 1.0f / 128.0f : tc == 2u ? 1.0f / 32768.0f : 1.0f);
+    const float pos_scale = through ? 1.0f : (pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f);
+    const float nrm_scale = nrm == 1u ? 1.0f / 127.0f : nrm == 2u ? 1.0f / 32767.0f : 1.0f;
+    uniform4(g_program.format, pos_scale, tc_scale, nrm_scale, static_cast<float>(col >= 4u ? col : 0u));
+    const bool lit = !through && (cmd(0x17u) & 1u) != 0u;
+    const std::uint32_t map_mode = cmd(0xC0u) & 3u, map_source = (cmd(0xC0u) >> 8u) & 3u;
+    const float mode = through ? 3.0f : (map_mode == 1u || map_mode == 2u) ? static_cast<float>(map_mode) : 0.0f;
+    uniform4(g_program.texgen, mode, static_cast<float>(map_source), through && pos == 2u ? 1.0f : 0.0f, lit ? 1.0f : 0.0f);
+    if (through) {
+        const float width = static_cast<float>(1u << std::min<std::uint32_t>(cmd(0xB8u) & 0xFu, 10u));
+        const float height = static_cast<float>(1u << std::min<std::uint32_t>((cmd(0xB8u) >> 8u) & 0xFu, 10u));
+        uniform4(g_program.uvscale, 1.0f / width, 1.0f / height, 0.0f, 0.0f);
+    } else if (mode == 0.0f) {
+        uniform4(g_program.uvscale, float24(cmd(0x48u)), float24(cmd(0x49u)), float24(cmd(0x4Au)), float24(cmd(0x4Bu)));
+    } else if (mode == 1.0f) {
+        float texmatrix[16];
+        psp_matrix(g_texgen.data(), texmatrix);
+        uniform_matrix(g_program.texmatrix, texmatrix);
+    } else {
+        const std::uint32_t ls = cmd(0xC1u);
+        const auto direction = [&](std::uint32_t l) {
+            return normalized({float24(cmd(0x63u + l * 3u)), float24(cmd(0x64u + l * 3u)), float24(cmd(0x65u + l * 3u))});
+        };
+        const auto lu = direction(ls & 3u), lv = direction((ls >> 8u) & 3u);
+        const float shade[8]{lu[0], lu[1], lu[2], 0.0f, lv[0], lv[1], lv[2], 0.0f};
+        uniform4v(g_program.shade, shade, 2);
+    }
+    if (lit) {
+        const auto lighting = lighting_uniforms(col >= 4u);
+        uniform4v(g_program.lighting, lighting.data(), 30);
+    }
+}
+
+void bind_vertices() {
+    const std::uint32_t vtype = g_batch_vtype;
+    const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
+    const auto stride = static_cast<GLsizei>(g_layout.stride);
+    const std::uint8_t *base = g_batch.data();
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, component_type(pos, true), GL_FALSE, stride, base + g_layout.pos);
+    if (tc != 0u) {
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, component_type(tc, false), GL_FALSE, stride, base + g_layout.tc);
+    } else {
+        glDisableVertexAttribArray(1);
+        glVertexAttrib4f(1, 0.0f, 0.0f, 0.0f, 1.0f);
+    }
+    if (col == 7u) {
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, base + g_layout.col);
+    } else if (col >= 4u) {
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 1, GL_UNSIGNED_SHORT, GL_FALSE, stride, base + g_layout.col);
+    } else {
+        // No vertex colour: the material ambient colour.
+        glDisableVertexAttribArray(2);
+        const auto ambient = rgb_command(0x55u, static_cast<float>(cmd(0x58u) & 0xFFu) / 255.0f);
+        glVertexAttrib4f(2, ambient[0], ambient[1], ambient[2], ambient[3]);
+    }
+    if (nrm != 0u) {
+        glEnableVertexAttribArray(3);
+        glVertexAttribPointer(3, 3, component_type(nrm, true), GL_FALSE, stride, base + g_layout.nrm);
+    } else {
+        glDisableVertexAttribArray(3);
+        glVertexAttrib4f(3, 0.0f, 0.0f, 1.0f, 1.0f);
+    }
+}
+
 // Snapshot record: header, then the index bytes, then the vertex bytes (a
 // LOAD_CLUT record keeps the palette in the index part). UINT32_MAX marks a
 // part the emulation thread could not read.
@@ -753,14 +960,12 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const std::uint32_t primitive = (data >> 16u) & 7u;
     const std::uint32_t count = data & 0xFFFFu;
     const std::uint32_t vtype = cmd(0x12u);
-    const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
     const std::uint32_t weight = (vtype >> 9u) & 3u, index = (vtype >> 11u) & 3u;
     const std::uint32_t weights = weight != 0u ? ((vtype >> 14u) & 7u) + 1u : 0u;
     const std::uint32_t morphs = ((vtype >> 18u) & 7u) + 1u;
     const bool through = (vtype & 0x800000u) != 0u;
 
     const VertexLayout layout = vertex_layout(vtype);
-    const std::uint32_t tc_offset = layout.tc, col_offset = layout.col, nrm_offset = layout.nrm, pos_offset = layout.pos;
     const std::uint32_t stride = layout.stride;
 
     if (weights != 0u || morphs > 1u || primitive < 3u) {  // skinning/morphing/points/lines: not yet
@@ -770,16 +975,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         return false;
     }
 
-    const float tc_scale = through ? 1.0f : (tc == 1u ? 1.0f / 128.0f : tc == 2u ? 1.0f / 32768.0f : 1.0f);
-    const float pos_scale = through ? 1.0f : (pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f);
-    const float nrm_scale = nrm == 1u ? 1.0f / 127.0f : nrm == 2u ? 1.0f / 32767.0f : 1.0f;
     const bool lit = !through && (cmd(0x17u) & 1u) != 0u;
-    const std::uint32_t map_mode = cmd(0xC0u) & 3u, map_source = (cmd(0xC0u) >> 8u) & 3u;
-    const float su = float24(cmd(0x48u)), sv = float24(cmd(0x49u)), ou = float24(cmd(0x4Au)), ov = float24(cmd(0x4Bu));
-    const float texture_width = static_cast<float>(1u << std::min<std::uint32_t>(cmd(0xB8u) & 0xFu, 10u));
-    const float texture_height = static_cast<float>(1u << std::min<std::uint32_t>((cmd(0xB8u) >> 8u) & 0xFu, 10u));
-    const auto ambient_material = rgb_command(0x55u, static_cast<float>(cmd(0x58u) & 0xFFu) / 255.0f);
-    const LightSetup lighting = lit ? prepare_lighting(col >= 4u) : LightSetup{};
 
     std::uint32_t max_vertex = 0u;
     static std::vector<std::uint32_t> indices;
@@ -800,96 +996,57 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const std::uint8_t *raw = guest_bytes(memory, g_vertex_address, vertex_count * stride, true);
     if (raw == nullptr) { ++g_stats.skipped_primitives; return false; }
 
-    static std::vector<Vertex> vertices;
-    vertices.resize(vertex_count);
-    for (std::uint32_t i = 0; i < vertex_count; ++i) {
-        const std::uint8_t *v = raw + static_cast<std::size_t>(i) * stride;
-        Decoded d;
-        const auto s8 = [](const std::uint8_t *p) { return static_cast<float>(static_cast<std::int8_t>(p[0])); };
-        const auto s16 = [](const std::uint8_t *p) { std::int16_t x; std::memcpy(&x, p, 2); return static_cast<float>(x); };
-        const auto u16 = [](const std::uint8_t *p) { std::uint16_t x; std::memcpy(&x, p, 2); return static_cast<float>(x); };
-        const auto f32 = [](const std::uint8_t *p) { float x; std::memcpy(&x, p, 4); return x; };
-        for (int k = 0; k < 3; ++k) {
-            const std::uint8_t *p = v + pos_offset + k * sizes_pos[pos];
-            d.position[k] = pos == 1u ? s8(p) * pos_scale
-                : pos == 2u ? ((through && k == 2) ? u16(p) : s16(p) * pos_scale)
-                : f32(p);
-        }
-        if (nrm)
-            for (int k = 0; k < 3; ++k) {
-                const std::uint8_t *p = v + nrm_offset + k * sizes_nrm[nrm];
-                d.normal[k] = nrm == 1u ? s8(p) * nrm_scale : nrm == 2u ? s16(p) * nrm_scale : f32(p);
-            }
-        if (tc)
-            for (int k = 0; k < 2; ++k) {
-                const std::uint8_t *p = v + tc_offset + k * sizes_tc[tc];
-                d.texcoord[k] = tc == 1u ? static_cast<float>(p[0]) * tc_scale : tc == 2u ? u16(p) * tc_scale : f32(p);
-            }
-        if (col >= 4u) {
-            const std::uint8_t *p = v + col_offset;
-            if (col == 7u) d.color = {p[0], p[1], p[2], p[3]};
-            else d.color = color16(static_cast<std::uint16_t>(p[0] | (p[1] << 8u)), col - 4u);
-        } else {
-            for (int k = 0; k < 4; ++k)
-                d.color[k] = static_cast<std::uint8_t>(std::clamp(ambient_material[k], 0.0f, 1.0f) * 255.0f + 0.5f);
-        }
-
-        Vertex &out = vertices[i];
-        std::memcpy(out.position, d.position, sizeof(out.position));
-        out.color = lit ? light(d, lighting) : d.color;
-        g_stats.lit_vertices += lit ? 1u : 0u;
-        out.texcoord[2] = 1.0f;
-        if (through) {
-            out.texcoord[0] = d.texcoord[0] / texture_width;
-            out.texcoord[1] = d.texcoord[1] / texture_height;
-        } else if (map_mode == 1u) {
-            // Texture matrix projection.
-            std::array<float, 3> s{d.position[0], d.position[1], d.position[2]};
-            if (map_source == 1u) s = {d.texcoord[0], d.texcoord[1], 0.0f};
-            else if (map_source == 2u) s = normalized({d.normal[0], d.normal[1], d.normal[2]});
-            else if (map_source == 3u) s = {d.normal[0], d.normal[1], d.normal[2]};
-            out.texcoord[0] = s[0] * g_texgen[0] + s[1] * g_texgen[3] + s[2] * g_texgen[6] + g_texgen[9];
-            out.texcoord[1] = s[0] * g_texgen[1] + s[1] * g_texgen[4] + s[2] * g_texgen[7] + g_texgen[10];
-            out.texcoord[2] = s[0] * g_texgen[2] + s[1] * g_texgen[5] + s[2] * g_texgen[8] + g_texgen[11];
-        } else if (map_mode == 2u) {
-            // Environment (shade) mapping from two light directions.
-            const auto n = normalized(world_point(d.normal, false));
-            const std::uint32_t ls = cmd(0xC1u);
-            const auto light_dir = [&](std::uint32_t l) {
-                return normalized({float24(cmd(0x63u + l * 3u)), float24(cmd(0x64u + l * 3u)), float24(cmd(0x65u + l * 3u))});
-            };
-            const auto lu = light_dir(ls & 3u), lv = light_dir((ls >> 8u) & 3u);
-            out.texcoord[0] = (1.0f + n[0] * lu[0] + n[1] * lu[1] + n[2] * lu[2]) * 0.5f;
-            out.texcoord[1] = (1.0f + n[0] * lv[0] + n[1] * lv[1] + n[2] * lv[2]) * 0.5f;
-        } else {
-            out.texcoord[0] = d.texcoord[0] * su + ou;
-            out.texcoord[1] = d.texcoord[1] * sv + ov;
-        }
+    if (!g_batch_indices.empty() && g_batch_vtype != vtype) flush();
+    if (g_batch_count == 0u) {
+        g_batch_vtype = vtype;
+        g_layout = batch_layout(vtype);
     }
-
-    if (!g_batch.empty() && g_batch_through != through) flush();
-    g_batch_through = through;
+    if (lit) g_stats.lit_vertices += vertex_count;
     // Indexed batch: the PRIM's vertices are appended once and triangles index
     // them. Flat shading needs per-triangle colours, so it copies vertices.
     const bool flat = (cmd(0x50u) & 1u) == 0u && (cmd(0xD3u) & 1u) == 0u;
     const std::size_t worst = flat ? static_cast<std::size_t>(count) * 3u
         : primitive == 6u ? static_cast<std::size_t>(count) * 2u : vertex_count;
-    if (g_batch.size() + worst > 65535u) flush();
-    const auto base = static_cast<std::uint32_t>(g_batch.size());
-    if (!flat && primitive != 6u) g_batch.insert(g_batch.end(), vertices.begin(), vertices.end());
+    if (g_batch_count + worst > 65535u) {
+        flush();
+        g_batch_vtype = vtype;
+        g_layout = batch_layout(vtype);
+    }
+    const BatchLayout &out = g_layout;
+    const auto vertex = [&](std::uint32_t i) { return raw + static_cast<std::size_t>(i) * stride; };
+    const auto base = g_batch_count;
+    // At most three indices per PRIM vertex (strips, fans, sprites).
+    const std::size_t index_start = g_batch_indices.size();
+    g_batch_indices.resize(index_start + static_cast<std::size_t>(count) * 3u);
+    std::uint16_t *next = g_batch_indices.data() + index_start;
+    const auto put = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+        next[0] = static_cast<std::uint16_t>(a);
+        next[1] = static_cast<std::uint16_t>(b);
+        next[2] = static_cast<std::uint16_t>(c);
+        next += 3;
+    };
+    if (!flat && primitive != 6u) {
+        std::uint8_t *dst = append_vertices(vertex_count);
+        if (out.same_as_psp) std::memcpy(dst, raw, static_cast<std::size_t>(vertex_count) * stride);
+        else
+            for (std::uint32_t i = 0; i < vertex_count; ++i) copy_vertex(dst + i * out.stride, vertex(i), out, layout);
+    }
     const auto emit = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
         if (flat) {
-            const auto first = static_cast<std::uint16_t>(g_batch.size());
-            Vertex va = vertices[indices[a]], vb = vertices[indices[b]], vc = vertices[indices[c]];
-            va.color = vb.color = vc.color;
-            g_batch.insert(g_batch.end(), {va, vb, vc});
-            g_batch_indices.insert(g_batch_indices.end(),
-                                   {first, static_cast<std::uint16_t>(first + 1u), static_cast<std::uint16_t>(first + 2u)});
+            // The last vertex gives the colour (and the normal it is lit with).
+            const auto first = static_cast<std::uint16_t>(g_batch_count);
+            std::uint8_t *dst = append_vertices(3u);
+            copy_vertex(dst, vertex(indices[a]), out, layout);
+            copy_vertex(dst + out.stride, vertex(indices[b]), out, layout);
+            copy_vertex(dst + out.stride * 2u, vertex(indices[c]), out, layout);
+            for (int k = 0; k < 2; ++k) {
+                std::memcpy(dst + out.stride * k + out.col, dst + out.stride * 2u + out.col, out.col_size);
+                std::memcpy(dst + out.stride * k + out.nrm, dst + out.stride * 2u + out.nrm, out.nrm_size * 3u);
+            }
+            put(first, first + 1u, first + 2u);
             return;
         }
-        g_batch_indices.insert(g_batch_indices.end(), {static_cast<std::uint16_t>(base + indices[a]),
-                                                       static_cast<std::uint16_t>(base + indices[b]),
-                                                       static_cast<std::uint16_t>(base + indices[c])});
+        put(base + indices[a], base + indices[b], base + indices[c]);
     };
     switch (primitive) {
     case 3u:
@@ -906,22 +1063,29 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         break;
     case 6u:
         for (std::uint32_t i = 0; i + 1u < count; i += 2u) {
-            // Sprite: corners from the two vertices, colour and depth of the second.
-            const Vertex &a = vertices[indices[i]], &b = vertices[indices[i + 1u]];
-            Vertex c00 = b, c10 = b, c01 = b, c11 = b;
-            c00.position[0] = a.position[0]; c00.position[1] = a.position[1];
-            c00.texcoord[0] = a.texcoord[0]; c00.texcoord[1] = a.texcoord[1];
-            c10.position[1] = a.position[1]; c10.texcoord[1] = a.texcoord[1];
-            c01.position[0] = a.position[0]; c01.texcoord[0] = a.texcoord[0];
-            const auto first = static_cast<std::uint16_t>(g_batch.size());
-            g_batch.insert(g_batch.end(), {c00, c10, c11, c01});
-            g_batch_indices.insert(g_batch_indices.end(),
-                                   {first, static_cast<std::uint16_t>(first + 1u), static_cast<std::uint16_t>(first + 2u), first,
-                                    static_cast<std::uint16_t>(first + 2u), static_cast<std::uint16_t>(first + 3u)});
+            // Sprite: corners from the two vertices, colour and depth of the
+            // second. Corners in order: (a.x, a.y), (b.x, a.y), b, (a.x, b.y).
+            const std::uint8_t *a = vertex(indices[i]);
+            const auto first = static_cast<std::uint16_t>(g_batch_count);
+            std::uint8_t *dst = append_vertices(4u);
+            for (std::uint32_t k = 0; k < 4u; ++k) copy_vertex(dst + k * out.stride, vertex(indices[i + 1u]), out, layout);
+            const auto take = [&](std::uint32_t corner, bool x, bool y) {
+                std::uint8_t *c = dst + corner * out.stride;
+                if (x) std::memcpy(c + out.pos, a + layout.pos, out.pos_size);
+                if (y) std::memcpy(c + out.pos + out.pos_size, a + layout.pos + out.pos_size, out.pos_size);
+                if (x) std::memcpy(c + out.tc, a + layout.tc, out.tc_size);
+                if (y) std::memcpy(c + out.tc + out.tc_size, a + layout.tc + out.tc_size, out.tc_size);
+            };
+            take(0u, true, true);
+            take(1u, false, true);
+            take(3u, true, false);
+            put(first, first + 1u, first + 2u);
+            put(first, first + 2u, first + 3u);
         }
         break;
     default: break;
     }
+    g_batch_indices.resize(static_cast<std::size_t>(next - g_batch_indices.data()));
     if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
     else g_vertex_address += count * stride;
     return true;
@@ -1116,6 +1280,7 @@ void present(std::uint32_t address) {
         glBindTexture(GL_TEXTURE_2D, target.texture);
         glUniform1i(g_present.texture, 0);
         glDisableVertexAttribArray(2);
+        glDisableVertexAttribArray(3);
         glEnableVertexAttribArray(0);
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);

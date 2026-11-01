@@ -9,9 +9,10 @@
 namespace burnout::gl {
 
 // GE display lists translated to OpenGL ES 2 (vitaGL on the PS Vita, desktop
-// GL on Windows for validation). Vertices are decoded on the CPU (with PSP
-// lighting and texture-coordinate generation), transformed by the vertex
-// shader, and consecutive PRIMs that share all state are drawn as one batch.
+// GL on Windows for validation). Vertices keep their PSP formats; the vertex
+// shader converts them and does the transform, PSP lighting and texture-
+// coordinate generation. Consecutive PRIMs that share all state are drawn as
+// one batch.
 // Every PSP render target becomes a framebuffer object; a texture whose
 // address is a render target samples that object.
 

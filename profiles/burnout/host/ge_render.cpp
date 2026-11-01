@@ -235,6 +235,7 @@ std::vector<std::uint8_t> g_pending_arena;
 // game rewrites them while it builds the next frame.
 // PSPRECOMP_BURNOUT_GL_SYNC=1 waits for each list instead.
 const bool g_async = std::getenv("PSPRECOMP_BURNOUT_GL_SYNC") == nullptr;
+std::uint64_t g_flips{};
 psprecomp::GuestMemory *g_memory{};
 
 void capture_rgb(const std::vector<std::uint8_t> &rgb, std::uint64_t vblank) {
@@ -529,8 +530,7 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         present.kind = Job::Kind::Present;
         present.address = address;
         push_job(std::move(present));
-        static std::uint64_t flips = 0;
-        if (++flips % 300u == 0u) {
+        if (++g_flips % 300u == 0u) {
             char line[96];
             std::snprintf(line, sizeof(line), "emulation waited %.1f ms/flip for the worker", g_emulation_wait_ms / 300.0);
             gl::trace(line);
