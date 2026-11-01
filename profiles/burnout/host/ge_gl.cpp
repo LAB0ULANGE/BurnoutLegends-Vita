@@ -1116,6 +1116,7 @@ void bind_vertices() {
 // a part the emulation thread could not read.
 struct SnapshotHeader {
     std::uint32_t index_bytes{UINT32_MAX}, vertex_bytes{UINT32_MAX}, vertex_offset{};
+    std::uint32_t index_in_guest{};  // the index part (palette) is read from guest memory
 };
 
 const std::uint8_t *g_snapshot{};
@@ -1137,7 +1138,7 @@ const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t ad
     std::memcpy(&header, g_snapshot, sizeof(header));
     const std::uint32_t have = vertices ? header.vertex_bytes : header.index_bytes;
     if (have == UINT32_MAX || have < bytes) return nullptr;
-    if (!vertices) return g_snapshot + sizeof(header);
+    if (!vertices) return header.index_in_guest != 0u ? memory.raw_pointer(address, bytes) : g_snapshot + sizeof(header);
     if (header.vertex_offset == kInGuestMemory) return memory.raw_pointer(address, bytes);
     return g_snapshot_vertices + header.vertex_offset;
 }
@@ -1152,7 +1153,13 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const std::uint32_t morphs = ((vtype >> 18u) & 7u) + 1u;
     const bool through = (vtype & 0x800000u) != 0u;
 
-    const VertexLayout layout = vertex_layout(vtype);
+    // The vertex type rarely changes between PRIMs.
+    static std::uint32_t layout_vtype = UINT32_MAX;
+    static VertexLayout layout;
+    if (vtype != layout_vtype) {
+        layout_vtype = vtype;
+        layout = vertex_layout(vtype);
+    }
     const std::uint32_t stride = layout.stride;
 
     if (weights != 0u || morphs > 1u || primitive < 3u) {  // skinning/morphing/points/lines: not yet
@@ -1689,7 +1696,9 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
         const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
         if (const std::uint8_t *p = memory.raw_pointer(clut, bytes)) {
             header.index_bytes = bytes;
-            append(arena, p, bytes);
+            // Palettes loaded with the track and cars do not change either.
+            if (static_vertices(clut)) header.index_in_guest = 1u;
+            else append(arena, p, bytes);
         }
     } else {
         // Same pointer arithmetic as decode_prim.

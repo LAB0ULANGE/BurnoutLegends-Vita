@@ -247,10 +247,6 @@ void capture_rgb(const std::vector<std::uint8_t> &rgb, std::uint64_t vblank) {
     ++g_captures;
 }
 
-// Estimated worker time per GE command type (see the command loop).
-std::uint32_t g_op_samples{};
-std::array<double, 256> g_op_ms{};
-std::array<std::uint64_t, 256> g_op_count{};
 
 // Sampling thread: histogram of gl::phase every ~100 us.
 std::array<std::atomic<std::uint32_t>, 16> g_phase_samples{};
@@ -266,18 +262,7 @@ void sample_phases() {
 }
 
 void trace_op_costs() {
-    std::array<int, 256> order{};
-    for (int i = 0; i < 256; ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [](int a, int b) { return g_op_ms[a] > g_op_ms[b]; });
-    std::string line = "per 300 frames, ms/frame by command:";
-    for (int i = 0; i < 8; ++i) {
-        char item[48];
-        std::snprintf(item, sizeof(item), " %02X %.1f (%llu)", order[i], g_op_ms[order[i]] / 300.0,
-                      static_cast<unsigned long long>(g_op_count[order[i]] / 300u));
-        line += item;
-    }
-    gl::trace(line.c_str());
-    line = "worker phases (% of samples):";
+    std::string line = "worker phases (% of samples):";
     std::uint32_t total = 0;
     for (auto &n : g_phase_samples) total += n.load();
     for (int i = 0; i < 14; ++i) {
@@ -297,8 +282,6 @@ void trace_op_costs() {
         g_emulation_samples[i] = 0u;
     }
     gl::trace(line.c_str());
-    g_op_ms.fill(0.0);
-    g_op_count.fill(0u);
 }
 
 void worker_loop() {
@@ -330,10 +313,6 @@ void worker_loop() {
             for (const auto &c : job.commands) {
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
                 const std::uint32_t op = c[0] >> 24u;
-                // Every 16th command is timed (includes any draw it flushes).
-                const bool sampled = (++g_op_samples & 15u) == 0u;
-                const double op_started = sampled ? host_now_ms() : 0.0;
-                ++g_op_count[op];
                 const bool snapshot = c[2] == UINT32_MAX;
                 if (snapshot && op == 0xEAu) {
                     const Transfer &transfer = job.transfers[c[1]];
@@ -348,7 +327,6 @@ void worker_loop() {
                 if (snapshot && op != 0xEAu) gl::use_snapshot(&job.snapshot, c[1]);
                 gl::ge_command(*g_memory, c[0], c[1], c[2]);
                 if (snapshot) gl::use_snapshot(nullptr, 0u);
-                if (sampled) g_op_ms[op] += (host_now_ms() - op_started) * 16.0;
             }
             gl::end_list(std::move(job.snapshot));
             gl::account(host_now_ms() - started, started - waiting);
