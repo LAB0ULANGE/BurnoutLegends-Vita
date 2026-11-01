@@ -3,6 +3,7 @@
 #include "gl_api.hpp"
 
 #include "burnout_bench.hpp"
+#include "thread_sync.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1318,8 +1319,8 @@ bool batch_neutral(std::uint32_t op) noexcept {
 // ---------------------------------------------------------------- GL thread side
 
 struct GlThread {
-    std::mutex mutex;
-    std::condition_variable cv;
+    SyncMutex mutex{"ge_gl"};  // finish() may run on the SCE main thread
+    SyncCondition cv{"ge_gl", mutex};
     std::deque<Frame> frames;
     bool busy{}, ready{}, ok{};
     std::string error;
