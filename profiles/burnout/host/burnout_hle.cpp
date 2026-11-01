@@ -9,6 +9,7 @@
 // audio buffer drain). Host time spent between two game frames is therefore the
 // pure CPU cost of that frame, which is what the benchmark measures.
 #include "burnout_hle.hpp"
+#include "burnout_bench.hpp"
 
 #include "workload_stats.hpp"
 #if defined(BURNOUT_GE_RENDER)
@@ -727,6 +728,12 @@ constexpr bool ge_is_control(std::uint8_t op) noexcept {
 // Walks a display list only far enough to honour SIGNAL/FINISH callbacks; the
 // commands themselves are discarded (no renderer in the headless build).
 void ge_scan(Runtime &rt, GeList &list) {
+#if defined(BURNOUT_GE_RENDER)
+    struct ScanTimer {
+        double started = host_now_ms();
+        ~ScanTimer() { render::account_scan(host_now_ms() - started); }
+    } timer;
+#endif
     constexpr std::uint64_t kCommandLimit = 4u * 1024u * 1024u;
     // Display lists are long and GuestMemory::load32 reads byte by byte.
     const auto memory = rt.memory().aot_fast_view();

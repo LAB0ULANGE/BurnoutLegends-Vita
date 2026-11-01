@@ -70,8 +70,13 @@ constexpr const char *kDefaultScript =
     "hold   600   606  CROSS\n"
     "hold   800   806  CIRCLE\n"
     "pulse  950  1500   90  6  CROSS\n"
+#if defined(BURNOUT_VITA_GL)
+    // From the race start the player drives.
+    "";
+#else
     "hold  1500 99999  CROSS\n"
     "pulse 1500 99999  240 30 R\n";
+#endif
 
 std::uint32_t *g_framebuffer = nullptr;
 

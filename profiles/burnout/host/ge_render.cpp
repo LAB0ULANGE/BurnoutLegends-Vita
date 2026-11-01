@@ -407,6 +407,7 @@ void start_worker() {
 }
 
 double g_emulation_wait_ms{};  // emulation thread blocked on the worker
+double g_scan_ms{};            // emulation thread walking display lists
 
 void push_job(Job job) {
     std::unique_lock lock(g_jobs_mutex);
@@ -468,6 +469,8 @@ void configure(const Options &options) {
 }
 
 bool active() noexcept { return g_options.enabled; }
+
+void account_scan(double ms) noexcept { g_scan_ms += ms; }
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset) {
@@ -599,7 +602,9 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         push_job(std::move(present));
         if (++g_flips % 300u == 0u) {
             char line[96];
-            std::snprintf(line, sizeof(line), "emulation waited %.1f ms/flip for the worker", g_emulation_wait_ms / 300.0);
+            std::snprintf(line, sizeof(line), "emulation: list scan %.1f ms/flip, waited %.1f ms/flip for the worker",
+                          g_scan_ms / 300.0, g_emulation_wait_ms / 300.0);
+            g_scan_ms = 0.0;
             gl::trace(line);
             g_emulation_wait_ms = 0.0;
         }

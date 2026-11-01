@@ -31,6 +31,8 @@ struct Options {
 
 void configure(const Options &options);
 [[nodiscard]] bool active() noexcept;
+// Emulation-thread time spent walking display lists (ge_scan with the hooks).
+void account_scan(double ms) noexcept;
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset);
