@@ -30,6 +30,7 @@ bool read_frame(std::uint32_t address, std::vector<std::uint8_t> &rgb);
 struct Stats {
     std::uint64_t primitives{}, batches{}, vertices{}, skipped_primitives{};
     std::uint64_t texture_uploads{}, render_targets{}, frames{};
+    double decode_ms{}, draw_ms{}, texture_ms{}, present_ms{};
 };
 [[nodiscard]] const Stats &stats() noexcept;
 

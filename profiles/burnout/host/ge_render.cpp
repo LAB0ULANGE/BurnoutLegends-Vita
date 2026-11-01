@@ -289,7 +289,9 @@ std::string report() {
         const auto &s = gl::stats();
         out << "GE OpenGL render: " << s.primitives << " PRIM in " << s.batches << " batches (" << s.vertices
             << " vertices, " << s.skipped_primitives << " PRIM skipped), " << s.texture_uploads << " texture uploads, "
-            << s.render_targets << " render targets, " << s.frames << " frames, " << g_captures << " captures\n";
+            << s.render_targets << " render targets, " << s.frames << " frames, " << g_captures << " captures\n"
+            << "GE OpenGL time: decode " << s.decode_ms / 1000.0 << " s, draw " << s.draw_ms / 1000.0 << " s (textures "
+            << s.texture_ms / 1000.0 << " s), present " << s.present_ms / 1000.0 << " s\n";
     }
     out << "GE software render: " << g_primitives << " PRIM, " << g_failures << " failed"
         << (g_first_error.empty() ? "" : " (first: " + g_first_error + ")") << ", " << g_render_ms / 1000.0
