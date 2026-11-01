@@ -217,6 +217,244 @@ void main() {
 }
 )";
 
+// The same pipeline specialised by preprocessor defines (see variant_defines):
+// one small program per combination of modes the game uses, with no branches
+// on uniforms and, unless the texture matrix projects, the texture
+// coordinates finished per vertex so the fragment shader samples them
+// directly. The SGX runs these much faster than the shaders above, which
+// remain the fallback.
+const char *kVariantVertexShader = R"(
+attribute vec3 a_position;
+attribute vec2 a_texcoord;
+attribute vec4 a_color;
+attribute vec3 a_normal;
+uniform mat4 u_world;
+uniform mat4 u_world_view;
+uniform mat4 u_projection;
+uniform vec4 u_viewport;
+uniform vec4 u_depth;
+uniform vec4 u_target;
+uniform vec4 u_fog;
+uniform vec4 u_format;
+uniform vec4 u_texgen;
+uniform vec4 u_uvscale;
+uniform vec4 u_texmap;
+uniform mat4 u_texmatrix;
+uniform vec4 u_shade[2];
+uniform vec4 u_lighting[30];
+#if TEXTURED
+#if PROJECTIVE
+varying vec3 v_texcoord;
+#else
+varying vec2 v_texcoord;
+#endif
+#endif
+varying vec4 v_color;
+#if FOG
+varying float v_fog;
+#endif
+
+vec3 unit(vec3 v) {
+    float l = length(v);
+    return l > 0.0 ? v / l : vec3(0.0, 0.0, 1.0);
+}
+
+float power(float x, float y) {
+    return x > 0.0 ? pow(x, y) : (y == 0.0 ? 1.0 : 0.0);
+}
+
+#if LIT
+vec4 light(vec4 vertex, vec3 position, vec3 normal) {
+    vec4 info = u_lighting[0];
+    vec4 ambient = info.x > 0.5 ? vertex : u_lighting[3];
+    vec4 diffuse = info.y > 0.5 ? vertex : u_lighting[4];
+    vec4 specular = info.z > 0.5 ? vertex : u_lighting[5];
+    vec4 result = vec4(u_lighting[1].rgb + ambient.rgb * u_lighting[2].rgb, ambient.a * u_lighting[2].a);
+    for (int l = 0; l < 4; ++l) {
+        vec4 l0 = u_lighting[6 + l * 6];
+        if (l0.w > -0.5) {
+            vec4 l1 = u_lighting[7 + l * 6];
+            vec4 l2 = u_lighting[8 + l * 6];
+            vec4 l3 = u_lighting[9 + l * 6];
+            vec3 to_light = l0.xyz;
+            float factor = 1.0;
+            if (l0.w > 0.5) {
+                to_light -= position;
+                float distance = length(to_light);
+                float d = l1.x + l1.y * distance + l1.z * distance * distance;
+                factor = d > 0.0 ? clamp(1.0 / d, 0.0, 1.0) : 0.0;
+                to_light = unit(to_light);
+            }
+            if (l0.w > 1.5) {
+                float spot = dot(l2.xyz, to_light);
+                factor *= spot >= l2.w ? max(0.0, power(max(spot, 0.0), l3.w)) : 0.0;
+            }
+            result.rgb += l3.rgb * ambient.rgb * factor;
+            float lambert = dot(to_light, normal);
+            if (l1.w > 1.5) lambert = power(max(lambert, 0.0), info.w);
+            if (lambert > 0.0) result.rgb += u_lighting[10 + l * 6].rgb * diffuse.rgb * factor * lambert;
+            if (l1.w > 0.5 && l1.w < 1.5 && lambert >= 0.0) {
+                vec3 half_vector = unit(to_light + vec3(0.0, 0.0, 1.0));
+                float sp = power(max(dot(half_vector, normal), 0.0), info.w);
+                result.rgb += u_lighting[11 + l * 6].rgb * specular.rgb * factor * sp;
+            }
+        }
+    }
+    return clamp(result, 0.0, 1.0);
+}
+#endif
+
+void main() {
+    vec3 position = a_position * u_format.x;
+    vec3 normal = a_normal * u_format.z;
+#if COLFMT == 4
+    float v = a_color.x;
+    vec4 color = vec4(mod(v, 32.0) / 31.0, mod(floor(v / 32.0), 64.0) / 63.0, floor(v / 2048.0) / 31.0, 1.0);
+#elif COLFMT == 5
+    float v = a_color.x;
+    vec4 color = vec4(mod(v, 32.0) / 31.0, mod(floor(v / 32.0), 32.0) / 31.0, mod(floor(v / 1024.0), 32.0) / 31.0,
+                      floor(v / 32768.0));
+#elif COLFMT == 6
+    float v = a_color.x;
+    vec4 color = vec4(mod(v, 16.0), mod(floor(v / 16.0), 16.0), mod(floor(v / 256.0), 16.0), floor(v / 4096.0)) / 15.0;
+#else
+    vec4 color = a_color;
+#endif
+#if THROUGH
+    if (u_texgen.z > 0.5 && position.z < 0.0) position.z += 65536.0;
+    vec3 screen = position;
+    float w = 1.0;
+#else
+    vec4 view = u_world_view * vec4(position, 1.0);
+    vec4 clip = u_projection * view;
+    float w = clip.w;
+    vec3 ndc = clip.xyz / clip.w;
+    vec3 screen = vec3(ndc.xy * u_viewport.xy + u_viewport.zw, ndc.z * u_depth.x + u_depth.y);
+#if FOG
+    v_fog = clamp((view.z + u_fog.x) * u_fog.y, 0.0, 1.0);
+#endif
+#endif
+    gl_Position = vec4((screen.x / u_target.x * 2.0 - 1.0) * w, (1.0 - screen.y / u_target.y * 2.0) * w,
+                       (screen.z / 65535.0 * 2.0 - 1.0) * w, w);
+#if LIT
+    color = light(color, (u_world * vec4(position, 1.0)).xyz, unit((u_world * vec4(normal, 0.0)).xyz));
+#endif
+    v_color = color;
+#if TEXTURED
+    vec2 texcoord = a_texcoord * u_format.y;
+#if TEXGEN == 3
+    vec2 t = texcoord * u_uvscale.xy;
+#elif TEXGEN == 2
+    vec3 n = unit((u_world * vec4(normal, 0.0)).xyz);
+    vec2 t = vec2((1.0 + dot(n, u_shade[0].xyz)) * 0.5, (1.0 + dot(n, u_shade[1].xyz)) * 0.5);
+#elif TEXGEN == 1
+#if SOURCE == 3
+    vec3 s = normal;
+#elif SOURCE == 2
+    vec3 s = unit(normal);
+#elif SOURCE == 1
+    vec3 s = vec3(texcoord, 0.0);
+#else
+    vec3 s = position;
+#endif
+    v_texcoord = (u_texmatrix * vec4(s, 1.0)).xyz;
+#else
+    vec2 t = texcoord * u_uvscale.xy + u_uvscale.zw;
+#endif
+#if !PROJECTIVE
+    v_texcoord = t * u_texmap.xy + u_texmap.zw;
+#endif
+#endif
+}
+)";
+
+const char *kVariantFragmentShader = R"(
+uniform sampler2D u_texture;
+uniform vec4 u_texmap;
+uniform vec4 u_envcolor;
+uniform vec4 u_alpha;
+uniform vec4 u_fogcolor;
+uniform vec4 u_blendfix;
+uniform vec4 u_alphaout;
+#if TEXTURED
+#if PROJECTIVE
+varying vec3 v_texcoord;
+#else
+varying vec2 v_texcoord;
+#endif
+#endif
+varying vec4 v_color;
+#if FOG
+varying float v_fog;
+#endif
+void main() {
+    vec4 c = v_color;
+#if TEXTURED
+#if PROJECTIVE
+    vec4 t = texture2D(u_texture, v_texcoord.xy / v_texcoord.z * u_texmap.xy + u_texmap.zw);
+#else
+    vec4 t = texture2D(u_texture, v_texcoord);
+#endif
+#if TCC
+    float ta = t.a;
+#else
+    float ta = 1.0;
+#endif
+#if TEXFUNC == 0
+    c = vec4(c.rgb * t.rgb, c.a * ta);
+#elif TEXFUNC == 1
+#if TCC
+    c = vec4(mix(c.rgb, t.rgb, t.a), c.a);
+#else
+    c = vec4(t.rgb, c.a);
+#endif
+#elif TEXFUNC == 2
+    c = vec4(mix(c.rgb, u_envcolor.rgb, t.rgb), c.a * ta);
+#elif TEXFUNC == 3
+#if TCC
+    c = t;
+#else
+    c = vec4(t.rgb, c.a);
+#endif
+#else
+    c = vec4(min(c.rgb + t.rgb, 1.0), c.a * ta);
+#endif
+#if DOUBLE
+    c.rgb = min(c.rgb * 2.0, 1.0);
+#endif
+#endif
+#if FOG
+    c.rgb = mix(u_fogcolor.rgb, c.rgb, v_fog);
+#endif
+#if ATEST
+    float a = floor(c.a * 255.0 + 0.5);
+    float r = u_alpha.y;
+#if ATFUNC == 0
+    discard;
+#elif ATFUNC == 2
+    if (a != r) discard;
+#elif ATFUNC == 3
+    if (a == r) discard;
+#elif ATFUNC == 4
+    if (a >= r) discard;
+#elif ATFUNC == 5
+    if (a > r) discard;
+#elif ATFUNC == 6
+    if (a <= r) discard;
+#else
+    if (a < r) discard;
+#endif
+#endif
+#if BLENDFIX
+    c.rgb *= u_blendfix.rgb;
+#endif
+#if ALPHAOUT
+    c.a = u_alphaout.y;
+#endif
+    gl_FragColor = c;
+}
+)";
+
 const char *kPresentVertexShader = R"(
 attribute vec2 a_position;
 attribute vec2 a_texcoord;
@@ -252,11 +490,22 @@ struct Texture {
     GLint sampling[4]{-1, -1, -1, -1};
 };
 
+// Uniforms are recorded by slot; the GL thread keeps the latest value of each
+// and uploads to whichever program variant draws whatever it has not seen.
+enum Slot : GLint {
+    kWorld, kWorldView, kProjection, kViewport, kDepth, kTarget, kFog, kFormat, kTexgen, kUvScale, kTexMatrix,
+    kShade, kLighting, kTexMap, kTexEnv, kEnvColor, kAlpha, kFogColor, kBlendFix, kAlphaOut, kSlotCount
+};
+constexpr const char *kSlotNames[kSlotCount]{
+    "u_world", "u_world_view", "u_projection", "u_viewport", "u_depth", "u_target", "u_fog",
+    "u_format", "u_texgen", "u_uvscale", "u_texmatrix", "u_shade", "u_lighting", "u_texmap",
+    "u_texenv", "u_envcolor", "u_alpha", "u_fogcolor", "u_blendfix", "u_alphaout"};
+
 struct Program {
     GLuint id{};
-    GLint world{}, world_view{}, projection{}, viewport{}, depth{}, target{}, fog{};
-    GLint format{}, texgen{}, uvscale{}, texmatrix{}, shade{}, lighting{};
-    GLint texmap{}, texenv{}, envcolor{}, alpha{}, fogcolor{}, texture{}, blendfix{}, alphaout{};
+    GLint texture{};
+    std::array<GLint, kSlotCount> slots{};             // locations, -1 when the variant does not use it
+    std::array<std::uint32_t, kSlotCount> versions{};  // slot value versions last uploaded (GL thread)
 };
 
 std::array<std::uint32_t, 256> g_commands{};
@@ -278,7 +527,7 @@ bool g_lighting_dirty{true};  // a lighting or material command changed since th
 bool g_drawing{true};         // false while a frame is skipped
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
-Program g_program, g_present;
+Program g_uber, g_present;  // GL thread
 #if defined(__vita__)
 GLuint g_vertex_buffer{}, g_index_buffer{};  // wrap per-draw scratch memory (vglBufferData)
 #endif
@@ -288,14 +537,15 @@ psprecomp::GuestMemory *g_memory{};
 std::uint32_t cmd(std::uint32_t index) noexcept { return g_commands[index] & 0x00FFFFFFu; }
 float float24(std::uint32_t data) noexcept { return std::bit_cast<float>(data << 8u); }
 
-GLuint compile(GLenum type, const char *source, std::string &error) {
+GLuint compile(GLenum type, const std::string &defines, const char *source, std::string &error) {
 #if defined(__vita__)
-    const char *sources[1]{source};
+    const std::string text = defines + source;
 #else
-    const char *sources[2]{"#version 120\n", source};
+    const std::string text = "#version 120\n" + defines + source;
 #endif
+    const char *sources[1]{text.c_str()};
     const GLuint shader = glCreateShader(type);
-    glShaderSource(shader, static_cast<GLsizei>(std::size(sources)), sources, nullptr);
+    glShaderSource(shader, 1, sources, nullptr);
     glCompileShader(shader);
     GLint ok = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
@@ -308,10 +558,11 @@ GLuint compile(GLenum type, const char *source, std::string &error) {
     return shader;
 }
 
-bool link(Program &program, const char *vertex, const char *fragment, bool present, std::string &error) {
-    const GLuint vs = compile(GL_VERTEX_SHADER, vertex, error);
+bool link(Program &program, const char *vertex, const char *fragment, bool present, std::string &error,
+          const std::string &defines = {}) {
+    const GLuint vs = compile(GL_VERTEX_SHADER, defines, vertex, error);
     if (vs == 0u) return false;
-    const GLuint fs = compile(GL_FRAGMENT_SHADER, fragment, error);
+    const GLuint fs = compile(GL_FRAGMENT_SHADER, defines, fragment, error);
     if (fs == 0u) return false;
     program.id = glCreateProgram();
     glAttachShader(program.id, vs);
@@ -334,26 +585,7 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
     const auto u = [&](const char *name) { return glGetUniformLocation(program.id, name); };
     program.texture = u("u_texture");
     if (present) return true;
-    program.world = u("u_world");
-    program.world_view = u("u_world_view");
-    program.format = u("u_format");
-    program.texgen = u("u_texgen");
-    program.uvscale = u("u_uvscale");
-    program.texmatrix = u("u_texmatrix");
-    program.shade = u("u_shade");
-    program.lighting = u("u_lighting");
-    program.projection = u("u_projection");
-    program.viewport = u("u_viewport");
-    program.depth = u("u_depth");
-    program.target = u("u_target");
-    program.fog = u("u_fog");
-    program.texmap = u("u_texmap");
-    program.texenv = u("u_texenv");
-    program.envcolor = u("u_envcolor");
-    program.alpha = u("u_alpha");
-    program.fogcolor = u("u_fogcolor");
-    program.blendfix = u("u_blendfix");
-    program.alphaout = u("u_alphaout");
+    for (int i = 0; i < kSlotCount; ++i) program.slots[i] = u(kSlotNames[i]);
     return true;
 }
 
@@ -763,12 +995,12 @@ void upload_matrices() {
             world_view[r * 4 + c] = sum;
         }
     // A row-vector matrix stored row-major is exactly a column-major GL matrix.
-    uniform_matrix(g_program.world, world);
-    uniform_matrix(g_program.world_view, world_view);
-    uniform_matrix(g_program.projection, g_projection.data());
+    uniform_matrix(kWorld, world);
+    uniform_matrix(kWorldView, world_view);
+    uniform_matrix(kProjection, g_projection.data());
 }
 
-void upload_vertex_state(bool through);
+std::uint32_t upload_vertex_state(bool through);
 void bind_vertices();
 
 void flush() {
@@ -794,24 +1026,19 @@ void flush() {
         g_state.viewport_h = target.height;
         record(Op::Viewport, {static_cast<std::uint32_t>(target.width), static_cast<std::uint32_t>(target.height)});
     }
-    if (g_state.program != g_program.id) {
-        g_state.program = g_program.id;
-        record(Op::UseProgram, {g_program.id});
-    }
-
     const bool clear_mode = (cmd(0xD3u) & 1u) != 0u;
     const bool through = (g_batch_vtype & 0x800000u) != 0u;
     if (!through) upload_matrices();
-    upload_vertex_state(through);
-    uniform4(g_program.viewport, float24(cmd(0x42u)), float24(cmd(0x43u)),
+    const std::uint32_t vertex_variant = upload_vertex_state(through);
+    uniform4(kViewport, float24(cmd(0x42u)), float24(cmd(0x43u)),
              float24(cmd(0x45u)) - static_cast<float>(cmd(0x4Cu) & 0xFFFFu) / 16.0f,
              float24(cmd(0x46u)) - static_cast<float>(cmd(0x4Du) & 0xFFFFu) / 16.0f);
     const bool fog = !through && !clear_mode && (cmd(0x1Fu) & 1u) != 0u;
-    uniform4(g_program.depth, float24(cmd(0x44u)), float24(cmd(0x47u)), through ? 1.0f : 0.0f, fog ? 1.0f : 0.0f);
-    uniform4(g_program.target, static_cast<float>(target.width), static_cast<float>(target.height), 0.0f, 0.0f);
-    uniform4(g_program.fog, float24(cmd(0xCDu)), float24(cmd(0xCEu)), 0.0f, 0.0f);
+    uniform4(kDepth, float24(cmd(0x44u)), float24(cmd(0x47u)), through ? 1.0f : 0.0f, fog ? 1.0f : 0.0f);
+    uniform4(kTarget, static_cast<float>(target.width), static_cast<float>(target.height), 0.0f, 0.0f);
+    uniform4(kFog, float24(cmd(0xCDu)), float24(cmd(0xCEu)), 0.0f, 0.0f);
     const std::uint32_t fog_color = cmd(0xCFu);
-    uniform4(g_program.fogcolor, static_cast<float>(fog_color & 0xFFu) / 255.0f,
+    uniform4(kFogColor, static_cast<float>(fog_color & 0xFFu) / 255.0f,
                 static_cast<float>((fog_color >> 8u) & 0xFFu) / 255.0f, static_cast<float>((fog_color >> 16u) & 0xFFu) / 255.0f, 1.0f);
 
     const bool textured = !clear_mode && (cmd(0x1Eu) & 1u) != 0u;
@@ -819,17 +1046,17 @@ void flush() {
         phase = 7u;
         const auto texmap = bind_texture(*g_memory);
         phase = 8u;
-        uniform4(g_program.texmap, texmap[0], texmap[1], texmap[2], texmap[3]);
+        uniform4(kTexMap, texmap[0], texmap[1], texmap[2], texmap[3]);
     }
     const std::uint32_t texfunc = cmd(0xC9u);
-    uniform4(g_program.texenv, textured ? 1.0f : 0.0f, static_cast<float>(std::min<std::uint32_t>(texfunc & 7u, 4u)),
+    uniform4(kTexEnv, textured ? 1.0f : 0.0f, static_cast<float>(std::min<std::uint32_t>(texfunc & 7u, 4u)),
                 (texfunc & 0x100u) != 0u ? 1.0f : 0.0f, (texfunc & 0x10000u) != 0u ? 1.0f : 0.0f);
     const std::uint32_t env = cmd(0xCAu);
-    uniform4(g_program.envcolor, static_cast<float>(env & 0xFFu) / 255.0f, static_cast<float>((env >> 8u) & 0xFFu) / 255.0f,
+    uniform4(kEnvColor, static_cast<float>(env & 0xFFu) / 255.0f, static_cast<float>((env >> 8u) & 0xFFu) / 255.0f,
                 static_cast<float>((env >> 16u) & 0xFFu) / 255.0f, 1.0f);
     const std::uint32_t alpha_test = cmd(0xDBu);
     const bool alpha_enabled = !clear_mode && (cmd(0x22u) & 1u) != 0u;
-    uniform4(g_program.alpha, static_cast<float>(alpha_test & 7u), static_cast<float>((alpha_test >> 8u) & 0xFFu),
+    uniform4(kAlpha, static_cast<float>(alpha_test & 7u), static_cast<float>((alpha_test >> 8u) & 0xFFu),
                 alpha_enabled ? 1.0f : 0.0f, 0.0f);
 
     // Scissor (inclusive PSP rectangle, y down) in GL window coordinates.
@@ -844,6 +1071,7 @@ void flush() {
                              static_cast<std::uint32_t>(scissor[2]), static_cast<std::uint32_t>(scissor[3])});
     }
 
+    bool blend_scaled = false, alpha_out = false;
     if (clear_mode) {
         const std::uint32_t clear = cmd(0xD3u);
         set_capability(GL_BLEND, g_state.blend, false);
@@ -851,12 +1079,14 @@ void flush() {
         set_depth(GL_ALWAYS, (clear & 0x400u) != 0u);
         set_color_mask((clear & 0x100u) != 0u, (clear & 0x200u) != 0u);
         set_capability(GL_CULL_FACE, g_state.cull, false);
-        uniform4(g_program.blendfix, 1.0f, 1.0f, 1.0f, 0.0f);
-        uniform4(g_program.alphaout, 0.0f, 0.0f, 0.0f, 0.0f);
+        uniform4(kBlendFix, 1.0f, 1.0f, 1.0f, 0.0f);
+        uniform4(kAlphaOut, 0.0f, 0.0f, 0.0f, 0.0f);
     } else {
         const BlendShader blend = set_blend();
-        uniform4(g_program.blendfix, blend.scale[0], blend.scale[1], blend.scale[2], blend.scaled ? 1.0f : 0.0f);
-        uniform4(g_program.alphaout, blend.alpha >= 0.0f ? 1.0f : 0.0f, std::max(blend.alpha, 0.0f), 0.0f, 0.0f);
+        uniform4(kBlendFix, blend.scale[0], blend.scale[1], blend.scale[2], blend.scaled ? 1.0f : 0.0f);
+        uniform4(kAlphaOut, blend.alpha >= 0.0f ? 1.0f : 0.0f, std::max(blend.alpha, 0.0f), 0.0f, 0.0f);
+        blend_scaled = blend.scaled;
+        alpha_out = blend.alpha >= 0.0f;
         // Depth writes still happen with the test off.
         set_capability(GL_DEPTH_TEST, g_state.depth_test, true);
         set_depth((cmd(0x23u) & 1u) != 0u ? compare(cmd(0xDEu)) : GL_ALWAYS, (cmd(0xE7u) & 1u) == 0u);
@@ -871,6 +1101,24 @@ void flush() {
                 record(Op::FrontFace, {front});
             }
         }
+    }
+
+    // Fragment half of the program variant; texture coordinate modes only
+    // matter when textured, alpha test 1 (always) is no test.
+    std::uint32_t variant = vertex_variant;
+    if (textured) {
+        variant |= 1u << 10u | std::min<std::uint32_t>(texfunc & 7u, 4u) << 11u | ((texfunc & 0x100u) != 0u ? 1u : 0u) << 14u |
+                   ((texfunc & 0x10000u) != 0u ? 1u : 0u) << 15u | (((variant >> 2u) & 3u) == 1u ? 1u : 0u) << 16u;
+    } else {
+        variant &= ~0x3Cu;
+    }
+    if (fog) variant |= 1u << 9u;
+    if (alpha_enabled && (alpha_test & 7u) != 1u) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
+    if (blend_scaled) variant |= 1u << 21u;
+    if (alpha_out) variant |= 1u << 22u;
+    if (g_state.program != variant) {
+        g_state.program = variant;
+        record(Op::UseProgram, {variant});
     }
 
     phase = 9u;
@@ -1037,27 +1285,27 @@ GLenum component_type(std::uint32_t format, bool is_signed) {
 
 // Vertex format, texture-coordinate generation and lighting uniforms of the
 // pending batch.
-void upload_vertex_state(bool through) {
+std::uint32_t upload_vertex_state(bool through) {
     const std::uint32_t vtype = g_batch_vtype;
     const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
     const float tc_scale = through ? 1.0f : (tc == 1u ? 1.0f / 128.0f : tc == 2u ? 1.0f / 32768.0f : 1.0f);
     const float pos_scale = through ? 1.0f : (pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f);
     const float nrm_scale = nrm == 1u ? 1.0f / 127.0f : nrm == 2u ? 1.0f / 32767.0f : 1.0f;
-    uniform4(g_program.format, pos_scale, tc_scale, nrm_scale, static_cast<float>(col >= 4u ? col : 0u));
+    uniform4(kFormat, pos_scale, tc_scale, nrm_scale, static_cast<float>(col >= 4u ? col : 0u));
     const bool lit = !through && (cmd(0x17u) & 1u) != 0u;
     const std::uint32_t map_mode = cmd(0xC0u) & 3u, map_source = (cmd(0xC0u) >> 8u) & 3u;
     const float mode = through ? 3.0f : (map_mode == 1u || map_mode == 2u) ? static_cast<float>(map_mode) : 0.0f;
-    uniform4(g_program.texgen, mode, static_cast<float>(map_source), through && pos == 2u ? 1.0f : 0.0f, lit ? 1.0f : 0.0f);
+    uniform4(kTexgen, mode, static_cast<float>(map_source), through && pos == 2u ? 1.0f : 0.0f, lit ? 1.0f : 0.0f);
     if (through) {
         const float width = static_cast<float>(1u << std::min<std::uint32_t>(cmd(0xB8u) & 0xFu, 10u));
         const float height = static_cast<float>(1u << std::min<std::uint32_t>((cmd(0xB8u) >> 8u) & 0xFu, 10u));
-        uniform4(g_program.uvscale, 1.0f / width, 1.0f / height, 0.0f, 0.0f);
+        uniform4(kUvScale, 1.0f / width, 1.0f / height, 0.0f, 0.0f);
     } else if (mode == 0.0f) {
-        uniform4(g_program.uvscale, float24(cmd(0x48u)), float24(cmd(0x49u)), float24(cmd(0x4Au)), float24(cmd(0x4Bu)));
+        uniform4(kUvScale, float24(cmd(0x48u)), float24(cmd(0x49u)), float24(cmd(0x4Au)), float24(cmd(0x4Bu)));
     } else if (mode == 1.0f) {
         float texmatrix[16];
         psp_matrix(g_texgen.data(), texmatrix);
-        uniform_matrix(g_program.texmatrix, texmatrix);
+        uniform_matrix(kTexMatrix, texmatrix);
     } else {
         const std::uint32_t ls = cmd(0xC1u);
         const auto direction = [&](std::uint32_t l) {
@@ -1065,15 +1313,19 @@ void upload_vertex_state(bool through) {
         };
         const auto lu = direction(ls & 3u), lv = direction((ls >> 8u) & 3u);
         const float shade[8]{lu[0], lu[1], lu[2], 0.0f, lv[0], lv[1], lv[2], 0.0f};
-        uniform4v(g_program.shade, shade, 2);
+        uniform4v(kShade, shade, 2);
     }
     static bool lighting_has_color = false;
     if (lit && (g_lighting_dirty || lighting_has_color != (col >= 4u))) {
         g_lighting_dirty = false;
         lighting_has_color = col >= 4u;
         const auto lighting = lighting_uniforms(lighting_has_color);
-        uniform4v(g_program.lighting, lighting.data(), 30);
+        uniform4v(kLighting, lighting.data(), 30);
     }
+    // Vertex half of the program variant (bit layout in variant_defines).
+    const std::uint32_t mode_bits = static_cast<std::uint32_t>(mode);
+    return (through ? 1u : 0u) | (lit ? 2u : 0u) | mode_bits << 2u | (mode_bits == 1u ? map_source << 4u : 0u) |
+           (col >= 4u && col <= 6u ? col : 0u) << 6u;
 }
 
 // Records the batch as one Draw: vertex source, attribute layout, indices.
@@ -1369,6 +1621,81 @@ void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int heig
     g_gl_framebuffers[framebuffer_id] = framebuffer;
 }
 
+// Latest value of each uniform slot, versioned so a program only uploads what
+// changed since it last drew.
+struct SlotValue {
+    std::array<float, 30 * 4> values{};
+    std::uint32_t count{}, version{};
+    bool matrix{};
+};
+std::array<SlotValue, kSlotCount> g_slot_values;
+std::unordered_map<std::uint32_t, Program *> g_variants;  // by variant key; the uber program when one failed
+std::deque<Program> g_variant_programs;
+Program *g_bound{};  // program in use; null after present changed it
+
+void set_slot(std::uint32_t slot, const float *values, std::uint32_t count, bool matrix) {
+    SlotValue &value = g_slot_values[slot];
+    std::memcpy(value.values.data(), values, count * sizeof(float));
+    value.count = count;
+    value.matrix = matrix;
+    ++value.version;
+}
+
+// Preprocessor defines of a variant key (bits set in flush and
+// upload_vertex_state).
+std::string variant_defines(std::uint32_t key) {
+    const auto bits = [&](int at, int width) { return (key >> at) & ((1u << width) - 1u); };
+    const std::pair<const char *, std::uint32_t> defines[]{
+        {"THROUGH", bits(0, 1)},    {"LIT", bits(1, 1)},     {"TEXGEN", bits(2, 2)},  {"SOURCE", bits(4, 2)},
+        {"COLFMT", bits(6, 3)},     {"FOG", bits(9, 1)},     {"TEXTURED", bits(10, 1)}, {"TEXFUNC", bits(11, 3)},
+        {"TCC", bits(14, 1)},       {"DOUBLE", bits(15, 1)}, {"PROJECTIVE", bits(16, 1)}, {"ATEST", bits(17, 1)},
+        {"ATFUNC", bits(18, 3)},    {"BLENDFIX", bits(21, 1)}, {"ALPHAOUT", bits(22, 1)}};
+    std::string text;
+    for (const auto &[name, value] : defines) text += "#define " + std::string(name) + " " + std::to_string(value) + "\n";
+    return text;
+}
+
+void use_program(std::uint32_t key) {
+    static const bool uber_only = std::getenv("PSPRECOMP_BURNOUT_UBER") != nullptr;
+    auto it = g_variants.find(key);
+    if (it == g_variants.end()) {
+        Program *program = &g_uber;
+        const double started = host_now_ms();
+        if (!uber_only) {
+            Program &variant = g_variant_programs.emplace_back();
+            std::string error;
+            if (link(variant, kVariantVertexShader, kVariantFragmentShader, false, error, variant_defines(key))) {
+                program = &variant;
+            } else {
+                g_variant_programs.pop_back();
+                trace(("program variant failed, using the general shaders: " + error).c_str());
+            }
+        }
+        it = g_variants.emplace(key, program).first;
+        char line[96];
+        std::snprintf(line, sizeof(line), "program variant %06X (%zu so far) in %.0f ms", key, g_variants.size(),
+                      host_now_ms() - started);
+        trace(line);
+    }
+    if (g_bound != it->second) {
+        g_bound = it->second;
+        glUseProgram(g_bound->id);
+    }
+}
+
+void sync_uniforms() {
+    if (g_bound == nullptr) use_program(0u);
+    Program &program = *g_bound;
+    for (int i = 0; i < kSlotCount; ++i) {
+        const GLint location = program.slots[i];
+        const SlotValue &value = g_slot_values[i];
+        if (location < 0 || program.versions[i] == value.version) continue;
+        program.versions[i] = value.version;
+        if (value.matrix) glUniformMatrix4fv(location, 1, GL_FALSE, value.values.data());
+        else glUniform4fv(location, static_cast<GLsizei>(value.count / 4u), value.values.data());
+    }
+}
+
 void draw(const Frame &frame, const std::uint32_t *a) {
     const std::uint32_t in_frame = a[0], source = a[1], bytes = a[2], stride = a[3], attribs_at = a[4];
     const std::uint32_t indices_at = a[5], index_count = a[6];
@@ -1416,6 +1743,7 @@ void draw(const Frame &frame, const std::uint32_t *a) {
                                   static_cast<GLsizei>(stride), reinterpret_cast<const void *>(base + setup.offset));
         }
     }
+    sync_uniforms();
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
 }
 
@@ -1432,6 +1760,7 @@ void present_target(GLuint texture_id, int width) {
         const float u = 480.0f / static_cast<float>(width);
         const float quad[16]{-1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, u, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
         glUseProgram(g_present.id);
+        g_bound = nullptr;
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gl_texture(texture_id));
         glUniform1i(g_present.texture, 0);
@@ -1504,7 +1833,7 @@ void replay(const Frame &frame) {
             glViewport(0, 0, static_cast<GLsizei>(op[0]) * g_scale, static_cast<GLsizei>(op[1]) * g_scale);
             op += 2;
             break;
-        case Op::UseProgram: glUseProgram(op[0]); op += 1; break;
+        case Op::UseProgram: use_program(op[0]); op += 1; break;
         case Op::BindFramebuffer:
             glBindFramebuffer(GL_FRAMEBUFFER, op[0] < g_gl_framebuffers.size() ? g_gl_framebuffers[op[0]] : 0u);
             op += 1;
@@ -1516,8 +1845,8 @@ void replay(const Frame &frame) {
                          GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
             op += 3;
             break;
-        case Op::Uniform4: glUniform4fv(static_cast<GLint>(op[0]), static_cast<GLsizei>(op[1]), floats(op[2])); op += 3; break;
-        case Op::UniformMatrix: glUniformMatrix4fv(static_cast<GLint>(op[0]), 1, GL_FALSE, floats(op[1])); op += 2; break;
+        case Op::Uniform4: set_slot(op[0], floats(op[2]), op[1] * 4u, false); op += 3; break;
+        case Op::UniformMatrix: set_slot(op[0], floats(op[1]), 16u, true); op += 2; break;
         case Op::Draw: draw(frame, op); op += 7; break;
         case Op::CreateTarget:
             create_target(op[0], op[1], static_cast<int>(op[2]) * g_scale, static_cast<int>(op[3]) * g_scale);
@@ -1540,7 +1869,7 @@ void gl_thread_main() {
         std::string error;
         bool ok = create_context(error);
         if (ok) trace("compiling the draw shaders");
-        ok = ok && link(g_program, kVertexShader, kFragmentShader, false, error);
+        ok = ok && link(g_uber, kVertexShader, kFragmentShader, false, error);
         if (ok) trace("compiling the present shaders");
         ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error);
 #if defined(__vita__)
