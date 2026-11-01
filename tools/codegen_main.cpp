@@ -1621,8 +1621,18 @@ int generate_auto(const std::filesystem::path &elf_path,
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
     std::set<std::uint32_t> import_stubs;
     for (const auto &import : imports) import_stubs.insert(import.stub_address);
-    const auto program = psprecomp::analyze_program(elf, memory, load_base);
+    auto program = psprecomp::analyze_program(elf, memory, load_base);
     if (program.executable_ranges.empty()) throw psprecomp::Error("ELF has no executable ranges");
+    // Import stubs (jr $ra; nop in the file, patched by the loader) can sit in
+    // the same span as the library wrappers that call them. Emitted as code,
+    // they become local labels and same-unit branches to them skip the HLE
+    // entirely, so they are never emitted: every edge to them hands off.
+    for (const std::uint32_t stub : import_stubs) {
+        program.covered_labels.erase(stub);
+        program.covered_labels.erase(stub + 4u);
+        program.covered_entry_labels.erase(stub);
+        program.covered_entry_labels.erase(stub + 4u);
+    }
 
     std::filesystem::create_directories(output_dir);
     const std::uint32_t executable_base = program.executable_ranges.front().start;

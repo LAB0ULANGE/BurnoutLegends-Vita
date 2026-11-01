@@ -39,7 +39,9 @@ set(BURNOUT_HOST_SOURCES
     host/burnout_hle.cpp
     host/burnout_bench.cpp
     host/burnout_run.cpp
-    host/workload_stats.cpp)
+    host/workload_stats.cpp
+    host/audio_out.cpp
+    host/sas_core.cpp)
 
 if(VITA)
     # PS Vita: the same headless runtime packaged as a VPK that benchmarks the
@@ -55,7 +57,7 @@ if(VITA)
     target_include_directories(burnout_vita PRIVATE "${BURNOUT_PROFILE_DIR}/host")
     target_link_libraries(burnout_vita PRIVATE burnout_generated
         SceDisplay_stub SceSysmem_stub ScePower_stub SceKernelThreadMgr_stub
-        SceProcessmgr_stub SceLibKernel_stub pthread)
+        SceProcessmgr_stub SceLibKernel_stub SceAudio_stub pthread)
     vita_create_self(eboot.bin burnout_vita UNSAFE)
     vita_create_vpk(burnout-bench.vpk BRNB00001 eboot.bin
         VERSION 01.00
@@ -74,7 +76,7 @@ if(VITA)
             vitaGL vitashark SceShaccCgExt mathneon taihen_stub SceShaccCg_stub SceKernelDmacMgr_stub
             SceGxm_stub SceDisplay_stub SceCommonDialog_stub SceAppMgr_stub SceSysmodule_stub SceIme_stub
             SceCtrl_stub SceSysmem_stub ScePower_stub SceKernelThreadMgr_stub SceProcessmgr_stub
-            SceLibKernel_stub pthread m)
+            SceLibKernel_stub SceAudio_stub pthread m)
         vita_create_self(eboot_gl.bin burnout_vita_gl UNSAFE)
         vita_create_vpk(burnout-gl.vpk BRNG00001 eboot_gl.bin
             VERSION 01.00

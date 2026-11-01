@@ -7,6 +7,7 @@
 // PSV-VSH-Menu, override the request; the report logs the clock obtained), and
 // writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
 // solid status colour: blue running, green done, red error.
+#include "audio_out.hpp"
 #include "burnout_run.hpp"
 #if defined(BURNOUT_VITA_GL)
 #include "ge_render.hpp"
@@ -254,9 +255,29 @@ int main() {
         burnout::render::configure(render);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
+        // Sound: the SAS voices and audio channels to a BGM port, mixed on
+        // core 2 next to the GL thread. ux0:data/burnout/no_sound.txt turns it off.
+        if (std::FILE *off = std::fopen((std::string(kRoot) + "no_sound.txt").c_str(), "r")) {
+            std::fclose(off);
+            std::fprintf(stderr, "[vita] sound off\n");
+        } else {
+            std::string sound_error;
+            if (burnout::audio::start(2, {}, sound_error)) std::fprintf(stderr, "[vita] sound on\n");
+            else std::fprintf(stderr, "[vita] sound unavailable: %s\n", sound_error.c_str());
+        }
 #endif
         const std::string report = run_pass(444, script);
         append_report(report);
+#if defined(BURNOUT_VITA_GL)
+        if (burnout::audio::enabled()) {
+            const auto sound = burnout::audio::counters();
+            std::fprintf(stderr, "[vita] sound: %llu frames played, %llu underrun, %llu dropped\n",
+                         static_cast<unsigned long long>(sound.played_frames),
+                         static_cast<unsigned long long>(sound.underrun_frames),
+                         static_cast<unsigned long long>(sound.dropped_frames));
+            burnout::audio::stop();
+        }
+#endif
 #if !defined(BURNOUT_VITA_GL)
         if (report.find("stop: benchmark window complete") == std::string::npos) ok = false;
 #endif

@@ -9,7 +9,9 @@
 // audio buffer drain). Host time spent between two game frames is therefore the
 // pure CPU cost of that frame, which is what the benchmark measures.
 #include "burnout_hle.hpp"
+#include "audio_out.hpp"
 #include "burnout_bench.hpp"
+#include "sas_core.hpp"
 
 #include "workload_stats.hpp"
 #if defined(BURNOUT_GE_RENDER)
@@ -143,6 +145,7 @@ struct AudioChannel {
     bool reserved{};
     std::uint32_t samples{};
     std::uint64_t busy_until{};
+    bool mono{};
 };
 
 struct GeCallback {
@@ -1365,6 +1368,15 @@ void install_ge(Runtime &rt) {
     });
 }
 
+// Hands one output buffer of a channel to the host sound output.
+void audio_submit(Runtime &r, std::uint32_t channel, std::uint32_t left, std::uint32_t right, std::uint32_t buffer) {
+    if (!audio::enabled() || channel >= k.audio.size() || buffer == 0u) return;
+    const auto &ch = k.audio[channel];
+    const std::uint32_t bytes = ch.samples * (ch.mono ? 2u : 4u);
+    if (const std::uint8_t *data = r.memory().raw_pointer(buffer, bytes))
+        audio::submit(channel, reinterpret_cast<const std::int16_t *>(data), ch.samples, !ch.mono, left, right);
+}
+
 void audio_block(Runtime &r, AllegrexContext &ctx, std::uint32_t channel) {
     if (channel >= k.audio.size()) { ret(ctx, 0x80260003u); return; }
     auto &ch = k.audio[channel];
@@ -1385,21 +1397,28 @@ void install_audio(Runtime &rt) {
                 if (!k.audio[i].reserved) { channel = static_cast<std::int32_t>(i); break; }
         }
         if (channel < 0 || channel >= static_cast<std::int32_t>(k.audio.size())) { ret(ctx, 0x80260002u); return; }
-        k.audio[static_cast<std::size_t>(channel)] = AudioChannel{true, arg(ctx, 1), k.time_us};
+        k.audio[static_cast<std::size_t>(channel)] = AudioChannel{true, arg(ctx, 1), k.time_us, arg(ctx, 2) == 0x10u};
         ret(ctx, static_cast<std::uint32_t>(channel));
     });
     reg(rt, lib, 0x6FC46853u, [](Runtime &, AllegrexContext &ctx) {
         if (arg(ctx, 0) < k.audio.size()) k.audio[arg(ctx, 0)] = AudioChannel{};
         ret(ctx, 0u);
     });
-    reg(rt, lib, 0x136CAF51u, [](Runtime &r, AllegrexContext &ctx) { audio_block(r, ctx, arg(ctx, 0)); });
-    reg(rt, lib, 0x13F592BCu, [](Runtime &r, AllegrexContext &ctx) { audio_block(r, ctx, arg(ctx, 0)); });
-    reg(rt, lib, 0xE2D56B2Du, [](Runtime &, AllegrexContext &ctx) {  // OutputPanned (non-blocking)
+    reg(rt, lib, 0x136CAF51u, [](Runtime &r, AllegrexContext &ctx) {  // OutputBlocking(channel, volume, buffer)
+        audio_submit(r, arg(ctx, 0), arg(ctx, 1), arg(ctx, 1), arg(ctx, 2));
+        audio_block(r, ctx, arg(ctx, 0));
+    });
+    reg(rt, lib, 0x13F592BCu, [](Runtime &r, AllegrexContext &ctx) {  // OutputPannedBlocking(channel, left, right, buffer)
+        audio_submit(r, arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), arg(ctx, 3));
+        audio_block(r, ctx, arg(ctx, 0));
+    });
+    reg(rt, lib, 0xE2D56B2Du, [](Runtime &r, AllegrexContext &ctx) {  // OutputPanned (non-blocking)
         if (arg(ctx, 0) >= k.audio.size()) { ret(ctx, 0x80260003u); return; }
         auto &ch = k.audio[arg(ctx, 0)];
         const std::uint64_t duration = (static_cast<std::uint64_t>(ch.samples) * 1000000u) / 44100u;
         if (ch.busy_until > k.time_us + duration) { ret(ctx, kErrorAudioBusy); return; }
         ch.busy_until = std::max(k.time_us, ch.busy_until) + duration;
+        audio_submit(r, arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), arg(ctx, 3));
         ret(ctx, 0u);
     });
     reg(rt, lib, 0xB011922Fu, [](Runtime &, AllegrexContext &ctx) {  // GetChannelRestLength
@@ -1412,40 +1431,84 @@ void install_audio(Runtime &rt) {
         if (arg(ctx, 0) < k.audio.size()) k.audio[arg(ctx, 0)].samples = arg(ctx, 1);
         ret(ctx, 0u);
     });
-    reg_value(rt, lib, 0x95FD0C2Du, 0u);
+    reg(rt, lib, 0x95FD0C2Du, [](Runtime &, AllegrexContext &ctx) {  // ChangeChannelConfig(channel, format)
+        if (arg(ctx, 0) < k.audio.size()) k.audio[arg(ctx, 0)].mono = arg(ctx, 1) == 0x10u;
+        ret(ctx, 0u);
+    });
     reg_value(rt, lib, 0xB7E1D8E7u, 0u);
 
     constexpr const char *sas = "sceSasCore";
-    reg(rt, sas, 0x42778A9Fu, [](Runtime &, AllegrexContext &ctx) {  // __sceSasInit
+    // With sound off, init fails as it did while the import stubs were not
+    // dispatched (the wrapper's own 0x80420000): the game then leaves its SAS
+    // voices alone, which saves it real CPU time and keeps the PC validation
+    // runs as they were.
+    reg(rt, sas, 0x42778A9Fu, [](Runtime &, AllegrexContext &ctx) {  // __sceSasInit(core, grain, voices, mode, rate)
+        if (!audio::enabled()) { ret(ctx, 0x80420000u); return; }
         k.sas_grain = std::max<std::uint32_t>(arg(ctx, 1), 64u);
+        sas::init(k.sas_grain);
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0xA3589D81u, [](Runtime &r, AllegrexContext &ctx) {  // __sceSasCore: silence
+    reg(rt, sas, 0xA3589D81u, [](Runtime &r, AllegrexContext &ctx) {  // __sceSasCore(core, out)
         workload::sas_core(k.time_us);
-        if (r.memory().contains(arg(ctx, 1), k.sas_grain * 4u)) r.memory().zero(arg(ctx, 1), k.sas_grain * 4u);
+        if (!r.memory().contains(arg(ctx, 1), k.sas_grain * 4u)) { ret(ctx, 0u); return; }
+        if (audio::enabled()) sas::mix(reinterpret_cast<std::int16_t *>(r.memory().raw_pointer(arg(ctx, 1), k.sas_grain * 4u)));
+        else r.memory().zero(arg(ctx, 1), k.sas_grain * 4u);
         ret(ctx, 0u);
     });
-    reg_value(rt, sas, 0x68A46B95u, 0xFFFFFFFFu);  // GetEndFlag: every voice idle
-    // Voice setup is recorded for the workload statistics only; mixing stays silent.
-    reg(rt, sas, 0x99944089u, [](Runtime &, AllegrexContext &ctx) {  // SetVoice(core, voice, vag, size, loop)
+    reg(rt, sas, 0x68A46B95u, [](Runtime &, AllegrexContext &ctx) {  // GetEndFlag
+        ret(ctx, audio::enabled() ? sas::end_flags() : 0xFFFFFFFFu);
+    });
+    const auto voice = [](const AllegrexContext &ctx) { return static_cast<int>(arg(ctx, 1)); };
+    reg(rt, sas, 0x99944089u, [voice](Runtime &r, AllegrexContext &ctx) {  // SetVoice(core, voice, vag, size, loop)
         workload::sas_set_voice(arg(ctx, 1), arg(ctx, 3), arg(ctx, 4) != 0u);
+        sas::set_voice(voice(ctx), r.memory().raw_pointer(arg(ctx, 2), arg(ctx, 3)), arg(ctx, 3), arg(ctx, 4) != 0u);
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0xAD84D37Fu, [](Runtime &, AllegrexContext &ctx) {  // SetPitch
+    reg(rt, sas, 0xAD84D37Fu, [voice](Runtime &, AllegrexContext &ctx) {  // SetPitch
         workload::sas_set_pitch(arg(ctx, 1), arg(ctx, 2));
+        sas::set_pitch(voice(ctx), arg(ctx, 2));
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x76F01ACAu, [](Runtime &, AllegrexContext &ctx) {  // SetKeyOn
+    reg(rt, sas, 0x76F01ACAu, [voice](Runtime &, AllegrexContext &ctx) {  // SetKeyOn
         workload::sas_key_on(arg(ctx, 1), k.time_us);
+        sas::key_on(voice(ctx));
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0xA0CF2FA4u, [](Runtime &, AllegrexContext &ctx) {  // SetKeyOff
+    reg(rt, sas, 0xA0CF2FA4u, [voice](Runtime &, AllegrexContext &ctx) {  // SetKeyOff
         workload::sas_key_off(arg(ctx, 1));
+        sas::key_off(voice(ctx));
         ret(ctx, 0u);
     });
-    for (const std::uint32_t nid : {0x440CA7D8u, 0xB7660A23u, 0x019B25EBu, 0x9EC3676Au, 0x5F9529F6u, 0x74AE582Au,
-                                    0xCBCD4F79u, 0xF983B186u, 0xD5A229C9u, 0x33D4AB37u, 0x267A6DD2u})
-        reg_value(rt, sas, nid, 0u);
+    reg(rt, sas, 0x440CA7D8u, [voice](Runtime &, AllegrexContext &ctx) {  // SetVolume(core, voice, l, r, effect l, effect r)
+        sas::set_volume(voice(ctx), static_cast<std::int32_t>(arg(ctx, 2)), static_cast<std::int32_t>(arg(ctx, 3)));
+        ret(ctx, 0u);
+    });
+    reg(rt, sas, 0xB7660A23u, [voice](Runtime &, AllegrexContext &ctx) {  // SetNoise(core, voice, frequency)
+        sas::set_noise(voice(ctx), arg(ctx, 2));
+        ret(ctx, 0u);
+    });
+    reg(rt, sas, 0x019B25EBu, [voice](Runtime &, AllegrexContext &ctx) {  // SetADSR(core, voice, flags, a, d, s, r)
+        sas::set_adsr(voice(ctx), arg(ctx, 2), static_cast<std::int32_t>(arg(ctx, 3)), static_cast<std::int32_t>(arg(ctx, 4)),
+                      static_cast<std::int32_t>(arg(ctx, 5)), static_cast<std::int32_t>(arg(ctx, 6)));
+        ret(ctx, 0u);
+    });
+    reg(rt, sas, 0x9EC3676Au, [voice](Runtime &, AllegrexContext &ctx) {  // SetADSRmode(core, voice, flags, a, d, s, r)
+        sas::set_adsr_mode(voice(ctx), arg(ctx, 2), arg(ctx, 3), arg(ctx, 4), arg(ctx, 5), arg(ctx, 6));
+        ret(ctx, 0u);
+    });
+    reg(rt, sas, 0x5F9529F6u, [voice](Runtime &, AllegrexContext &ctx) {  // SetSL(core, voice, level)
+        sas::set_sustain_level(voice(ctx), static_cast<std::int32_t>(arg(ctx, 2)));
+        ret(ctx, 0u);
+    });
+    reg(rt, sas, 0xCBCD4F79u, [voice](Runtime &, AllegrexContext &ctx) {  // SetSimpleADSR(core, voice, env1, env2)
+        sas::set_simple_adsr(voice(ctx), arg(ctx, 2), arg(ctx, 3));
+        ret(ctx, 0u);
+    });
+    reg(rt, sas, 0x74AE582Au, [voice](Runtime &, AllegrexContext &ctx) {  // GetEnvelopeHeight(core, voice)
+        ret(ctx, audio::enabled() ? static_cast<std::uint32_t>(sas::envelope_height(voice(ctx))) : 0u);
+    });
+    // Reverb (RevVON, RevEVOL, RevType, RevParam): not modelled.
+    for (const std::uint32_t nid : {0xF983B186u, 0xD5A229C9u, 0x33D4AB37u, 0x267A6DD2u}) reg_value(rt, sas, nid, 0u);
 
     constexpr const char *atrac = "sceAtrac3plus";
     std::int32_t *next_atrac = new std::int32_t(0);
