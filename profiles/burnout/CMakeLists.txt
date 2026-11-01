@@ -1,0 +1,77 @@
+set(BURNOUT_PROFILE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# The generated corpus is a translation of the commercial executable and is
+# never committed (see .gitignore); regenerate it locally with psp_recomp.
+set(BURNOUT_GENERATED_DIR "${BURNOUT_PROFILE_DIR}/generated" CACHE PATH
+    "Directory holding the psp_recomp --auto output for this profile")
+file(GLOB BURNOUT_GENERATED CONFIGURE_DEPENDS "${BURNOUT_GENERATED_DIR}/*.cpp")
+if(NOT BURNOUT_GENERATED)
+    message(WARNING "profiles/burnout/generated is empty; run psp_recomp --auto first")
+endif()
+
+set(BURNOUT_GENERATED_INLINE_LEVEL "0" CACHE STRING
+    "MSVC /Ob level for the generated burnout units (0 keeps compile time low)")
+if(NOT BURNOUT_GENERATED_INLINE_LEVEL MATCHES "^[0-3]$")
+    message(FATAL_ERROR "BURNOUT_GENERATED_INLINE_LEVEL must be 0, 1, 2 or 3")
+endif()
+
+if(MSVC)
+    if(PSPRECOMP_GENERATED_OPT_LEVEL STREQUAL "0")
+        set(BURNOUT_GENERATED_MSVC_OPT "/Od")
+    elseif(PSPRECOMP_GENERATED_OPT_LEVEL STREQUAL "3")
+        set(BURNOUT_GENERATED_MSVC_OPT "/Ox")
+    else()
+        set(BURNOUT_GENERATED_MSVC_OPT "/O${PSPRECOMP_GENERATED_OPT_LEVEL}")
+    endif()
+    set_source_files_properties(${BURNOUT_GENERATED} PROPERTIES COMPILE_OPTIONS
+        "${BURNOUT_GENERATED_MSVC_OPT};/Ob${BURNOUT_GENERATED_INLINE_LEVEL};/bigobj;${PSPRECOMP_MSVC_MP_FLAG}")
+else()
+    set_source_files_properties(${BURNOUT_GENERATED} PROPERTIES COMPILE_OPTIONS
+        "-O${PSPRECOMP_GENERATED_OPT_LEVEL};-g0")
+endif()
+
+add_library(burnout_generated STATIC ${BURNOUT_GENERATED})
+target_include_directories(burnout_generated PRIVATE "${BURNOUT_GENERATED_DIR}")
+target_link_libraries(burnout_generated PUBLIC psprecomp_core)
+psprecomp_enable_host_avx(burnout_generated)
+
+set(BURNOUT_HOST_SOURCES
+    host/burnout_hle.cpp
+    host/burnout_bench.cpp
+    host/burnout_run.cpp
+    host/workload_stats.cpp)
+
+if(VITA)
+    # PS Vita: the same headless runtime packaged as a VPK that benchmarks the
+    # scripted race and writes ux0:data/burnout-bench.txt.
+    include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
+    add_executable(burnout_vita host/main_vita.cpp ${BURNOUT_HOST_SOURCES})
+    target_compile_definitions(burnout_vita PRIVATE BURNOUT_GENERATED_OPT="-O${PSPRECOMP_GENERATED_OPT_LEVEL}")
+    # Sampling profiler: needs a corpus generated with PSPRECOMP_PROFILE_LABELS=1.
+    option(BURNOUT_VITA_PROFILE "Sample the generated block addresses during the window" OFF)
+    if(BURNOUT_VITA_PROFILE)
+        target_compile_definitions(burnout_vita PRIVATE BURNOUT_VITA_PROFILE=1)
+    endif()
+    target_include_directories(burnout_vita PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+    target_link_libraries(burnout_vita PRIVATE burnout_generated
+        SceDisplay_stub SceSysmem_stub ScePower_stub SceKernelThreadMgr_stub
+        SceProcessmgr_stub SceLibKernel_stub pthread)
+    vita_create_self(eboot.bin burnout_vita UNSAFE)
+    vita_create_vpk(burnout-bench.vpk BRNB00001 eboot.bin
+        VERSION 01.00
+        NAME "Burnout recomp bench")
+    return()
+endif()
+
+add_executable(burnout_headless host/main_headless.cpp ${BURNOUT_HOST_SOURCES}
+    $<$<BOOL:${WIN32}>:host/sampling_profiler_win.cpp>)
+target_link_libraries(burnout_headless PRIVATE burnout_generated)
+target_include_directories(burnout_headless PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+if(MSVC)
+    # Guest code runs on the host stack only one dispatch deep, but generated
+    # units chain natively; keep the same headroom as the VCS profile.
+    target_link_options(burnout_headless PRIVATE /STACK:67108864)
+endif()
+
+add_executable(burnout_opcode_census tools/opcode_census.cpp)
+target_link_libraries(burnout_opcode_census PRIVATE psprecomp_core)

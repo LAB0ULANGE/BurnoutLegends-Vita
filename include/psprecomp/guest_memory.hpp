@@ -117,6 +117,30 @@ public:
             }
             owner_->aot_store32_slow(address, value);
         }
+        // LV.Q/SV.Q: one range check covers the four words when all of them are
+        // in main RAM; anything else takes the per-word path above.
+        PSPRECOMP_MEMORY_FAST_PATH void aot_load_quad(std::uint32_t address, float *value) const {
+            const std::uint32_t offset = ram_offset_of_fast(address);
+            if (ram_limit32_ >= 12u && offset <= ram_limit32_ - 12u) {
+                for (std::uint32_t i = 0; i < 4u; ++i)
+                    value[i] = std::bit_cast<float>(GuestMemory::read_le32(ram_data_ + offset + i * 4u));
+                return;
+            }
+            owner_->aot_load_quad_slow(address, value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store_quad(std::uint32_t address, const float *value) const {
+            const std::uint32_t offset = ram_offset_of_fast(address);
+#if defined(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH)
+            if (ram_limit32_ >= 12u && offset <= ram_limit32_ - 12u) {
+#else
+            if (!write_watch_enabled_ && ram_limit32_ >= 12u && offset <= ram_limit32_ - 12u) {
+#endif
+                for (std::uint32_t i = 0; i < 4u; ++i)
+                    GuestMemory::write_le32(ram_data_ + offset + i * 4u, std::bit_cast<std::uint32_t>(value[i]));
+                return;
+            }
+            owner_->aot_store_quad_slow(address, value);
+        }
 
     private:
         friend class GuestMemory;
@@ -207,6 +231,12 @@ public:
         }
         aot_store32_slow(address, value);
     }
+    PSPRECOMP_MEMORY_FAST_PATH void aot_load_quad(std::uint32_t address, float *value) {
+        aot_fast_view().aot_load_quad(address, value);
+    }
+    PSPRECOMP_MEMORY_FAST_PATH void aot_store_quad(std::uint32_t address, const float *value) {
+        aot_fast_view().aot_store_quad(address, value);
+    }
     void aot_store_word_left(std::uint32_t address, std::uint32_t value);
     void aot_store_word_right(std::uint32_t address, std::uint32_t value);
 
@@ -275,8 +305,17 @@ private:
         return value;
     }
     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static std::uint32_t read_le32(const std::uint8_t *source) noexcept {
+#if defined(__GNUC__)
+        // A typed word access keeps GCC from assuming that guest RAM aliases the
+        // float VFPU/FPU state (memcpy is a char access that aliases everything).
+        // Byte and halfword accesses stay char accesses, so mixed-size guest
+        // traffic is still ordered correctly.
+        using guest_word = std::uint32_t __attribute__((aligned(1)));
+        std::uint32_t value = *reinterpret_cast<const guest_word *>(source);
+#else
         std::uint32_t value{};
         std::memcpy(&value, source, sizeof(value));
+#endif
         if constexpr (std::endian::native == std::endian::big)
             value = ((value >> 24u) & 0x000000FFu) | ((value >> 8u) & 0x0000FF00u) |
                     ((value << 8u) & 0x00FF0000u) | ((value << 24u) & 0xFF000000u);
@@ -291,12 +330,20 @@ private:
         if constexpr (std::endian::native == std::endian::big)
             value = ((value >> 24u) & 0x000000FFu) | ((value >> 8u) & 0x0000FF00u) |
                     ((value << 8u) & 0x00FF0000u) | ((value << 24u) & 0xFF000000u);
+#if defined(__GNUC__)
+        using guest_word = std::uint32_t __attribute__((aligned(1)));
+        *reinterpret_cast<guest_word *>(destination) = value;
+#else
         std::memcpy(destination, &value, sizeof(value));
+#endif
     }
 
     [[nodiscard]] std::uint8_t aot_load8_slow(std::uint32_t address) const;
     [[nodiscard]] std::uint16_t aot_load16_slow(std::uint32_t address) const;
     [[nodiscard]] std::uint32_t aot_load32_slow(std::uint32_t address) const;
+    // Per-word fallback for a quad that is not entirely in main RAM (or is watched).
+    void aot_load_quad_slow(std::uint32_t address, float *value);
+    void aot_store_quad_slow(std::uint32_t address, const float *value);
     void aot_store8_slow(std::uint32_t address, std::uint8_t value);
     void aot_store16_slow(std::uint32_t address, std::uint16_t value);
     void aot_store32_slow(std::uint32_t address, std::uint32_t value);

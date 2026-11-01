@@ -23,7 +23,35 @@ std::vector<ExecutableRange> executable_ranges_for(const Elf32Image &elf, std::u
         ranges.push_back({start, static_cast<std::uint32_t>(end64)});
     }
     std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.start < b.start; });
-    return ranges;
+
+    // Linkers commonly emit one RX PT_LOAD spanning .text, .rodata and .data.
+    // When section headers mark the code with SHF_EXECINSTR, narrow the
+    // executable ranges to those sections so data is never decoded as code.
+    constexpr std::uint32_t kShfExecInstr = 0x4u;
+    std::vector<ExecutableRange> code_sections;
+    for (const auto &section : elf.sections()) {
+        if ((section.flags & kShfExecInstr) == 0u || section.size == 0u) continue;
+        const std::uint32_t start = elf.section_runtime_address(section, load_base);
+        const std::uint64_t end64 = static_cast<std::uint64_t>(start) + section.size;
+        if (end64 > std::numeric_limits<std::uint32_t>::max()) continue;
+        const auto end = static_cast<std::uint32_t>(end64);
+        for (const auto &segment_range : ranges) {
+            const std::uint32_t lo = std::max(start, segment_range.start);
+            const std::uint32_t hi = std::min(end, segment_range.end);
+            if (lo < hi) code_sections.push_back({lo, hi});
+        }
+    }
+    if (code_sections.empty()) return ranges;
+    std::sort(code_sections.begin(), code_sections.end(), [](const auto &a, const auto &b) { return a.start < b.start; });
+    std::vector<ExecutableRange> merged;
+    for (const auto &range : code_sections) {
+        if (!merged.empty() && range.start <= merged.back().end) {
+            merged.back().end = std::max(merged.back().end, range.end);
+        } else {
+            merged.push_back(range);
+        }
+    }
+    return merged;
 }
 
 std::uint32_t direct_jump_target(std::uint32_t pc, const DecodedInstruction &decoded) {
@@ -303,6 +331,24 @@ std::map<std::uint32_t, std::string> collect_initial_seeds(const Elf32Image &elf
     }
     collect_materialized_code_pointers(memory, ranges, seeds);
     collect_relocated_data_code_pointers(elf, memory, load_base, ranges, seeds);
+    // Functions reached only through pointers the scans above cannot see (built
+    // at run time, or stored without a relocation) still start right after the
+    // previous function's `jr $ra` + delay slot, optionally after alignment
+    // NOPs, with a stack-frame prologue `addiu $sp, $sp, -N`.
+    for (const auto &range : ranges) {
+        for (std::uint32_t pc = range.start; pc + 12u <= range.end; pc += 4u) {
+            if (memory.load32(pc) != 0x03E00008u) continue;  // jr $ra
+            std::uint32_t candidate = pc + 8u;
+            for (int padding = 0; padding < 4 && candidate + 4u <= range.end &&
+                                  memory.load32(candidate) == 0u; ++padding)
+                candidate += 4u;
+            if (candidate + 4u > range.end) continue;
+            const auto prologue = decode_allegrex(memory.load32(candidate));
+            if (prologue.kind == OpcodeKind::Addiu && prologue.rs == 29u && prologue.rt == 29u &&
+                prologue.immediate < 0)
+                add_seed(seeds, ranges, candidate, "prologue_after_return");
+        }
+    }
     // R_MIPS_32 relocations are the authoritative source for function pointers
     // stored in read-only tables embedded in the executable segment (init arrays,
     // vtables, callbacks). Scanning raw RX words would confuse J opcodes with pointers.

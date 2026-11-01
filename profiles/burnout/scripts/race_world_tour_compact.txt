@@ -1,0 +1,15 @@
+# Burnout Legends ULES00125: cold boot -> World Tour, Compact, first event.
+# Times are PSP vblanks (59.94 per second). Requires the profile save
+# ULES00125SAVE000 (unencrypted) under ms0:/PSP/SAVEDATA.
+# The headless HLE picks the listed save itself, so the "choose profile" press
+# made in the system save dialog on hardware is not scripted.
+hold   120   126  START      # skip the intro movie
+hold   420   426  START      # title screen -> profile menu
+hold   600   606  CROSS      # "Charger profil" (save loaded at ~vblank 640)
+hold   800   806  CIRCLE     # back to the main menu
+# Defaults from here: World Tour -> Compact -> first event -> launch -> start.
+# The race data (Tracks/B2/C5_V1/streamed.dat) loads at ~vblank 1470.
+pulse  950  1500   90  6  CROSS
+# Race: full throttle, boost every 4 s.
+hold  1500 99999  CROSS
+pulse 1500 99999  240 30 R

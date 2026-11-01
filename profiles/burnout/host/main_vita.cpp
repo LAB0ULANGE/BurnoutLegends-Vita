@@ -1,0 +1,201 @@
+// Headless Burnout Legends benchmark for PS Vita.
+//
+// Expects the user's own game files under ux0:data/burnout/:
+//   EBOOT_DECRYPTED.ELF, PARAM.SFO, USRDIR/, ms0/PSP/SAVEDATA/ULES00125SAVE000/
+// Runs the scripted race once at 444 MHz, the highest ARM clock a retail Vita
+// grants an app without plugins (clock plugins with per-title profiles, such as
+// PSV-VSH-Menu, override the request; the report logs the clock obtained), and
+// writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
+// solid status colour: blue running, green done, red error.
+#include "burnout_run.hpp"
+
+#include <psp2/display.h>
+#include <psp2/kernel/cpu.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/power.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+extern "C" {
+// Runtime state is heap-allocated (32 MiB guest RAM plus dispatch tables); the
+// generated units chain natively up to 48 frames deep.
+int _newlib_heap_size_user = 160 * 1024 * 1024;
+unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
+}
+
+#if defined(BURNOUT_VITA_PROFILE)
+extern "C" volatile std::uint32_t psprecomp_profile_label;
+#endif
+
+namespace {
+
+constexpr const char *kRoot = "ux0:data/burnout/";
+constexpr const char *kReport = "ux0:data/burnout-bench.txt";
+constexpr const char *kLog = "ux0:data/burnout-bench.log";
+
+// Same sequence as profiles/burnout/scripts/race_world_tour_compact.txt.
+constexpr const char *kDefaultScript =
+    "hold   120   126  START\n"
+    "hold   420   426  START\n"
+    "hold   600   606  CROSS\n"
+    "hold   800   806  CIRCLE\n"
+    "pulse  950  1500   90  6  CROSS\n"
+    "hold  1500 99999  CROSS\n"
+    "pulse 1500 99999  240 30 R\n";
+
+std::uint32_t *g_framebuffer = nullptr;
+
+#if defined(BURNOUT_VITA_PROFILE)
+constexpr const char *kProfile = "ux0:data/burnout-profile.txt";
+std::atomic<bool> g_measuring{false};
+std::atomic<bool> g_profiler_stop{false};
+std::unordered_map<std::uint32_t, std::uint32_t> g_samples;
+
+// Runs on another core and samples the last block the emulation thread entered.
+int profiler_thread(SceSize, void *) {
+    g_samples.reserve(1u << 16u);
+    while (!g_profiler_stop.load(std::memory_order_relaxed)) {
+        if (g_measuring.load(std::memory_order_relaxed)) ++g_samples[static_cast<std::uint32_t>(psprecomp_profile_label)];
+        sceKernelDelayThread(100);
+    }
+    return 0;
+}
+
+void write_profile() {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranked(g_samples.begin(), g_samples.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    std::uint64_t total = 0u;
+    for (const auto &entry : ranked) total += entry.second;
+    std::FILE *out = std::fopen(kProfile, "w");
+    if (out == nullptr) return;
+    std::fprintf(out, "samples %llu\n", static_cast<unsigned long long>(total));
+    for (const auto &[label, count] : ranked) std::fprintf(out, "%08lx %lu\n", static_cast<unsigned long>(label),
+                                                           static_cast<unsigned long>(count));
+    std::fclose(out);
+}
+#endif
+
+void show_status(std::uint32_t abgr) {
+    constexpr int kWidth = 960, kHeight = 544;
+    if (g_framebuffer == nullptr) {
+        const SceUID block = sceKernelAllocMemBlock("status_fb", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+                                                    (kWidth * kHeight * 4 + 0x3FFFF) & ~0x3FFFF, nullptr);
+        if (block < 0 || sceKernelGetMemBlockBase(block, reinterpret_cast<void **>(&g_framebuffer)) < 0) return;
+    }
+    for (int i = 0; i < kWidth * kHeight; ++i) g_framebuffer[i] = abgr;
+    SceDisplayFrameBuf frame{};
+    frame.size = sizeof(frame);
+    frame.base = g_framebuffer;
+    frame.pitch = kWidth;
+    frame.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
+    frame.width = kWidth;
+    frame.height = kHeight;
+    sceDisplaySetFrameBuf(&frame, SCE_DISPLAY_SETBUF_NEXTFRAME);
+}
+
+int keep_awake(SceSize, void *) {
+    for (;;) {
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+        sceKernelDelayThread(5 * 1000 * 1000);
+    }
+    return 0;
+}
+
+void append_report(const std::string &text) {
+    std::ofstream out(kReport, std::ios::app);
+    out << text;
+}
+
+std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
+    const int arm_set = scePowerSetArmClockFrequency(arm_mhz);
+    scePowerSetBusClockFrequency(222);
+    scePowerSetGpuClockFrequency(222);
+
+    burnout::BenchOptions options;
+    const std::string root = kRoot;
+    options.elf = root + "EBOOT_DECRYPTED.ELF";
+    options.usrdir = root + "USRDIR";
+    options.disc_root = root;
+    options.memstick = root + "ms0";
+    options.script = script;
+    options.max_vblanks = 9000u;
+    options.hash_trace = "ux0:data/burnout-hashes.txt";
+#if defined(BURNOUT_VITA_PROFILE)
+    options.measuring = &g_measuring;
+#endif
+    std::ostringstream title;
+    title << "burnout-bench (PS Vita headless) ARM " << scePowerGetArmClockFrequency() << " MHz (requested " << arm_mhz
+          << ", ret 0x" << std::hex << arm_set << std::dec << "), bus "
+          << scePowerGetBusClockFrequency() << " MHz";
+    options.title = title.str();
+    std::fprintf(stderr, "[vita] %s\n", options.title.c_str());
+
+    const burnout::BenchResult result = burnout::run_benchmark(options);
+    std::ostringstream text;
+    text << result.report << "host time for the whole pass: " << result.host_seconds << " s\n\n";
+    return text.str();
+}
+
+} // namespace
+
+int main() {
+    std::freopen(kLog, "w", stderr);
+    show_status(0xFF804000u);  // blue: running
+    const SceUID awake = sceKernelCreateThread("keep_awake", keep_awake, 0x10000100, 0x1000, 0, 0, nullptr);
+    if (awake >= 0) sceKernelStartThread(awake, 0, nullptr);
+
+#if defined(BURNOUT_VITA_PROFILE)
+    // Keep the emulation thread off the sampler's core.
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
+    const SceUID profiler = sceKernelCreateThread("profiler", profiler_thread, 0x10000100, 0x10000, 0,
+                                                  SCE_KERNEL_CPU_MASK_USER_2, nullptr);
+    if (profiler >= 0) sceKernelStartThread(profiler, 0, nullptr);
+#endif
+
+    bool ok = true;
+    {
+        std::ofstream(kReport, std::ios::trunc)
+            << "Burnout Legends ULES00125 - headless recomp benchmark\n"
+            << "build: arm-vita-eabi-g++ " << __VERSION__ << ", generated code " BURNOUT_GENERATED_OPT " -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard\n"
+            << "window: 60 s of race (PSP time), starting 10 s after the race data loads\n\n";
+    }
+    try {
+        burnout::InputScript script;
+        if (std::FILE *custom = std::fopen((std::string(kRoot) + "race.txt").c_str(), "r")) {
+            std::fclose(custom);
+            script.load(std::string(kRoot) + "race.txt");
+        } else {
+            std::istringstream lines(kDefaultScript);
+            for (std::string line; std::getline(lines, line);) script.parse_line(line);
+        }
+        const std::string report = run_pass(444, script);
+        append_report(report);
+        if (report.find("stop: benchmark window complete") == std::string::npos) ok = false;
+    } catch (const std::exception &e) {
+        append_report(std::string("ERROR: ") + e.what() + "\n");
+        std::fprintf(stderr, "[vita] error: %s\n", e.what());
+        ok = false;
+    }
+#if defined(BURNOUT_VITA_PROFILE)
+    g_profiler_stop = true;
+    if (profiler >= 0) sceKernelWaitThreadEnd(profiler, nullptr, nullptr);
+    write_profile();
+#endif
+    std::fflush(stderr);
+    show_status(ok ? 0xFF00C000u : 0xFF0000C0u);  // green done / red error
+    sceKernelDelayThread(10 * 1000 * 1000);
+    sceKernelExitProcess(0);
+    return 0;
+}

@@ -50,3 +50,8 @@ SAVEDATA/
 # Python
 __pycache__/
 *.pyc
+
+# psp_analyze output (function lists derived from the game executable) and local bench reports
+/psp_report*.json
+/psp_report*.csv
+/burnout-bench*.txt

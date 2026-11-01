@@ -203,6 +203,14 @@ void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
     }
     store16(address, value);
 }
+void GuestMemory::aot_load_quad_slow(std::uint32_t address, float *value) {
+    for (std::uint32_t i = 0; i < 4u; ++i) value[i] = std::bit_cast<float>(aot_load32(address + i * 4u));
+}
+
+void GuestMemory::aot_store_quad_slow(std::uint32_t address, const float *value) {
+    for (std::uint32_t i = 0; i < 4u; ++i) aot_store32(address + i * 4u, std::bit_cast<std::uint32_t>(value[i]));
+}
+
 void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
     if (write_watch_enabled_) { store32(address, value); return; }
     const std::uint32_t c = canonical(address);

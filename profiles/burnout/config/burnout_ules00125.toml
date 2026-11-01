@@ -1,0 +1,30 @@
+[game]
+name = "Burnout Legends"
+disc_id = "ULES00125"
+region = "PAL"
+disc_version = "1.01"
+module = "Burnout"
+ram_mb = 32
+load_base = "0x08804000"
+# PSP_GAME/SYSDIR/EBOOT.BIN decrypted by PPSSPP 1.17.1 (DumpDecryptedEboots).
+expected_sha256 = "89263a8f1f262971ad85761202fa6b02f4dfc86b3fbc733402ec20d0003e57c4"
+
+[input]
+# Paths are relative to the workspace root (one level above the repository).
+# Neither file is distributed with PSPRecomp.
+executable = "original/EBOOT_DECRYPTED.ELF"
+game_root = "original/USRDIR"
+nids_csv = "configs/nids.csv"
+
+[output]
+report_json = "profiles/burnout/analysis/ULES00125_report.json"
+generated_dir = "profiles/burnout/generated"
+# 16 KiB units: the runtime's fast unit index and dense entry dispatch assume it.
+# psp_recomp ../original/EBOOT_DECRYPTED.ELF --auto profiles/burnout/generated 0x08804000 0x4000
+unit_span_bytes = "0x4000"
+
+[policy]
+missing_function = "stop"
+unsupported_instruction = "stop"
+allow_interpreter_fallback = false
+allow_jit_fallback = false

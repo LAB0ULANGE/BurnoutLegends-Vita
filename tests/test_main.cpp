@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -557,13 +558,11 @@ static void test_codegen_vh2f_lowering() {
             "VH2F codegen retained an unsupported fallback");
     require(text.find("vi2f not lowered yet") == std::string::npos,
             "VI2F codegen retained an unsupported fallback");
-    require(text.find("case 17u: vfpu_rounded = std::trunc(vfpu_scaled)") != std::string::npos,
+    require(text.find("psprecomp::AllegrexContext::vfpu_float_to_int<17u>(vfpu_s[vfpu_i] * vfpu_scale)") != std::string::npos,
             "VF2IZ did not lower to truncation semantics");
-    require(text.find("std::numeric_limits<std::int32_t>::max()") != std::string::npos,
-            "VF2I saturation/NaN handling was not generated");
     require(text.find("vf2iz not lowered yet") == std::string::npos,
             "VF2IZ codegen retained an unsupported fallback");
-    require(text.find("ctx.execute_vfpu_vx2i(0u, 2u, 2u, 3u)") != std::string::npos,
+    require(text.find("ctx.execute_vfpu_vx2i_ct<0u, 2u, 2u, 3u") != std::string::npos,
             "VS2I.P was not lowered to the dedicated AOT helper");
     require(text.find("ctx.execute_vfpu_horizontal(8u, 36u, 3u, true)") != std::string::npos,
             "VAVG.T was not lowered to the dedicated AOT helper");
@@ -611,6 +610,177 @@ static std::vector<std::uint8_t> make_function_pointer_test_elf() {
     };
     for (std::size_t i = 0; i < std::size(code); ++i) put32(bytes, 0x80u + i * 4u, code[i]);
     return bytes;
+}
+
+// main: jal callee; nop; addiu v0, v0, 1; jr ra; nop
+// callee (0x08804020): addiu v0, zero, 7; jr ra; nop
+static std::vector<std::uint8_t> make_return_hint_test_elf() {
+    auto bytes = make_function_pointer_test_elf();
+    const std::uint32_t code[] = {
+        0x0E201008u, // jal 0x08804020
+        0x00000000u, // nop
+        0x24420001u, // addiu v0, v0, 1   (return address 0x08804008)
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+        0x00000000u, 0x00000000u, 0x00000000u,
+        0x24020007u, // callee: addiu v0, zero, 7
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+        0x00000000u,
+    };
+    for (std::size_t i = 0; i < std::size(code); ++i) put32(bytes, 0x80u + i * 4u, code[i]);
+    return bytes;
+}
+
+static void test_automatic_return_hints() {
+#ifndef PSPRECOMP_CODEGEN_PATH
+    throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
+#else
+    const auto bytes = make_return_hint_test_elf();
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_return_hint_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto elf_path = root / "return_hint.elf";
+    const auto generated_dir = root / "generated";
+    { std::ofstream out(elf_path, std::ios::binary); out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size())); }
+    const std::filesystem::path codegen_path = PSPRECOMP_CODEGEN_PATH;
+    const std::string command = shell_quote(codegen_path) + " " + shell_quote(elf_path) +
+        " --auto " + shell_quote(generated_dir) + " 0x08804000 0x4000";
+    require(std::system(shell_command(command).c_str()) == 0, "psp_recomp return-hint generation failed");
+    std::string text;
+    {
+        std::ifstream generated(generated_dir / "generated_unit_0000.cpp");
+        text.assign((std::istreambuf_iterator<char>(generated)), std::istreambuf_iterator<char>());
+    }
+    // The callee's return tests the same-unit call's continuation first.
+    const auto callee = text.find("L_08804020:");
+    const auto hint = text.find("if (jump_target == 0x08804008u) goto L_08804008;", callee);
+    require(callee != std::string::npos && hint != std::string::npos,
+            "Same-unit return did not get a return hint");
+    // The caller's own return has no same-unit caller and keeps the plain dispatch.
+    const auto caller_return = text.find("local_pc = jump_target;");
+    require(caller_return != std::string::npos && caller_return < callee &&
+                text.find("if (jump_target ==", caller_return) > callee,
+            "Return without same-unit callers received a hint");
+    std::filesystem::remove_all(root);
+#endif
+}
+
+static void test_default_prefix_vfpu_helpers() {
+    psprecomp::AllegrexContext full{}, plain{};
+    for (std::size_t i = 0; i < full.vfpu.size(); ++i)
+        full.vfpu[i] = static_cast<float>(static_cast<int>(i * 37u % 23u) - 11) * 0.37f;
+    full.eat_vfpu_prefixes();
+    plain = full;
+    full.execute_vfpu_vdot_ct<0u, 4u, 8u, 3u>();
+    plain.execute_vfpu_vdot_ct<0u, 4u, 8u, 3u, true>();
+    full.execute_vfpu_vscl_ct<36u, 40u, 5u, 4u>();
+    plain.execute_vfpu_vscl_ct<36u, 40u, 5u, 4u, true>();
+    full.execute_vfpu_vscl_ct<44u, 45u, 6u, 2u>();
+    plain.execute_vfpu_vscl_ct<44u, 45u, 6u, 2u, true>();
+    require(std::memcmp(full.vfpu.data(), plain.vfpu.data(), sizeof(full.vfpu)) == 0 &&
+                full.vfpu_ctrl == plain.vfpu_ctrl,
+            "Default-prefix VFPU helpers diverge from the prefixed path");
+}
+
+static void test_aot_quad_memory_access() {
+    psprecomp::GuestMemory memory;
+    const auto view = memory.aot_fast_view();
+    for (const std::uint32_t address : {0x08900000u, 0x48900104u, 0x08900206u}) {
+        const float stored[4]{1.5f, -2.0f, 3.25f, 0.125f};
+        view.aot_store_quad(address, stored);
+        float loaded[4]{};
+        view.aot_load_quad(address, loaded);
+        for (std::uint32_t i = 0; i < 4u; ++i) {
+            require(memory.load32(address + i * 4u) == std::bit_cast<std::uint32_t>(stored[i]) &&
+                        std::bit_cast<std::uint32_t>(loaded[i]) == std::bit_cast<std::uint32_t>(stored[i]),
+                    "Quad guest memory access differs from word accesses");
+        }
+    }
+}
+
+static void set_test_environment(const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value == nullptr ? "" : value);
+#else
+    if (value == nullptr) unsetenv(name);
+    else setenv(name, value, 1);
+#endif
+}
+
+#ifdef PSPRECOMP_CODEGEN_PATH
+// Generates code for `words` at the test ELF's text and returns unit 0's source.
+static std::string generate_vfpu_prefix_unit(const std::vector<std::uint32_t> &words, bool unit_prefixes) {
+    auto bytes = make_function_pointer_test_elf();
+    for (std::size_t i = 0; i < words.size(); ++i) put32(bytes, 0x80u + i * 4u, words[i]);
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_vfpu_prefix_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto elf_path = root / "vfpu_prefix.elf";
+    const auto generated_dir = root / "generated";
+    { std::ofstream out(elf_path, std::ios::binary); out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size())); }
+    const std::filesystem::path codegen_path = PSPRECOMP_CODEGEN_PATH;
+    const std::string command = shell_quote(codegen_path) + " " + shell_quote(elf_path) +
+        " --auto " + shell_quote(generated_dir) + " 0x08804000 0x4000";
+    set_test_environment("PSPRECOMP_NO_UNIT_VFPU_PREFIXES", unit_prefixes ? nullptr : "1");
+    const int status = std::system(shell_command(command).c_str());
+    set_test_environment("PSPRECOMP_NO_UNIT_VFPU_PREFIXES", nullptr);
+    require(status == 0, "psp_recomp VFPU prefix generation failed");
+    std::string text;
+    {
+        std::ifstream generated(generated_dir / "generated_unit_0000.cpp");
+        text.assign((std::istreambuf_iterator<char>(generated)), std::istreambuf_iterator<char>());
+    }
+    std::filesystem::remove_all(root);
+    return text;
+}
+#endif
+
+static void test_automatic_known_vfpu_prefixes() {
+#ifndef PSPRECOMP_CODEGEN_PATH
+    throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
+#else
+    const std::vector<std::uint32_t> code = {
+        0x64888480u, // vdot.q S000, C100, C200   (block start)
+        0x64888481u, // vdot.q S010, ...          (prefixes known consumed)
+        0xDC0F00E4u, // vpfxs [-x, -y, -z, -w]
+        0x64888482u, // vdot.q S020, ...          (S prefix pending)
+        0x64888483u, // vdot.q S030, ...          (consumed again)
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+        0x00000000u,
+    };
+    // Per-block tracking only: the block start is unknown.
+    {
+        const std::string text = generate_vfpu_prefix_unit(code, false);
+        const auto first = text.find("ctx.execute_vfpu_vdot_ct<0u, 4u, 8u, 4u>();");
+        const auto second = text.find("ctx.execute_vfpu_vdot_ct<1u, 4u, 8u, 4u, true>();");
+        const auto prefixed = text.find("ctx.execute_vfpu_vdot_ct<2u, 4u, 8u, 4u>();");
+        const auto last = text.find("ctx.execute_vfpu_vdot_ct<3u, 4u, 8u, 4u, true>();");
+        require(first != std::string::npos && second != std::string::npos && prefixed != std::string::npos &&
+                    last != std::string::npos && first < second && second < prefixed && prefixed < last,
+                "Known VFPU prefix state was not tracked through the block");
+    }
+    // Unit-wide: no block ends with a pending prefix, so block starts are default.
+    {
+        const std::string text = generate_vfpu_prefix_unit(code, true);
+        require(text.find("ctx.execute_vfpu_vdot_ct<0u, 4u, 8u, 4u, true>();") != std::string::npos &&
+                    text.find("ctx.execute_vfpu_vdot_ct<2u, 4u, 8u, 4u>();") != std::string::npos,
+                "Unit-wide default VFPU prefixes were not assumed at block starts");
+    }
+    // A prefix still pending when a block ends disables the assumption for the unit.
+    {
+        const std::vector<std::uint32_t> pending = {
+            0x64888480u, // vdot.q S000, C100, C200
+            0xDC0F00E4u, // vpfxs [-x, -y, -z, -w]
+            0x03E00008u, // jr ra (prefix left pending)
+            0x00000000u, // nop
+        };
+        const std::string text = generate_vfpu_prefix_unit(pending, true);
+        require(text.find("ctx.execute_vfpu_vdot_ct<0u, 4u, 8u, 4u>();") != std::string::npos,
+                "A pending VFPU prefix at a block end did not disable the unit-wide assumption");
+    }
+#endif
 }
 
 static void test_materialized_function_pointer_discovery() {
@@ -722,13 +892,16 @@ static void test_automatic_cross_unit_tail_chaining() {
         std::ifstream generated(generated_dir / "generated_unit_0000.cpp");
         text.assign((std::istreambuf_iterator<char>(generated)), std::istreambuf_iterator<char>());
     }
-    require(text.find("(void)rt.invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>(ctx, &aot_mem); return;") != std::string::npos,
+    require(text.find("(void)rt.invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>(ctx, &aot_mem_shared); return;") != std::string::npos,
             "Automatic codegen did not emit a direct-entry native chain across AOT units");
     require(text.find("ctx.pc = 0x08804040u; (void)rt.invoke_chained_direct") == std::string::npos,
             "Direct-entry chain still dirties ctx.pc on its successful hot path");
-    require(text.find("GuestMemory::AotFastView &aot_mem)") != std::string::npos &&
+    require(text.find("GuestMemory::AotFastView &aot_mem_shared)") != std::string::npos &&
             text.find("_entry(rt, ctx, 0u, aot_mem)") != std::string::npos,
             "Shared AOT memory was not threaded across generated-unit direct chains");
+    require(text.find("const GuestMemory::AotFastView aot_mem = aot_mem_shared;") != std::string::npos &&
+                text.find("GuestMemory::AotFastView &aot_mem = aot_mem_shared;") != std::string::npos,
+            "Generated units lack the private/shared memory view selection");
     // The register-cache lowering passes were removed: generated units must
     // address AllegrexContext directly rather than a second long-lived cache
     // object, which is what made MSVC's optimizer non-convergent on this corpus.
@@ -799,8 +972,75 @@ static std::vector<std::uint8_t> make_relocation_test_prx() {
     return bytes;
 }
 
+// The compile-time lane helpers used under default prefixes must match the
+// generic helpers bit for bit.
+void test_compile_time_vfpu_lane_helpers() {
+    std::uint32_t seed = 0x1234567u;
+    auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed; };
+    auto randomize = [&](psprecomp::AllegrexContext &context) {
+        for (auto &lane : context.vfpu) {
+            const std::uint32_t pick = next();
+            lane = (pick & 7u) == 0u ? std::bit_cast<float>(next())
+                : static_cast<float>(static_cast<std::int32_t>(next())) / 65536.0f;
+        }
+        context.eat_vfpu_prefixes();
+    };
+    auto same = [](const psprecomp::AllegrexContext &a, const psprecomp::AllegrexContext &b) {
+        return std::memcmp(a.vfpu.data(), b.vfpu.data(), sizeof(a.vfpu)) == 0 && a.vfpu_ctrl == b.vfpu_ctrl;
+    };
+    for (int round = 0; round < 200; ++round) {
+        psprecomp::AllegrexContext generic{}, fast{};
+        randomize(generic);
+        fast = generic;
+        generic.execute_vfpu_vminmax(0x2Cu, 0x05u, 0x12u, 4u, true);
+        fast.execute_vfpu_vminmax_ct<0x2Cu, 0x05u, 0x12u, 4u, true, true>();
+        generic.execute_vfpu_vminmax(0x48u, 0x48u, 0x09u, 3u, false);
+        fast.execute_vfpu_vminmax_ct<0x48u, 0x48u, 0x09u, 3u, false, true>();
+        generic.execute_vfpu_vi2x(0x0Cu, 0x00u, 4u, 3u);
+        fast.execute_vfpu_vi2x_ct<0x0Cu, 0x00u, 4u, 3u, true>();
+        generic.execute_vfpu_vi2x(0x4Du, 0x21u, 4u, 0u);
+        fast.execute_vfpu_vi2x_ct<0x4Du, 0x21u, 4u, 0u, true>();
+        generic.execute_vfpu_vi2x(0x0Eu, 0x26u, 2u, 2u);
+        fast.execute_vfpu_vi2x_ct<0x0Eu, 0x26u, 2u, 2u, true>();
+        generic.execute_vfpu_vx2i(0x17u, 0x17u, 2u, 3u);
+        fast.execute_vfpu_vx2i_ct<0x17u, 0x17u, 2u, 3u, true>();
+        generic.execute_vfpu_vx2i(0x30u, 0x03u, 1u, 0u);
+        fast.execute_vfpu_vx2i_ct<0x30u, 0x03u, 1u, 0u, true>();
+        generic.execute_vfpu_vx2i(0x18u, 0x41u, 1u, 2u);
+        fast.execute_vfpu_vx2i_ct<0x18u, 0x41u, 1u, 2u, true>();
+        require(same(generic, fast), "compile-time VMIN/VMAX/VI2X/VX2I differ from the generic helpers");
+
+        float a[16]{}, b[16]{};
+        generic.read_vfpu_matrix(a, 0x34u, 3u);
+        fast.read_vfpu_matrix_ct<0x34u, 3u>(b);
+        require(std::memcmp(a, b, sizeof(a)) == 0, "read_vfpu_matrix_ct differs");
+        generic.read_vfpu_matrix(a, 0x60u, 2u);
+        fast.read_vfpu_matrix_ct<0x60u, 2u>(b);
+        require(std::memcmp(a, b, sizeof(a)) == 0, "read_vfpu_matrix_ct (transposed) differs");
+        generic.write_vfpu_matrix(a, 0x2Cu, 4u);
+        fast.write_vfpu_matrix_ct<0x2Cu, 4u>(b);
+        require(same(generic, fast), "write_vfpu_matrix_ct differs");
+    }
+    const float edge[] = {0.0f, -0.0f, 0.5f, -0.5f, 1.5f, -1.5f, 2.5f, 2147483520.0f, 2147483648.0f, -2147483648.0f,
+                          -2147483904.0f, std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                          std::numeric_limits<float>::quiet_NaN()};
+    for (const float value : edge) {
+        require(psprecomp::AllegrexContext::vfpu_float_to_int<17u>(value) ==
+                    (std::isnan(value) ? std::numeric_limits<std::int32_t>::max()
+                     : value >= 2147483648.0f ? std::numeric_limits<std::int32_t>::max()
+                     : value <= -2147483648.0f ? std::numeric_limits<std::int32_t>::min()
+                     : static_cast<std::int32_t>(std::trunc(value))),
+                "vfpu_float_to_int<17> saturation/NaN mismatch");
+    }
+    require(psprecomp::AllegrexContext::vfpu_float_to_int<16u>(2.5f) == 2 &&
+                psprecomp::AllegrexContext::vfpu_float_to_int<18u>(1.25f) == 2 &&
+                psprecomp::AllegrexContext::vfpu_float_to_int<19u>(-1.25f) == -2,
+            "vfpu_float_to_int rounding modes");
+}
+
 int main() {
     try {
+        test_compile_time_vfpu_lane_helpers();
         test_import_return_context_guard();
         test_chained_call_context_guard();
         test_nested_direct_chain_context_guard();
@@ -840,6 +1080,12 @@ int main() {
         const auto addiu = psprecomp::decode_allegrex(0x24820001u);
         require(addiu.kind == psprecomp::OpcodeKind::Addiu && addiu.rs == 4u && addiu.rt == 2u && addiu.immediate == 1,
                 "ADDIU decode failed");
+        const auto addi = psprecomp::decode_allegrex(0x216BFFF0u);
+        require(addi.kind == psprecomp::OpcodeKind::Addiu && addi.rs == 11u && addi.rt == 11u &&
+                    addi.immediate == -16 && addi.mnemonic == "addi",
+                "ADDI decode failed");
+        const auto brk = psprecomp::decode_allegrex(0x000001CDu);
+        require(brk.kind == psprecomp::OpcodeKind::Break && !brk.is_control_flow(), "BREAK decode failed");
         const auto jr = psprecomp::decode_allegrex(0x03E00008u);
         require(jr.kind == psprecomp::OpcodeKind::Jr && jr.has_delay_slot(), "JR decode failed");
         require(psprecomp::decode_allegrex(0xA6A200B0u).kind == psprecomp::OpcodeKind::Sh, "SH decode failed");
@@ -1465,6 +1711,67 @@ int main() {
                     vx2i_context.vfpu_ctrl[2] == 0u,
                 "VX2I did not consume VFPU prefixes");
 
+        // 0xD03F9E91 is vi2s.p S412, C420 (pair -> single).
+        require(psprecomp::decode_allegrex(0xD03F9E91u).kind == psprecomp::OpcodeKind::Vi2x &&
+                    psprecomp::decode_allegrex(0xD03F9E91u).mnemonic == "vi2s" &&
+                    psprecomp::decode_allegrex(0xD03D0000u).mnemonic == "vi2c",
+                "VI2X decode failed");
+        psprecomp::AllegrexContext vi2x_context{};
+        vi2x_context.eat_vfpu_prefixes();
+        const float wide_lanes[4]{
+            std::bit_cast<float>(0x80000000u),
+            std::bit_cast<float>(0x7FFF0000u),
+            std::bit_cast<float>(0x00010000u),
+            std::bit_cast<float>(0xFFFF0000u),
+        };
+        vi2x_context.write_vfpu_vector(wide_lanes, 0u, 4u);
+        vi2x_context.execute_vfpu_vi2x(8u, 0u, 4u, 3u);
+        float vi2x_result[4]{};
+        vi2x_context.read_vfpu_vector(vi2x_result, 8u, 2u);
+        require(std::bit_cast<std::uint32_t>(vi2x_result[0]) == 0x7FFF8000u &&
+                    std::bit_cast<std::uint32_t>(vi2x_result[1]) == 0xFFFF0001u,
+                "VI2S.Q is not the inverse of VS2I");
+        vi2x_context.eat_vfpu_prefixes();
+        vi2x_context.execute_vfpu_vi2x(12u, 0u, 4u, 1u);
+        require(vi2x_context.vfpu_scalar_bits(12u) == 0xFF007F80u, "VI2C.Q byte pack failed");
+        vi2x_context.eat_vfpu_prefixes();
+        vi2x_context.execute_vfpu_vi2x(12u, 0u, 4u, 0u);
+        require(vi2x_context.vfpu_scalar_bits(12u) == 0x0000FF00u, "VI2UC.Q clamp/pack failed");
+        require(vi2x_context.vfpu_ctrl[0] == 0xE4u && vi2x_context.vfpu_ctrl[2] == 0u,
+                "VI2X did not consume VFPU prefixes");
+
+        // Destination-prefix writes: the no-prefix fast path must match the
+        // compile-time and runtime helpers, and saturation/mask must still apply.
+        {
+            const float lanes[4]{1.5f, -2.0f, 0.25f, -0.5f};
+            psprecomp::AllegrexContext a{}, b{};
+            a.eat_vfpu_prefixes();
+            b.eat_vfpu_prefixes();
+            a.vfpu_ctrl[0] = 0x12u;  // must be consumed by the write
+            a.write_vfpu_vector_with_destination_prefix_ct<0x23u, 4u>(lanes);
+            b.write_vfpu_vector_with_destination_prefix(lanes, 0x23u, 4u);
+            float ra[4]{}, rb[4]{};
+            a.read_vfpu_vector(ra, 0x23u, 4u);
+            b.read_vfpu_vector(rb, 0x23u, 4u);
+            require(std::equal(ra, ra + 4, lanes) && std::equal(rb, rb + 4, lanes) && a.vfpu_ctrl[0] == 0xE4u,
+                    "VFPU no-prefix destination write failed");
+
+            // Lane 0 saturate [0,1], lane 1 saturate [-1,1], lane 2 masked.
+            const std::uint32_t prefix = 1u | (3u << 2u) | (1u << 10u);
+            for (auto *ctx : {&a, &b}) {
+                ctx->write_vfpu_vector(std::array<float, 4>{9.0f, 9.0f, 9.0f, 9.0f}.data(), 0x23u, 4u);
+                ctx->vfpu_ctrl[2] = prefix;
+            }
+            a.write_vfpu_vector_with_destination_prefix_ct<0x23u, 4u>(lanes);
+            b.write_vfpu_vector_with_destination_prefix(lanes, 0x23u, 4u);
+            a.read_vfpu_vector(ra, 0x23u, 4u);
+            b.read_vfpu_vector(rb, 0x23u, 4u);
+            const float expected[4]{1.0f, -1.0f, 9.0f, -0.5f};
+            require(std::equal(ra, ra + 4, expected) && std::equal(rb, rb + 4, expected) &&
+                        a.vfpu_ctrl[2] == 0u && b.vfpu_ctrl[2] == 0u,
+                    "VFPU destination prefix saturation/mask failed");
+        }
+
         require(psprecomp::decode_allegrex(0xD047A408u).kind == psprecomp::OpcodeKind::VfpuHorizontal &&
                     psprecomp::decode_allegrex(0xD047A408u).mnemonic == "vavg",
                 "VAVG.T decode failed");
@@ -1641,6 +1948,10 @@ int main() {
         test_vfpu_branch_cfg_discovery();
         test_automatic_cfg_and_codegen();
         test_automatic_cross_unit_tail_chaining();
+        test_automatic_return_hints();
+        test_automatic_known_vfpu_prefixes();
+        test_default_prefix_vfpu_helpers();
+        test_aot_quad_memory_access();
         test_materialized_function_pointer_discovery();
 
         auto relocation_elf = psprecomp::Elf32Image::from_bytes(make_relocation_test_prx(), "synthetic_relocation.prx");

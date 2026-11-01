@@ -9,6 +9,7 @@
 #include <bit>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <cmath>
 #include <limits>
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <iomanip>
 #include <map>
+#include <optional>
 #include <regex>
 #include <string_view>
 #include <set>
@@ -252,9 +254,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         out << "    ctx.fpr[" << d.sa << "] = ctx.fpr[" << d.rd << "] - ctx.fpr[" << d.rt << "];\n";
         break;
     case psprecomp::OpcodeKind::MulS:
-        out << "    { const float fs = ctx.fpr[" << d.rd << "]; const float ft = ctx.fpr[" << d.rt << "]; "
-            << "if ((std::isinf(fs) && ft == 0.0f) || (std::isinf(ft) && fs == 0.0f)) ctx.set_fpr_bits(" << d.sa << ", 0x7FC00000u); "
-            << "else ctx.fpr[" << d.sa << "] = fs * ft; }\n";
+        out << "    ctx.fpr[" << d.sa << "] = psprecomp::fpu_mul(ctx.fpr[" << d.rd << "], ctx.fpr[" << d.rt << "]);\n";
         break;
     case psprecomp::OpcodeKind::DivS:
         out << "    ctx.fpr[" << d.sa << "] = ctx.fpr[" << d.rd << "] / ctx.fpr[" << d.rt << "];\n";
@@ -383,21 +383,9 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
             << "      ctx.read_vfpu_vector(vfpu_s, " << source << "u, " << length << "u);\n"
             << "      ctx.apply_vfpu_source_prefix(vfpu_s, " << length << "u, 0u);\n"
             << "      const float vfpu_scale = std::ldexp(1.0f, static_cast<int>(" << immediate << "u));\n"
-            << "      for (std::uint32_t vfpu_i = 0; vfpu_i < " << length << "u; ++vfpu_i) {\n"
-            << "        if (std::isnan(vfpu_s[vfpu_i])) { vfpu_d[vfpu_i] = std::numeric_limits<std::int32_t>::max(); continue; }\n"
-            << "        const double vfpu_scaled = static_cast<double>(vfpu_s[vfpu_i] * vfpu_scale);\n"
-            << "        if (vfpu_scaled > static_cast<double>(std::numeric_limits<std::int32_t>::max())) vfpu_d[vfpu_i] = std::numeric_limits<std::int32_t>::max();\n"
-            << "        else if (vfpu_scaled <= static_cast<double>(std::numeric_limits<std::int32_t>::min())) vfpu_d[vfpu_i] = std::numeric_limits<std::int32_t>::min();\n"
-            << "        else { double vfpu_rounded = 0.0;\n"
-            << "          switch (" << mode << "u) {\n"
-            << "          case 16u: vfpu_rounded = psprecomp::AllegrexContext::round_ties_to_even(vfpu_scaled); break;\n"
-            << "          case 17u: vfpu_rounded = std::trunc(vfpu_scaled); break;\n"
-            << "          case 18u: vfpu_rounded = std::ceil(vfpu_scaled); break;\n"
-            << "          default: vfpu_rounded = std::floor(vfpu_scaled); break;\n"
-            << "          }\n"
-            << "          vfpu_d[vfpu_i] = static_cast<std::int32_t>(vfpu_rounded);\n"
-            << "        }\n"
-            << "      }\n"
+            << "      for (std::uint32_t vfpu_i = 0; vfpu_i < " << length << "u; ++vfpu_i)\n"
+            << "        vfpu_d[vfpu_i] = psprecomp::AllegrexContext::vfpu_float_to_int<"
+            << (mode >= 16u && mode <= 19u ? mode : 19u) << "u>(vfpu_s[vfpu_i] * vfpu_scale);\n"
             << "      const std::uint32_t vfpu_destination_prefix = ctx.vfpu_ctrl[2];\n"
             << "      for (std::uint32_t vfpu_i = 0; vfpu_i < " << length << "u; ++vfpu_i) {\n"
             << "        if (((vfpu_destination_prefix >> (8u + vfpu_i)) & 1u) == 0u)\n"
@@ -429,8 +417,18 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         const std::uint32_t destination = d.word & 0x7Fu;
         const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
         const std::uint32_t operation = (d.word >> 16u) & 3u;
-        out << "    ctx.execute_vfpu_vx2i(" << destination << "u, " << source << "u, "
-            << source_length << "u, " << operation << "u);\n";
+        out << "    ctx.execute_vfpu_vx2i_ct<" << destination << "u, " << source << "u, "
+            << source_length << "u, " << operation << "u>();\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Vi2x: {
+        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
+        const std::uint32_t source_length = size_code + 1u;
+        const std::uint32_t destination = d.word & 0x7Fu;
+        const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+        const std::uint32_t operation = (d.word >> 16u) & 3u;
+        out << "    ctx.execute_vfpu_vi2x_ct<" << destination << "u, " << source << "u, "
+            << source_length << "u, " << operation << "u>();\n";
         break;
     }
     case psprecomp::OpcodeKind::Mtv:
@@ -502,7 +500,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
             << "      const std::uint32_t vfpu_last_lane = vfpu_side - 1u;\n"
             << "      ctx.vfpu_ctrl[2] = ((vfpu_destination_prefix & (1u << 8u)) << vfpu_last_lane) |\n"
             << "                         ((vfpu_destination_prefix & 3u) << (vfpu_last_lane * 2u));\n"
-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_result, " << destination << "u, vfpu_side); }\n";
+            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_result, " << destination << "u, " << side << "u); }\n";
         break;
     }
     case psprecomp::OpcodeKind::VfpuVectorInit: {
@@ -630,8 +628,8 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
         const std::uint32_t target = (d.word >> 16u) & 0x7Fu;
         const bool maximum = ((d.word >> 23u) & 7u) == 3u;
-        out << "    ctx.execute_vfpu_vminmax(" << destination << "u, " << source << "u, "
-            << target << "u, " << length << "u, " << (maximum ? "true" : "false") << ");\n";
+        out << "    ctx.execute_vfpu_vminmax_ct<" << destination << "u, " << source << "u, "
+            << target << "u, " << length << "u, " << (maximum ? "true" : "false") << ">();\n";
         break;
     }
     case psprecomp::OpcodeKind::VfpuCompare3: {
@@ -692,15 +690,15 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         case 5u: expression = "vfpu_s[i] < -1.0f ? -1.0f : (vfpu_s[i] > 1.0f ? 1.0f : vfpu_s[i])"; break;
         case 16u: expression = "1.0f / vfpu_s[i]"; break;
         case 17u: expression = "1.0f / std::sqrt(vfpu_s[i])"; break;
-        case 18u: expression = "std::sin(vfpu_s[i] * 1.57079632679489661923f)"; break;
-        case 19u: expression = "std::cos(vfpu_s[i] * 1.57079632679489661923f)"; break;
-        case 20u: expression = "std::exp2(vfpu_s[i])"; break;
-        case 21u: expression = "std::log2(vfpu_s[i])"; break;
+        case 18u: expression = "psprecomp::vfpu_sin(vfpu_s[i] * 1.57079632679489661923f)"; break;
+        case 19u: expression = "psprecomp::vfpu_cos(vfpu_s[i] * 1.57079632679489661923f)"; break;
+        case 20u: expression = "psprecomp::vfpu_exp2(vfpu_s[i])"; break;
+        case 21u: expression = "psprecomp::vfpu_log2(vfpu_s[i])"; break;
         case 22u: expression = "std::fabs(std::sqrt(vfpu_s[i]))"; break;
-        case 23u: expression = "std::asin(vfpu_s[i]) * 0.63661977236758134308f"; break;
+        case 23u: expression = "psprecomp::vfpu_asin(vfpu_s[i]) * 0.63661977236758134308f"; break;
         case 24u: expression = "-1.0f / vfpu_s[i]"; break;
-        case 26u: expression = "-std::sin(vfpu_s[i] * 1.57079632679489661923f)"; break;
-        default: expression = "1.0f / std::exp2(vfpu_s[i])"; break;
+        case 26u: expression = "-psprecomp::vfpu_sin(vfpu_s[i] * 1.57079632679489661923f)"; break;
+        default: expression = "1.0f / psprecomp::vfpu_exp2(vfpu_s[i])"; break;
         }
         out << "    { float vfpu_s[4]{}, vfpu_d[4]{};\n"
             << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_s, " << source << "u, " << length << "u, 0u);\n"
@@ -746,11 +744,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         const std::int32_t offset = static_cast<std::int16_t>(d.word & 0xFFFCu);
         const std::uint32_t vector_register = ((d.word >> 16u) & 0x1Fu) | ((d.word & 1u) << 5u);
         out << "    { const std::uint32_t vfpu_address = " << reg(d.rs) << " + static_cast<std::uint32_t>(" << offset << ");\n"
-            << "      float vfpu_value[4]{\n"
-            << "        std::bit_cast<float>(rt.memory().aot_load32(vfpu_address + 0u)),\n"
-            << "        std::bit_cast<float>(rt.memory().aot_load32(vfpu_address + 4u)),\n"
-            << "        std::bit_cast<float>(rt.memory().aot_load32(vfpu_address + 8u)),\n"
-            << "        std::bit_cast<float>(rt.memory().aot_load32(vfpu_address + 12u))};\n"
+            << "      float vfpu_value[4]; rt.memory().aot_load_quad(vfpu_address, vfpu_value);\n"
             << "      ctx.write_vfpu_vector(vfpu_value, " << vector_register << "u, 4u); }\n";
         break;
     }
@@ -759,10 +753,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         const std::uint32_t vector_register = ((d.word >> 16u) & 0x1Fu) | ((d.word & 1u) << 5u);
         out << "    { float vfpu_value[4]{}; ctx.read_vfpu_vector(vfpu_value, " << vector_register << "u, 4u);\n"
             << "      const std::uint32_t vfpu_address = " << reg(d.rs) << " + static_cast<std::uint32_t>(" << offset << ");\n"
-            << "      rt.memory().aot_store32(vfpu_address + 0u, std::bit_cast<std::uint32_t>(vfpu_value[0]));\n"
-            << "      rt.memory().aot_store32(vfpu_address + 4u, std::bit_cast<std::uint32_t>(vfpu_value[1]));\n"
-            << "      rt.memory().aot_store32(vfpu_address + 8u, std::bit_cast<std::uint32_t>(vfpu_value[2]));\n"
-            << "      rt.memory().aot_store32(vfpu_address + 12u, std::bit_cast<std::uint32_t>(vfpu_value[3])); }\n";
+            << "      rt.memory().aot_store_quad(vfpu_address, vfpu_value); }\n";
         break;
     }
     default:
@@ -843,11 +834,13 @@ std::string direct_unit_chain_expression(
         if (found != direct_entry_ids->end() && found->second != 0u) {
             return "rt.invoke_chained_direct<&" + generated_unit_cpp_entry_name(unit) + ", " +
                 std::to_string(unit) + "u, " + std::to_string(found->second) + "u, " +
-                psprecomp::hex32(target) + "u>(ctx, &aot_mem)";
+                psprecomp::hex32(target) + "u>(ctx, &aot_mem_shared)";
         }
     }
-    return "rt.invoke_chained_direct<&" + generated_unit_cpp_name(unit) + ", " +
-        std::to_string(unit) + "u>(ctx, &aot_mem)";
+    // Without a dense entry id the callee dispatches on ctx.pc, which the
+    // id-carrying fast path above deliberately leaves stale.
+    return "(ctx.pc = " + psprecomp::hex32(target) + "u, rt.invoke_chained_direct<&" +
+        generated_unit_cpp_name(unit) + ", " + std::to_string(unit) + "u>(ctx, &aot_mem_shared))";
 }
 
 void emit_target(std::ostringstream &body, std::uint32_t target,
@@ -882,7 +875,7 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
              << "; return;\n";
     } else {
         body << indent << "ctx.pc = " << psprecomp::hex32(target)
-             << "u; (void)rt.invoke_chained_call(ctx, &aot_mem); return;\n";
+             << "u; (void)rt.invoke_chained_call(ctx, &aot_mem_shared); return;\n";
     }
 }
 
@@ -898,9 +891,45 @@ struct GeneratedFunctionInput {
     const std::set<std::uint32_t> *import_stubs{};
 };
 
+// Units whose entries span more than this many word slots fall back to a
+// sparse `switch` on the guest PC and cannot accept dense direct entry ids.
+bool uses_dense_dispatch(const std::set<std::uint32_t> &entry_labels) {
+    constexpr std::uint64_t kMaximumDenseSlots = 8192u;
+    return !entry_labels.empty() &&
+        (static_cast<std::uint64_t>(*entry_labels.rbegin() - *entry_labels.begin()) / 4u + 1u)
+            <= kMaximumDenseSlots;
+}
+
+// VFPU S/T/D prefix controls known at codegen time; nullopt means unknown.
+// PSPRECOMP_PROFILE_LABELS=1: every block stores its guest address to a global
+// that a sampling thread reads (profiling builds on targets without a PC sampler).
+bool profile_labels_enabled() {
+    static const bool enabled = std::getenv("PSPRECOMP_PROFILE_LABELS") != nullptr;
+    return enabled;
+}
+
+struct VfpuPrefixState {
+    std::array<std::optional<std::uint32_t>, 3> control{};
+    [[nodiscard]] bool all_default() const {
+        return control[0] == 0xE4u && control[1] == 0xE4u && control[2] == 0u;
+    }
+    void set_default() { control = {0xE4u, 0xE4u, 0u}; }
+    void forget() { control = {}; }
+};
+
+std::string lower_constant_vfpu_accesses(std::string text);
+std::string lower_known_vfpu_prefixes(std::string text, VfpuPrefixState &state);
+
+// With assume_default_vfpu_prefixes, every block starts with the S/T/D prefixes
+// at their defaults. Guest compilers emit vpfx right before the instruction it
+// modifies, so a prefix never stays pending across a branch target or a call;
+// *vfpu_prefixes_consistent is cleared when some block of this unit ends with a
+// prefix still pending, and the caller then emits the unit again without it.
 std::string emit_function_source(const GeneratedFunctionInput &function,
                                  const psprecomp::GuestMemory &memory,
-                                 const std::string &cpp_name) {
+                                 const std::string &cpp_name,
+                                 bool assume_default_vfpu_prefixes = false,
+                                 bool *vfpu_prefixes_consistent = nullptr) {
     std::ostringstream body;
 
     // Unit entry dispatch.  A `switch (ctx.pc)` over several hundred sparse
@@ -910,10 +939,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
     // holes and lowers to a single jump table: two loads and one indirect jump.
     // The guarded offset/alignment test keeps the accepted PC set identical to
     // the exact comparisons it replaces.
-    constexpr std::uint64_t kMaximumDenseSlots = 8192u;
-    const bool dense_dispatch = !function.entry_labels.empty() &&
-        (static_cast<std::uint64_t>(*function.entry_labels.rbegin() - *function.entry_labels.begin()) / 4u + 1u)
-            <= kMaximumDenseSlots;
+    const bool dense_dispatch = uses_dense_dispatch(function.entry_labels);
     const std::uint32_t dense_base = function.entry_labels.empty() ? 0u : *function.entry_labels.begin();
     const std::uint32_t dense_span = function.entry_labels.empty()
         ? 0u
@@ -933,7 +959,17 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
         }
         body << "\n};\n";
 
-        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem) {\n"
+        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem_shared) {\n"
+             // With PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW, guest accesses use a private
+             // copy of the view whose address never escapes: guest stores go through
+             // a byte pointer that could alias the shared view, which forces its
+             // fields to be reloaded at every access. GCC/ARM gains from it, MSVC
+             // does not. Chained calls always receive the shared view.
+             << "#if defined(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW)\n"
+             << "    const GuestMemory::AotFastView aot_mem = aot_mem_shared;\n"
+             << "#else\n"
+             << "    GuestMemory::AotFastView &aot_mem = aot_mem_shared;\n"
+             << "#endif\n"
              << "    std::uint32_t jump_target = 0u;\n"
              << "    std::uint32_t local_transfers = 0u;\n"
              << "    std::uint32_t local_pc = ctx.pc;\n"
@@ -964,12 +1000,25 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
              << "    }\n"
              << "    }\n";
     } else {
-        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem) {\n"
+        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem_shared) {\n"
+             // With PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW, guest accesses use a private
+             // copy of the view whose address never escapes: guest stores go through
+             // a byte pointer that could alias the shared view, which forces its
+             // fields to be reloaded at every access. GCC/ARM gains from it, MSVC
+             // does not. Chained calls always receive the shared view.
+             << "#if defined(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW)\n"
+             << "    const GuestMemory::AotFastView aot_mem = aot_mem_shared;\n"
+             << "#else\n"
+             << "    GuestMemory::AotFastView &aot_mem = aot_mem_shared;\n"
+             << "#endif\n"
              << "    (void)direct_entry_id;\n"
              << "    std::uint32_t jump_target = 0u;\n"
              << "    std::uint32_t local_transfers = 0u;\n"
+             << "    std::uint32_t local_pc = ctx.pc;\n"
+             << "    std::uint32_t entry_id = 0u;\n"
              << "LOCAL_DISPATCH:\n"
-             << "    switch (ctx.pc) {\n";
+             << "    (void)entry_id;\n"
+             << "    switch (local_pc) {\n";
         for (const auto label : function.entry_labels) {
             body << "    case " << psprecomp::hex32(label) << "u: goto L_"
                  << psprecomp::hex32(label).substr(2) << ";\n";
@@ -988,8 +1037,42 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
              << "    }\n";
     }
 
+    // Return hints. A same-unit JAL is a goto, so its callee's `jr $ra` comes
+    // back through LOCAL_DISPATCH: a table load and one shared indirect branch
+    // that every return in the unit goes through, which predicts badly. Each
+    // `jr $ra` first compares against the return addresses of the same-unit
+    // calls to the function it belongs to (the nearest callee entry at or below
+    // it), each with its own direct branch. A wrong guess only costs the
+    // compares: the table dispatch still follows.
+    constexpr std::size_t kMaximumReturnHints = 8u;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> returns_by_callee;
+    // PSPRECOMP_NO_RETURN_HINTS=1 keeps the plain dispatch (for A/B measurements).
+    static const bool return_hints_enabled = std::getenv("PSPRECOMP_NO_RETURN_HINTS") == nullptr;
+    for (const auto pc : function.instructions) {
+        if (!return_hints_enabled) break;
+        const auto decoded = psprecomp::decode_allegrex(memory.load32(pc));
+        if (decoded.kind != psprecomp::OpcodeKind::Jal) continue;
+        const std::uint32_t target = ((pc + 4u) & 0xF0000000u) | (decoded.target << 2u);
+        if (function.entry_labels.contains(target) && function.entry_labels.contains(pc + 8u)) {
+            auto &returns = returns_by_callee[target];
+            if (returns.size() < kMaximumReturnHints) returns.push_back(pc + 8u);
+        }
+    }
+    const auto return_hints_for = [&](std::uint32_t pc) -> const std::vector<std::uint32_t> * {
+        auto it = returns_by_callee.upper_bound(pc);
+        if (it == returns_by_callee.begin()) return nullptr;
+        return &std::prev(it)->second;
+    };
+
     for (const auto block_start : function.entry_labels) {
+        VfpuPrefixState vfpu_prefixes;
+        if (assume_default_vfpu_prefixes) vfpu_prefixes.set_default();
+        const auto regular = [&](const psprecomp::DecodedInstruction &instruction, std::uint32_t at) {
+            return lower_known_vfpu_prefixes(emit_regular(instruction, at), vfpu_prefixes);
+        };
         body << "L_" << psprecomp::hex32(block_start).substr(2) << ":\n";
+        if (profile_labels_enabled())
+            body << "    psprecomp_profile_label = " << psprecomp::hex32(block_start) << "u;\n";
         std::uint32_t pc = block_start;
         while (function.instructions.contains(pc)) {
             if (pc != block_start && function.entry_labels.contains(pc)) {
@@ -1018,13 +1101,13 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     }
                     if (likely_branch) {
                         body << "    if (" << condition << ") {\n"
-                             << emit_regular(slot, pc + 4u);
+                             << regular(slot, pc + 4u);
                         emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
                         body << "    }\n";
                         emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
                     } else {
                         body << "    { const bool branch_taken = " << condition << ";\n"
-                             << emit_regular(slot, pc + 4u)
+                             << regular(slot, pc + 4u)
                              << "      if (branch_taken) {\n";
                         emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
                         body << "      }\n";
@@ -1037,7 +1120,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     if (decoded.kind == psprecomp::OpcodeKind::Jal) {
                         body << "    ctx.set_gpr(31, " << psprecomp::hex32(pc + 8u) << "u);\n";
                     }
-                    body << emit_regular(slot, pc + 4u);
+                    body << regular(slot, pc + 4u);
                     if (decoded.kind == psprecomp::OpcodeKind::J) {
                         emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
                     } else if (function.entry_labels.contains(target)) {
@@ -1056,7 +1139,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         if (target_is_import) {
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                                  << "    return;\n";
-                            continue;
+                            break;
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.
@@ -1071,14 +1154,14 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                             if (direct_unit)
                                 body << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids);
                             else
-                                body << "rt.invoke_chained_call(ctx, &aot_mem)";
+                                body << "rt.invoke_chained_call(ctx, &aot_mem_shared)";
                             body << " && ctx.pc == " << psprecomp::hex32(return_pc)
                                  << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
                         } else {
                             if (direct_unit)
                                 body << "    (void)" << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids) << ";\n";
                             else
-                                body << "    (void)rt.invoke_chained_call(ctx, &aot_mem);\n";
+                                body << "    (void)rt.invoke_chained_call(ctx, &aot_mem_shared);\n";
                         }
                         body << "    return;\n";
                     }
@@ -1088,7 +1171,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     if (decoded.kind == psprecomp::OpcodeKind::Jalr) {
                         body << "    ctx.set_gpr(" << link << ", " << psprecomp::hex32(pc + 8u) << "u);\n";
                     }
-                    body << emit_regular(slot, pc + 4u);
+                    body << regular(slot, pc + 4u);
                     if (decoded.kind == psprecomp::OpcodeKind::Jalr) {
                         // Indirect call: same bounded chaining as a direct one.
                         // The runtime rejects import wrappers, so a JALR into
@@ -1096,19 +1179,31 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         const std::uint32_t return_pc = pc + 8u;
                         body << "    ctx.pc = jump_target;\n";
                         if (function.entry_labels.contains(return_pc)) {
-                            body << "    if (rt.invoke_chained_call(ctx, &aot_mem) && ctx.pc == "
+                            body << "    if (rt.invoke_chained_call(ctx, &aot_mem_shared) && ctx.pc == "
                                  << psprecomp::hex32(return_pc) << "u) goto L_"
                                  << psprecomp::hex32(return_pc).substr(2) << ";\n";
                         } else {
-                            body << "    (void)rt.invoke_chained_call(ctx, &aot_mem);\n";
+                            body << "    (void)rt.invoke_chained_call(ctx, &aot_mem_shared);\n";
                         }
                         body << "    return;\n";
                     } else {
                         // Plain JR, including `jr $ra`.  A return that lands in
                         // this unit continues locally; otherwise the chained
                         // caller one frame up recognizes its return address.
-                        body << "    local_pc = jump_target;\n"
-                             << "    if (++local_transfers < 2048u) { entry_id = 0u; goto LOCAL_DISPATCH; }\n"
+                        body << "    local_pc = jump_target;\n";
+                        const auto *hints = decoded.rs == 31u ? return_hints_for(pc) : nullptr;
+                        if (hints != nullptr) {
+                            body << "    if (++local_transfers < 2048u) {\n";
+                            for (const auto hint : *hints) {
+                                body << "        if (jump_target == " << psprecomp::hex32(hint) << "u) goto L_"
+                                     << psprecomp::hex32(hint).substr(2) << ";\n";
+                            }
+                            body << "        entry_id = 0u; goto LOCAL_DISPATCH;\n"
+                                 << "    }\n";
+                        } else {
+                            body << "    if (++local_transfers < 2048u) { entry_id = 0u; goto LOCAL_DISPATCH; }\n";
+                        }
+                        body
                              << "    ctx.pc = jump_target;\n"
                              << "    return;\n";
                     }
@@ -1124,8 +1219,15 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                      << cpp_escape(decoded.mnemonic) << " not lowered yet\"); return;\n";
                 break;
             }
+            if (decoded.kind == psprecomp::OpcodeKind::Break) {
+                // BREAK raises a guest exception (e.g. GCC's divide-by-zero
+                // trap); user code never resumes after it.
+                body << "    rt.unsupported(" << psprecomp::hex32(pc) << "u, "
+                     << psprecomp::hex32(decoded.word) << "u, \"guest break trap\"); return;\n";
+                break;
+            }
 
-            body << emit_regular(decoded, pc);
+            body << regular(decoded, pc);
             const std::uint32_t next = pc + 4u;
             if (!function.instructions.contains(next)) {
                 body << "    ctx.pc = " << psprecomp::hex32(next) << "u; return;\n";
@@ -1137,6 +1239,8 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
             }
             pc = next;
         }
+        if (assume_default_vfpu_prefixes && !vfpu_prefixes.all_default() && vfpu_prefixes_consistent != nullptr)
+            *vfpu_prefixes_consistent = false;
     }
     body << "}\n\n";
     body << "void " << cpp_name << "(Runtime &rt, AllegrexContext &ctx) {\n"
@@ -1284,7 +1388,7 @@ std::string lower_aot_memory_accesses(std::string text) {
     // compile-time direct chains pass it by reference across unit boundaries.
     // Lower ordinary aligned byte/half/word accesses to that shared view.
     static const std::regex access_pattern(
-        R"(rt\.memory\(\)\.aot_(load|store)(8|16|32)\()" );
+        R"(rt\.memory\(\)\.aot_(load|store)(8|16|32|_quad)\()" );
     return std::regex_replace(text, access_pattern, "aot_mem.aot_$1$2(");
 }
 
@@ -1400,6 +1504,11 @@ std::string lower_constant_vfpu_accesses(std::string text) {
     text = std::regex_replace(text, vdot,
         "ctx.execute_vfpu_vdot_ct<$1u, $2u, $3u, $4u>();");
 
+    const std::regex matrix_read(R"(ctx\.read_vfpu_matrix\(([A-Za-z0-9_]+), ([0-9]+)u, ([1-4])u\);)");
+    text = std::regex_replace(text, matrix_read, "ctx.read_vfpu_matrix_ct<$2u, $3u>($1);");
+    const std::regex matrix_write(R"(ctx\.write_vfpu_matrix\(([A-Za-z0-9_]+), ([0-9]+)u, ([1-4])u\);)");
+    text = std::regex_replace(text, matrix_write, "ctx.write_vfpu_matrix_ct<$2u, $3u>($1);");
+
     const std::regex vscl(
         R"(ctx\.execute_vfpu_vscl\(([0-9]+)u, ([0-9]+)u, ([0-9]+)u, ([1-4])u\);)" );
     text = std::regex_replace(text, vscl,
@@ -1415,6 +1524,75 @@ std::string lower_constant_vfpu_accesses(std::string text) {
     text = std::regex_replace(text, scalar_write,
         "ctx.set_vfpu_scalar_bits_ct<$1u>($2);");
     return text;
+}
+
+// Straight-line VFPU prefix knowledge. Every prefix-consuming instruction
+// resets S/T to 0xE4 and D to 0, so inside a basic block the controls are
+// usually known at codegen time. A block starts with nothing known because any
+// predecessor may have left a prefix pending. Guest memory and ctx.vfpu_ctrl
+// stay in sync: only checks and consume stores proven redundant are removed.
+std::string lower_known_vfpu_prefixes(std::string text, VfpuPrefixState &state) {
+    if (text.find("vfpu") == std::string::npos) return text;
+    text = lower_constant_vfpu_accesses(std::move(text));
+
+    static const std::regex literal_prefix(
+        R"(^    ctx\.vfpu_ctrl\[([0-3])u\] = 0x([0-9A-Fa-f]{8})u;\n$)");
+    std::smatch match;
+    if (std::regex_match(text, match, literal_prefix)) {
+        const auto index = static_cast<std::size_t>(std::stoul(match[1].str()));
+        if (index < state.control.size()) state.control[index] = static_cast<std::uint32_t>(std::stoul(match[2].str(), nullptr, 16));
+        return text;
+    }
+
+    static const std::regex raw_control_write(
+        R"(vfpu_ctrl\[[0-2]u?\] *=[^=]|set_vfpu_scalar_bits\(|set_vfpu_scalar_bits_ct<1(28|29|30)u>)");
+    static const std::regex consume(
+        R"(eat_vfpu_prefixes\(|write_vfpu_vector_with_destination_prefix|execute_vfpu_|write_vfpu_identity_matrix\()");
+    std::ptrdiff_t last_raw_write = -1, last_consume = -1;
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), raw_control_write); it != std::sregex_iterator(); ++it)
+        last_raw_write = it->position();
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), consume); it != std::sregex_iterator(); ++it)
+        last_consume = it->position();
+
+    std::string lowered = text;
+    if (last_raw_write < 0) {
+        static const std::regex read_s(R"(ctx\.read_vfpu_vector_with_source_prefix_ct<([0-9]+)u, ([1-4])u, 0u>\()");
+        static const std::regex read_t(R"(ctx\.read_vfpu_vector_with_source_prefix_ct<([0-9]+)u, ([1-4])u, 1u>\()");
+        static const std::regex apply_s(R"(ctx\.apply_vfpu_source_prefix_ct<[1-4]u, 0u>\([A-Za-z0-9_]+\);)");
+        static const std::regex apply_t(R"(ctx\.apply_vfpu_source_prefix_ct<[1-4]u, 1u>\([A-Za-z0-9_]+\);)");
+        static const std::regex write_d(
+            R"(ctx\.write_vfpu_vector_with_destination_prefix_ct<([0-9]+)u, ([1-4])u>\(([A-Za-z0-9_]+)\);)");
+        static const std::regex helper_ct(R"(ctx\.execute_vfpu_(vdot|vscl)_ct<([0-9]+u, [0-9]+u, [0-9]+u, [1-4]u)>\(\);)");
+        static const std::regex lane_helper_ct(
+            R"(ctx\.execute_vfpu_(vminmax|vx2i|vi2x)_ct<([0-9]+u, [0-9]+u, [0-9]+u, [0-9]+u(, true|, false)?)>\(\);)");
+        static const std::regex destination_prefix_read(
+            R"(const std::uint32_t vfpu_destination_prefix = ctx\.vfpu_ctrl\[2\];)");
+        static const std::regex eat(R"(ctx\.eat_vfpu_prefixes\(\);)");
+        if (state.control[0] == 0xE4u) {
+            lowered = std::regex_replace(lowered, read_s, "ctx.read_vfpu_vector_ct<$1u, $2u>(");
+            lowered = std::regex_replace(lowered, apply_s, "");
+        }
+        if (state.control[1] == 0xE4u) {
+            lowered = std::regex_replace(lowered, read_t, "ctx.read_vfpu_vector_ct<$1u, $2u>(");
+            lowered = std::regex_replace(lowered, apply_t, "");
+        }
+        if (state.all_default()) {
+            // Every consume in this instruction would store the values already held.
+            lowered = std::regex_replace(lowered, write_d, "ctx.write_vfpu_vector_ct<$1u, $2u>($3);");
+            lowered = std::regex_replace(lowered, helper_ct, "ctx.execute_vfpu_$1_ct<$2, true>();");
+            lowered = std::regex_replace(lowered, lane_helper_ct, "ctx.execute_vfpu_$1_ct<$2, true>();");
+            lowered = std::regex_replace(lowered, destination_prefix_read,
+                                         "constexpr std::uint32_t vfpu_destination_prefix = 0u;");
+            lowered = std::regex_replace(lowered, eat, "");
+        } else if (state.control[2] == 0u) {
+            lowered = std::regex_replace(lowered, write_d,
+                "ctx.write_vfpu_vector_ct<$1u, $2u>($3); ctx.eat_vfpu_prefixes();");
+        }
+    }
+
+    if (last_consume >= 0 && last_consume > last_raw_write) state.set_default();
+    else if (last_raw_write >= 0) state.forget();
+    return lowered;
 }
 
 bool write_text_if_changed(const std::filesystem::path &path, const std::string &text) {
@@ -1490,7 +1668,10 @@ int generate_auto(const std::filesystem::path &elf_path,
     // dispatcher globally before emission. Fixed cross-unit edges can pass the
     // destination id directly and skip the target unit's PC->entry table lookup.
     std::map<std::uint32_t, std::uint16_t> direct_entry_ids;
+    // Sparse units dispatch on the PC, so callers must use the variant that
+    // materializes ctx.pc instead of passing an id.
     for (const auto &unit : units) {
+        if (!uses_dense_dispatch(unit.entries)) continue;
         std::uint16_t id = 1u;
         for (const auto label : unit.entries) direct_entry_ids[label] = id++;
     }
@@ -1508,10 +1689,13 @@ int generate_auto(const std::filesystem::path &elf_path,
                      << "(Runtime &, AllegrexContext &, std::uint16_t, GuestMemory::AotFastView &);\n";
     }
     units_header << "} // namespace psprecomp\n";
+    if (profile_labels_enabled())
+        units_header << "extern \"C\" volatile std::uint32_t psprecomp_profile_label;\n";
     (void)write_text_if_changed(units_header_path, units_header.str());
 
     std::set<std::filesystem::path> expected_cpp;
     std::size_t rewritten_units = 0u;
+    std::size_t units_without_prefix_assumption = 0u;
     std::size_t registered_entries = 0u;
     for (const auto &unit : units) {
         std::ostringstream suffix;
@@ -1542,10 +1726,20 @@ int generate_auto(const std::filesystem::path &elf_path,
         // each grew past 2 GB, exhausting system memory during a normal build.
         // This pipeline matches the last configuration observed booting on
         // hardware.
+        // PSPRECOMP_NO_UNIT_VFPU_PREFIXES=1 keeps the per-block prefix tracking only.
+        static const bool unit_prefixes_enabled = std::getenv("PSPRECOMP_NO_UNIT_VFPU_PREFIXES") == nullptr;
+        bool prefixes_consistent = unit_prefixes_enabled;
+        std::string unit_source;
+        if (unit_prefixes_enabled)
+            unit_source = emit_function_source(generated_unit, memory, generated_unit.name, true, &prefixes_consistent);
+        if (!prefixes_consistent) {
+            unit_source = emit_function_source(generated_unit, memory, generated_unit.name);
+            if (unit_prefixes_enabled) ++units_without_prefix_assumption;
+        }
         out << lower_constant_vfpu_accesses(
                 lower_aot_memory_accesses(
                     lower_constant_fpr_accesses(
-                        lower_constant_gpr_writes(emit_function_source(generated_unit, memory, generated_unit.name)))));
+                        lower_constant_gpr_writes(std::move(unit_source)))));
         out << "void register_generated_unit_" << unit.bucket << "(Runtime &runtime) {\n";
         out << "    runtime.register_generated_unit(" << unit.bucket << "u, "
             << psprecomp::hex32(generated_unit.address) << "u, " << unit_span_bytes
@@ -1605,6 +1799,7 @@ int generate_auto(const std::filesystem::path &elf_path,
               << "  registered blocks: " << registered_entries << "\n"
               << "  source units:      " << units.size() << "\n"
               << "  rewritten units:   " << rewritten_units << "\n"
+              << "  units with pending VFPU prefixes: " << units_without_prefix_assumption << "\n"
               << "  import wrappers:   " << imports.size() << "\n"
               << "  output:            " << output_dir.string() << "\n";
     return 0;

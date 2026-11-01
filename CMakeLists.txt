@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(PSPRECOMP_BUILD_TESTS "Build reusable PSPRecomp tests" ON)
+option(PSPRECOMP_BUILD_TOOLS "Build the host analysis/codegen tools (off for cross builds)" ON)
 option(PSPRECOMP_BUILD_PROFILE_TESTS "Build tests supplied by the selected profile" ON)
 set(PSPRECOMP_PROFILE "" CACHE STRING "Profile to build from profiles/<name>; empty builds only the framework")
 
@@ -56,6 +57,17 @@ endif()
 if(PSPRECOMP_AOT_PRODUCTION_FASTPATHS)
     add_compile_definitions(PSPRECOMP_AOT_PRODUCTION_FASTPATHS=1)
 endif()
+if(MSVC)
+    set(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW_DEFAULT OFF)
+else()
+    set(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW_DEFAULT ON)
+endif()
+option(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW
+    "Generated units access guest memory through a private copy of the AOT view"
+    ${PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW_DEFAULT})
+if(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW)
+    add_compile_definitions(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW=1)
+endif()
 if(MSVC AND PSPRECOMP_NATIVE_AVX2)
     add_compile_options($<$<CONFIG:Release>:/arch:AVX2>
                         $<$<CONFIG:RelWithDebInfo>:/arch:AVX2>)
@@ -93,14 +105,16 @@ else()
     target_compile_options(psprecomp_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
-add_executable(psp_analyze tools/analyzer_main.cpp)
-target_link_libraries(psp_analyze PRIVATE psprecomp_core)
+if(PSPRECOMP_BUILD_TOOLS)
+    add_executable(psp_analyze tools/analyzer_main.cpp)
+    target_link_libraries(psp_analyze PRIVATE psprecomp_core)
 
-add_executable(psp_recomp tools/codegen_main.cpp)
-target_link_libraries(psp_recomp PRIVATE psprecomp_core)
+    add_executable(psp_recomp tools/codegen_main.cpp)
+    target_link_libraries(psp_recomp PRIVATE psprecomp_core)
 
-add_executable(dump_function tools/dump_function.cpp)
-target_link_libraries(dump_function PRIVATE psprecomp_core)
+    add_executable(dump_function tools/dump_function.cpp)
+    target_link_libraries(dump_function PRIVATE psprecomp_core)
+endif()
 
 function(psprecomp_enable_host_avx target)
     # /arch:AVX appears after the directory-wide /arch:AVX2 option in MSVC's
@@ -112,7 +126,7 @@ function(psprecomp_enable_host_avx target)
     endif()
 endfunction()
 
-if(PSPRECOMP_BUILD_TESTS)
+if(PSPRECOMP_BUILD_TESTS AND PSPRECOMP_BUILD_TOOLS)
     enable_testing()
     add_executable(psprecomp_tests tests/test_main.cpp)
     target_link_libraries(psprecomp_tests PRIVATE psprecomp_core)

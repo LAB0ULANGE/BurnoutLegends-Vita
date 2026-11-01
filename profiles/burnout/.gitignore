@@ -1,0 +1,6 @@
+# The generated AOT corpus is a direct translation of the commercial
+# executable: keep it local, regenerate with psp_recomp.
+/generated/
+/game/
+/analysis/
+/progress/
