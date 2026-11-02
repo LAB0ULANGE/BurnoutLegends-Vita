@@ -209,6 +209,14 @@ bool g_worker_failed{};
 std::string g_worker_error;
 std::vector<std::array<std::uint32_t, 3>> g_pending;
 std::vector<std::uint32_t> g_pending_words, g_pending_records;
+// Buffers of finished command jobs, handed back by the worker so the next
+// lists reuse warm memory instead of allocating (and freeing across cores).
+struct SpareBuffers {
+    std::vector<std::array<std::uint32_t, 3>> commands;
+    std::vector<std::uint32_t> words, records;
+    std::vector<Transfer> transfers;
+};
+std::vector<SpareBuffers> g_spares;  // under g_jobs_mutex
 constexpr std::uint32_t kRun = UINT32_MAX - 1u;  // commands entry tag (offsets are multiples of 256)
 std::vector<Transfer> g_pending_transfers;
 gl::Snapshot g_pending_snapshot;
@@ -344,7 +352,19 @@ void worker_loop() {
             break;
         }
         }
+        SpareBuffers spare;
+        if (job.kind == Job::Kind::Commands) {
+            spare.commands.swap(job.commands);
+            spare.words.swap(job.words);
+            spare.records.swap(job.records);
+            spare.transfers.swap(job.transfers);
+            spare.commands.clear();
+            spare.words.clear();
+            spare.records.clear();
+            spare.transfers.clear();
+        }
         std::lock_guard lock(g_jobs_mutex);
+        if (job.kind == Job::Kind::Commands && g_spares.size() < 4u) g_spares.push_back(std::move(spare));
         if (job.kind == Job::Kind::Commands) --g_queued_command_jobs;
         g_worker_busy = false;
         g_jobs_cv.notify_all();
@@ -453,6 +473,17 @@ void submit_pending() {
     job.transfers.swap(g_pending_transfers);
     job.words.swap(g_pending_words);
     job.records.swap(g_pending_records);
+    {
+        std::lock_guard lock(g_jobs_mutex);
+        if (!g_spares.empty()) {
+            SpareBuffers &spare = g_spares.back();
+            g_pending.swap(spare.commands);
+            g_pending_words.swap(spare.words);
+            g_pending_records.swap(spare.records);
+            g_pending_transfers.swap(spare.transfers);
+            g_spares.pop_back();
+        }
+    }
     g_pending.reserve(job.commands.size());
     g_pending_words.reserve(job.words.size());
     g_pending_records.reserve(job.records.size());

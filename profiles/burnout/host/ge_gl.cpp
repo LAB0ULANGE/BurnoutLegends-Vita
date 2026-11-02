@@ -1711,6 +1711,8 @@ struct GlThread {
     SyncMutex mutex{"ge_gl"};  // finish() may run on the SCE main thread
     SyncCondition cv{"ge_gl", mutex};
     std::deque<Frame> frames;
+    // Op and data buffers of replayed frames, emptied, for the next frames.
+    std::vector<std::pair<std::vector<std::uint32_t>, std::vector<std::uint8_t>>> spares;
     bool busy{}, ready{}, ok{};
     std::string error;
 } g_gl;
@@ -2093,8 +2095,13 @@ void gl_thread_main() {
         }();
         if (delay_ms > 0) host_sleep_ms(static_cast<double>(delay_ms));
         g_gl_busy_ms.store(g_gl_busy_ms.load() + host_now_ms() - started);
+        std::vector<std::uint32_t> spare_ops = std::move(frame.ops);
+        std::vector<std::uint8_t> spare_data = std::move(frame.data);
+        spare_ops.clear();
+        spare_data.clear();
         frame = Frame{};  // release snapshots and payloads before reporting idle
         std::lock_guard lock(g_gl.mutex);
+        if (g_gl.spares.size() < 3u) g_gl.spares.emplace_back(std::move(spare_ops), std::move(spare_data));
         g_gl.busy = false;
         g_gl.cv.notify_all();
     }
@@ -2118,6 +2125,11 @@ void submit_frame() {
     const std::size_t ops = g_frame.ops.size(), data = g_frame.data.size();
     g_gl.frames.push_back(std::move(g_frame));
     g_frame = Frame{};
+    if (!g_gl.spares.empty()) {
+        g_frame.ops = std::move(g_gl.spares.back().first);
+        g_frame.data = std::move(g_gl.spares.back().second);
+        g_gl.spares.pop_back();
+    }
     g_gl.cv.notify_all();
     lock.unlock();
     g_frame.ops.reserve(ops + ops / 4u);
