@@ -11,6 +11,7 @@
 #include "burnout_hle.hpp"
 #include "audio_out.hpp"
 #include "burnout_bench.hpp"
+#include "music.hpp"
 #include "sas_core.hpp"
 
 #include "workload_stats.hpp"
@@ -1519,33 +1520,62 @@ void install_audio(Runtime &rt) {
     for (const std::uint32_t nid : {0xF983B186u, 0xD5A229C9u, 0x33D4AB37u, 0x267A6DD2u}) reg_value(rt, sas, nid, 0u);
 
     constexpr const char *atrac = "sceAtrac3plus";
+    // Music: with sound on, the RIFF header the game hands over picks a
+    // pre-converted track (see music.hpp); otherwise silent frames, as before.
+    struct AtracStream {
+        std::uint32_t buffer{};
+        int track{-1};
+        std::int32_t loops{};
+    };
     std::int32_t *next_atrac = new std::int32_t(0);
-    std::map<std::int32_t, std::uint32_t> *atrac_buffers = new std::map<std::int32_t, std::uint32_t>();
-    reg(rt, atrac, 0x7A20E7AFu, [next_atrac, atrac_buffers](Runtime &r, AllegrexContext &ctx) {
+    auto *streams = new std::map<std::int32_t, AtracStream>();
+    reg(rt, atrac, 0x7A20E7AFu, [next_atrac, streams](Runtime &r, AllegrexContext &ctx) {  // SetDataAndGetID(buffer, size)
         workload::atrac_set_data(r.memory(), arg(ctx, 0), arg(ctx, 1));
         const std::int32_t id = (*next_atrac)++ % 6;
-        (*atrac_buffers)[id] = arg(ctx, 0);
+        AtracStream &stream = (*streams)[id];
+        music::close(stream.track);
+        stream = AtracStream{arg(ctx, 0)};
+        if (audio::enabled()) stream.track = music::open(r.memory().raw_pointer(arg(ctx, 0), 8u), 8u);
         ret(ctx, static_cast<std::uint32_t>(id));
     });
-    reg_value(rt, atrac, 0x61EB33F5u, 0u);
-    reg(rt, atrac, 0x6A8C3CD5u, [](Runtime &r, AllegrexContext &ctx) {  // DecodeData: one silent frame
+    reg(rt, atrac, 0x61EB33F5u, [streams](Runtime &, AllegrexContext &ctx) {  // ReleaseAtracID
+        const auto it = streams->find(static_cast<std::int32_t>(arg(ctx, 0)));
+        if (it != streams->end()) {
+            music::close(it->second.track);
+            streams->erase(it);
+        }
+        ret(ctx, 0u);
+    });
+    reg(rt, atrac, 0x6A8C3CD5u, [streams](Runtime &r, AllegrexContext &ctx) {  // DecodeData(id, out, samples, finish, remain)
         constexpr std::uint32_t kSamples = 2048u;
         workload::atrac_decode();
-        if (r.memory().contains(arg(ctx, 1), kSamples * 4u)) r.memory().zero(arg(ctx, 1), kSamples * 4u);
+        const auto it = streams->find(static_cast<std::int32_t>(arg(ctx, 0)));
+        std::uint32_t finished = 0u;
+        if (!r.memory().contains(arg(ctx, 1), kSamples * 4u)) {
+        } else if (it != streams->end() && it->second.track >= 0) {
+            auto *out = reinterpret_cast<std::int16_t *>(r.memory().raw_pointer(arg(ctx, 1), kSamples * 4u));
+            if (!music::decode(it->second.track, out, kSamples, it->second.loops)) finished = 1u;
+        } else {
+            r.memory().zero(arg(ctx, 1), kSamples * 4u);
+        }
         if (arg(ctx, 2) != 0u) r.memory().store32(arg(ctx, 2), kSamples);
-        if (arg(ctx, 3) != 0u) r.memory().store32(arg(ctx, 3), 0u);
+        if (arg(ctx, 3) != 0u) r.memory().store32(arg(ctx, 3), finished);
         if (arg(ctx, 4) != 0u) r.memory().store32(arg(ctx, 4), 0xFFFFFFFFu);
         ret(ctx, 0u);
     });
-    reg(rt, atrac, 0x5D268707u, [atrac_buffers](Runtime &r, AllegrexContext &ctx) {  // GetStreamDataInfo
-        const auto it = atrac_buffers->find(static_cast<std::int32_t>(arg(ctx, 0)));
-        if (arg(ctx, 1) != 0u) r.memory().store32(arg(ctx, 1), it == atrac_buffers->end() ? 0u : it->second);
+    reg(rt, atrac, 0x5D268707u, [streams](Runtime &r, AllegrexContext &ctx) {  // GetStreamDataInfo
+        const auto it = streams->find(static_cast<std::int32_t>(arg(ctx, 0)));
+        if (arg(ctx, 1) != 0u) r.memory().store32(arg(ctx, 1), it == streams->end() ? 0u : it->second.buffer);
         if (arg(ctx, 2) != 0u) r.memory().store32(arg(ctx, 2), 0u);
         if (arg(ctx, 3) != 0u) r.memory().store32(arg(ctx, 3), 0u);
         ret(ctx, 0u);
     });
-    reg_value(rt, atrac, 0x7DB31251u, 0u);
-    reg_value(rt, atrac, 0x868120B5u, 0u);
+    reg_value(rt, atrac, 0x7DB31251u, 0u);  // AddStreamData
+    reg(rt, atrac, 0x868120B5u, [streams](Runtime &, AllegrexContext &ctx) {  // SetLoopNum(id, loops)
+        const auto it = streams->find(static_cast<std::int32_t>(arg(ctx, 0)));
+        if (it != streams->end()) it->second.loops = static_cast<std::int32_t>(arg(ctx, 1));
+        ret(ctx, 0u);
+    });
 }
 
 void call_guest(AllegrexContext &ctx, std::uint32_t function, std::initializer_list<std::uint32_t> args,

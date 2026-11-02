@@ -8,6 +8,7 @@
 // writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
 // solid status colour: blue running, green done, red error.
 #include "audio_out.hpp"
+#include "music.hpp"
 #include "burnout_run.hpp"
 #if defined(BURNOUT_VITA_GL)
 #include "ge_render.hpp"
@@ -262,8 +263,11 @@ int main() {
             std::fprintf(stderr, "[vita] sound off\n");
         } else {
             std::string sound_error;
-            if (burnout::audio::start(2, {}, sound_error)) std::fprintf(stderr, "[vita] sound on\n");
-            else std::fprintf(stderr, "[vita] sound unavailable: %s\n", sound_error.c_str());
+            if (burnout::audio::start(2, {}, sound_error)) {
+                // Music: the tracks converted by tools/convert_music.py.
+                const int tracks = burnout::music::set_dir(std::string(kRoot) + "music_ima");
+                std::fprintf(stderr, "[vita] sound on, %d music tracks\n", tracks);
+            } else std::fprintf(stderr, "[vita] sound unavailable: %s\n", sound_error.c_str());
         }
 #endif
         const std::string report = run_pass(444, script);
