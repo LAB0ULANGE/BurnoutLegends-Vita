@@ -269,7 +269,9 @@ int main() {
     try {
         burnout::InputScript script;
         if (!scripted) {
-            // Free play: the player goes through the menus.
+            // Free play: the player goes through the menus. The intro movie
+            // (not decoded: a black screen) is skipped as the script does.
+            script.parse_line("hold   120   126  START");
         } else if (std::FILE *custom = std::fopen((std::string(kRoot) + "race.txt").c_str(), "r")) {
             std::fclose(custom);
             script.load(std::string(kRoot) + "race.txt");

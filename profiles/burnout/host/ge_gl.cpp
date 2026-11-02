@@ -2625,7 +2625,8 @@ void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uin
             use_snapshot(&snapshot, records[next_record++]);
             ge_command(memory, word, base, offset);
             use_snapshot(nullptr, 0u);
-        } else {
+        } else if (g_commands[op] != word || kActsWhenRepeated[op]) {
+            // Repeated state (most of a list) is dropped here, without a call.
             ge_command(memory, word, base, offset);
         }
     }
