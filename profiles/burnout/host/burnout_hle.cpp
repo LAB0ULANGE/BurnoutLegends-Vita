@@ -955,6 +955,8 @@ bool g_busy{};                     // a request is being handled
 std::uint32_t g_queued_flips{};
 volatile bool g_has_events{};
 std::set<std::int32_t> g_open_lists;     // emulation thread: lists not complete yet
+std::uint32_t g_uncovered_count{};      // lists not covered since the last report
+std::set<std::int32_t> g_uncovered_lists;  // emulation thread: open lists early_transfers did not cover
 std::map<std::int32_t, GeList> g_lists;  // front end thread: lists waiting on a stall address
 double g_wait_ms{};                // emulation thread blocked on the front end
 volatile std::uint32_t g_cpu_samples[4]{};  // requests handled per core (Vita)
@@ -1048,7 +1050,10 @@ template <typename Predicate> void wait(Predicate done) {
 bool ge_front_post_list(std::int32_t id, GeList &list) {
 #if defined(BURNOUT_GE_RENDER)
     if (!front::g_enabled) return false;
-    render::early_transfers(front::g_runtime->memory(), list.pc, list.stall, list.base, list.offset);
+    if (!render::early_transfers(front::g_runtime->memory(), list.pc, list.stall, list.base, list.offset)) {
+        front::g_uncovered_lists.insert(id);
+        ++front::g_uncovered_count;
+    }
     front::g_open_lists.insert(id);
     front::Request request;
     request.kind = front::Request::Kind::List;
@@ -1073,7 +1078,10 @@ void ge_front_deliver() {
         front::g_has_events = false;
     }
     for (const GeEvent &event : events) {
-        if (event.list_done >= 0) front::g_open_lists.erase(event.list_done);
+        if (event.list_done >= 0) {
+            front::g_open_lists.erase(event.list_done);
+            front::g_uncovered_lists.erase(event.list_done);
+        }
         else ge_queue_callback(event.callback, event.finish, event.value);
     }
 #endif
@@ -1107,7 +1115,12 @@ std::uint32_t ge_front_sync(std::uint32_t mode, std::int32_t list_id) {
         return list_id < 0 ? !front::g_open_lists.empty() : front::g_open_lists.count(list_id) != 0u;
     };
     ge_front_deliver();
-    if (mode != 0u) return 0u;
+    if (mode != 0u) {
+        // Honest while a list the pre-pass could not cover is still open.
+        const bool uncovered = list_id < 0 ? !front::g_uncovered_lists.empty()
+                                           : front::g_uncovered_lists.count(list_id) != 0u;
+        return uncovered && pending() ? 2u : 0u;
+    }
     while (pending()) {
         front::wait([] { return front::g_has_events || front::idle_locked(); });
         ge_front_deliver();
@@ -2324,8 +2337,10 @@ std::string thread_time_report(double frames) {
     report += item;
 #if defined(BURNOUT_GE_RENDER)
     if (front::g_enabled) {
-        std::snprintf(item, sizeof(item), "; waited %.1f for the GE front end (on cores %u/%u/%u/%u)", front::g_wait_ms / frames,
-                      front::g_cpu_samples[0], front::g_cpu_samples[1], front::g_cpu_samples[2], front::g_cpu_samples[3]);
+        std::snprintf(item, sizeof(item), "; waited %.1f for the GE front end (on cores %u/%u/%u/%u, %u lists uncovered)",
+                      front::g_wait_ms / frames, front::g_cpu_samples[0], front::g_cpu_samples[1], front::g_cpu_samples[2],
+                      front::g_cpu_samples[3], front::g_uncovered_count);
+        front::g_uncovered_count = 0u;
         report += item;
         for (auto &count : front::g_cpu_samples) count = 0u;
         front::g_wait_ms = 0.0;

@@ -193,19 +193,20 @@ std::array<std::uint32_t, 8> transfer_key(const std::array<std::uint32_t, 256> &
 }
 
 // The copy early_transfers made for this kick, if the registers agree.
+// A kick the pre-pass did not see leaves the queue alone; copies the front end
+// never reaches (at most a few) are dropped when a later one matches.
 bool take_early_transfer(std::uint32_t data, Transfer &out) {
     const auto key = transfer_key(g_commands, data);
     std::lock_guard lock(g_early_mutex);
-    while (!g_early.empty()) {
-        EarlyTransfer early = std::move(g_early.front());
-        g_early.pop_front();
-        if (early.regs == key) {
-            out = std::move(early.transfer);
-            ++g_early_used;
-            return true;
-        }
-        ++g_early_missed;
+    constexpr std::size_t kLookAhead = 4u;
+    for (std::size_t i = 0; i < g_early.size() && i < kLookAhead; ++i) {
+        if (g_early[i].regs != key) continue;
+        out = std::move(g_early[i].transfer);
+        g_early.erase(g_early.begin(), g_early.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+        ++g_early_used;
+        return true;
     }
+    ++g_early_missed;
     return false;
 }
 
@@ -731,11 +732,13 @@ std::uint32_t forward_run(psprecomp::GuestMemory &memory, const std::uint8_t *wo
 
 } // namespace
 
-void early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
+bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
                      std::uint32_t offset) {
-    if (!g_options.enabled || g_options.backend != Backend::OpenGL) return;
+    if (!g_options.enabled || g_options.backend != Backend::OpenGL) return false;
     constexpr std::uint32_t kLimit = 1u << 20u;
     std::vector<EarlyTransfer> found;
+    bool covered = false;  // reached END, and every transfer goes to VRAM
+    bool to_ram = false;
     for (std::uint32_t count = 0; count < kLimit; ++count) {
         pc &= 0x0FFFFFFCu;
         if (stall != 0u && pc == (stall & 0x0FFFFFFFu)) break;
@@ -748,7 +751,7 @@ void early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std
         pc += 4u;
         switch (op) {
         case 0x08u: pc = (base | data) + offset; continue;  // JUMP
-        case 0x0Bu: case 0x0Cu: count = kLimit; continue;    // RET at the top level, END
+        case 0x0Bu: case 0x0Cu: covered = true; count = kLimit; continue;  // RET at the top level, END
         case 0x10u: base = (data << 8u) & 0x0F000000u; continue;
         case 0x13u: offset = data << 8u; continue;
         case 0x14u: offset = pc - 4u; continue;
@@ -759,15 +762,20 @@ void early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std
             EarlyTransfer early;
             early.regs = transfer_key(g_early_regs, data);
             early.transfer = snapshot_transfer_from(memory, g_early_regs, data);
+            // A copy into RAM may feed a later transfer: its source is only
+            // right once the front end has done the first.
+            if ((early.transfer.destination & 0x0F000000u) != 0x04000000u) to_ram = true;
             found.push_back(std::move(early));
             continue;
         }
         default: continue;  // CALL: sub-lists hold no transfers
         }
     }
-    if (found.empty()) return;
-    std::lock_guard lock(g_early_mutex);
-    for (EarlyTransfer &early : found) g_early.push_back(std::move(early));
+    if (!found.empty()) {
+        std::lock_guard lock(g_early_mutex);
+        for (EarlyTransfer &early : found) g_early.push_back(std::move(early));
+    }
+    return covered && !to_ram;
 }
 
 void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count, std::uint32_t base,

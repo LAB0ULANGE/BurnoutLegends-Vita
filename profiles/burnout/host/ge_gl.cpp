@@ -629,7 +629,9 @@ constexpr std::size_t kProgramBinaryMax = 1u << 20u;
 
 std::string cache_path(const char *vertex, const char *fragment, const std::string &defines) {
     std::uint64_t hash = 0xCBF29CE484222325ull;
-    for (const std::string &part : {std::string(vertex), std::string(fragment), defines})
+    // The build date stands for the vitaGL and shader compiler it was linked
+    // with: a newer build never loads an older binary.
+    for (const std::string &part : {std::string(vertex), std::string(fragment), defines, std::string(__DATE__ __TIME__)})
         for (const char c : part) hash = (hash ^ static_cast<std::uint8_t>(c)) * 0x100000001B3ull;
     char name[32];
     std::snprintf(name, sizeof(name), "/%016llx.bin", static_cast<unsigned long long>(hash));

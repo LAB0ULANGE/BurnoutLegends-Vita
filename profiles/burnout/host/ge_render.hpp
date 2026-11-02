@@ -65,7 +65,9 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t 
 // GE is done at once (it refills that RAM as soon as it is). Burnout kicks its
 // transfers from the top level only; the front end checks each copy against
 // its own transfer registers and reads guest memory when they disagree.
-void early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
+// Returns whether the whole list was covered (it reached END before any
+// stall, and no transfer goes into RAM); only then may a peek say "done".
+bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
                      std::uint32_t offset);
 // sceDisplaySetFrameBuf: the frame at `address` is about to be shown.
 void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stride,
