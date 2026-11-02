@@ -48,5 +48,8 @@ void prepare_boot_thread(psprecomp::Runtime &runtime, const std::string &boot_pa
 [[nodiscard]] std::uint64_t virtual_time_us() noexcept;
 [[nodiscard]] std::uint64_t vblank_count() noexcept;
 void print_hle_summary();
+// Host ms per frame each guest thread ran since the previous call (threads
+// above 0.05 ms), as "name ms, ...".
+[[nodiscard]] std::string thread_time_report(double frames);
 
 } // namespace burnout

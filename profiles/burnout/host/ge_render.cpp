@@ -804,6 +804,7 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
                           worst_flip, gl::io_read_ms, gl::io_read_max_ms);
             worst_flip = 0.0;
             gl::io_read_ms = gl::io_read_max_ms = 0.0;
+            gl::trace(("emulation threads (ms/flip): " + thread_time_report(300.0)).c_str());
             g_skipped_frames = 0u;
             g_scan_ms = 0.0;
             gl::trace(line);

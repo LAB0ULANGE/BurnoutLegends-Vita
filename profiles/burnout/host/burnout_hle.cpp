@@ -88,6 +88,7 @@ struct Thread {
     std::uint32_t timeout_ptr{};
     std::uint64_t deadline{};  // 0 = none
     std::uint32_t exit_status{};
+    double host_ms{};  // host time spent running this thread (thread_time_report)
     std::uint32_t wakeup_count{};
     std::int64_t ready_seq{};
 };
@@ -472,7 +473,21 @@ std::uint64_t next_event_time() {
     return std::max(next, k.time_us);
 }
 
+// Host time of the running guest thread, charged when it switches out.
+struct Slice {
+    std::int32_t uid{-1};
+    double started{};
+} g_slice;
+
+void close_slice() {
+    if (g_slice.uid < 0) return;
+    const auto it = k.threads.find(g_slice.uid);
+    if (it != k.threads.end()) it->second.host_ms += host_now_ms() - g_slice.started;
+    g_slice.uid = -1;
+}
+
 void dispatch_next(Runtime &rt, AllegrexContext &ctx) {
+    close_slice();
     for (;;) {
         if (rt.stopped()) return;
         if (!k.pending_interrupts.empty()) {
@@ -486,6 +501,7 @@ void dispatch_next(Runtime &rt, AllegrexContext &ctx) {
             thread->state = ThreadState::Running;
             k.current = uid;
             k.idle_vblanks = 0u;
+            g_slice = {uid, host_now_ms()};
             ctx = thread->ctx;
             psprecomp::set_runtime_thread_identity(uid, thread->name);
             return;
@@ -1887,6 +1903,23 @@ void prepare_boot_thread(Runtime &runtime, const std::string &boot_path) {
     k.threads.emplace(uid, std::move(thread));
     k.current = uid;
     psprecomp::set_runtime_thread_identity(uid, "user_main");
+}
+
+std::string thread_time_report(double frames) {
+    close_slice();
+    if (k.current >= 0) g_slice = {k.current, host_now_ms()};
+    std::string report;
+    for (auto &[uid, thread] : k.threads) {
+        (void)uid;
+        if (thread.host_ms / frames >= 0.05) {
+            char item[96];
+            std::snprintf(item, sizeof(item), "%s%s %.1f", report.empty() ? "" : ", ", thread.name.c_str(),
+                          thread.host_ms / frames);
+            report += item;
+        }
+        thread.host_ms = 0.0;
+    }
+    return report;
 }
 
 void print_hle_summary() {
