@@ -163,9 +163,12 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
 #if defined(BURNOUT_VITA_GL)
     options.max_vblanks = 60u * 60u * 30u;
     options.realtime = true;
-    // ux0:data/burnout/sync_ge.txt keeps the display lists on the emulation core.
-    if (std::FILE *flag = std::fopen((root + "sync_ge.txt").c_str(), "r")) std::fclose(flag);
-    else options.async_ge = true;
+    // ux0:data/burnout/async_ge.txt walks the display lists on another core
+    // (no faster: the game waits for the GE right after submitting).
+    if (std::FILE *flag = std::fopen((root + "async_ge.txt").c_str(), "r")) {
+        std::fclose(flag);
+        options.async_ge = true;
+    }
     options.live_buttons = [] {
         SceCtrlData pad{};
         sceCtrlPeekBufferPositive(0, &pad, 1);

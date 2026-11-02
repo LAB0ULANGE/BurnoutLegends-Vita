@@ -18,6 +18,9 @@
 #include <pthread.h>
 #endif
 
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -588,6 +591,15 @@ void forward_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::ui
 
 namespace {
 
+// Starts loading the cache line at `address` (no effect on the result).
+inline void prefetch_line(const void *address) {
+#if defined(_MSC_VER)
+    _mm_prefetch(static_cast<const char *>(address), _MM_HINT_T0);
+#else
+    __builtin_prefetch(address);
+#endif
+}
+
 enum class ForwardKind : std::uint8_t { Plain, Pointer, Snapshot, Transfer, Control };
 // How the emulation thread treats each opcode inside a run: snapshot pointer
 // and PRIM/LOAD_CLUT commands, TRXKICK, and the control flow that ends a run
@@ -621,6 +633,7 @@ std::uint32_t forward_run(psprecomp::GuestMemory &memory, const std::uint8_t *wo
     const auto *list = reinterpret_cast<const std::uint32_t *>(words);
     std::uint32_t i = 0u;
     for (; i < count; ++i) {
+        if ((i & 7u) == 0u) prefetch_line(list + i + 64u);  // long runs: stream ahead
         const std::uint32_t word = list[i];
         const std::uint32_t op = word >> 24u;
         const ForwardKind kind = kForwardKind[op];

@@ -29,6 +29,9 @@
 
 #include "psprecomp/common.hpp"
 
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -771,6 +774,15 @@ std::int64_t file_read(Runtime &rt, std::int32_t fd, std::uint32_t buffer, std::
     return read;
 }
 
+// Starts loading the cache line at `address` (no effect on the result).
+inline void prefetch_line(const void *address) {
+#if defined(_MSC_VER)
+    _mm_prefetch(static_cast<const char *>(address), _MM_HINT_T0);
+#else
+    __builtin_prefetch(address);
+#endif
+}
+
 // ---------------------------------------------------------------- GE
 
 void ge_queue_callback(std::int32_t callback_id, bool finish, std::uint32_t value) {
@@ -863,7 +875,27 @@ void ge_scan(Runtime &rt, GeList &list, std::vector<GeEvent> *events = nullptr) 
         const auto target = [&]() { return ((list.base | data) + list.offset) & 0x0FFFFFFCu; };
         switch (op) {
         case 0x08u: list.pc = target(); break;                         // JUMP
-        case 0x0Au: list.call_stack.push_back(list.pc); list.pc = target(); break;  // CALL
+        case 0x0Au: {  // CALL
+            list.call_stack.push_back(list.pc);
+            list.pc = target();
+            // The sub-lists (models, ~1500 a frame) are scattered: start
+            // loading the ones the next caller words call, so their cache
+            // misses overlap instead of following one another.
+            if (const std::uint8_t *ahead = rt.memory().raw_pointer(pc + 4u, 64u)) {
+                for (std::uint32_t at = 0; at < 64u; at += 4u) {
+                    std::uint32_t next;
+                    std::memcpy(&next, ahead + at, 4u);
+                    if ((next >> 24u) != 0x0Au) continue;
+                    const std::uint32_t callee = ((list.base | (next & 0x00FFFFFFu)) + list.offset) & 0x0FFFFFFCu;
+                    if (const std::uint8_t *host = rt.memory().raw_pointer(callee, 64u)) {
+                        prefetch_line(host);
+                        prefetch_line(host + 32);
+                    }
+                }
+            }
+            if (const std::uint8_t *host = rt.memory().raw_pointer(list.pc, 64u)) prefetch_line(host + 32);
+            break;
+        }
         case 0x0Bu:                                                     // RET
             if (!list.call_stack.empty()) { list.pc = list.call_stack.back(); list.call_stack.pop_back(); }
             break;
@@ -1052,7 +1084,10 @@ bool ge_front_wait() {
 }
 
 // sceGeDrawSync / sceGeListSync: mode 0 waits, otherwise the state is peeked
-// (0 complete, 2 drawing).
+// (0 complete, 2 drawing). Burnout polls right after sceGeListEnQueue until
+// the GE is done (it refills the RAM its block transfers read from as soon as
+// it is: reporting completion early blackens streamed textures), so the
+// emulation core gains nothing; the front end stays off by default.
 std::uint32_t ge_front_sync(std::uint32_t mode, std::int32_t list_id) {
 #if defined(BURNOUT_GE_RENDER)
     if (!front::g_enabled) return 0u;
