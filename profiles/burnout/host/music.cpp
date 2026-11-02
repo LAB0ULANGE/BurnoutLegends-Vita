@@ -1,11 +1,23 @@
 #include "music.hpp"
 
+#include "thread_sync.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
+
+#if defined(__vita__)
+#include <pthread.h>
+#else
+#include <thread>
+#endif
 
 namespace burnout::music {
 
@@ -20,9 +32,21 @@ struct Header {
     std::uint32_t riff_size{}, total{}, start{}, loop_start{}, loop_end{}, block_samples{}, blocks{};
 };
 
+// The next window of a track, read by the prefetch thread with its own file
+// handle while the current one plays, so the emulation thread does not wait
+// for the memory card.
+struct Ahead {
+    std::FILE *file{};
+    std::vector<std::uint8_t> data;
+    std::uint32_t first{UINT32_MAX}, count{};
+    bool busy{};   // queued or being read
+    bool ready{};  // data holds blocks [first, first + count)
+};
+
 struct Track {
     std::FILE *file{};
     Header header;
+    std::unique_ptr<Ahead> ahead;
     std::uint32_t position{};                  // next sample
     std::uint32_t cached_block{UINT32_MAX};
     std::array<std::int16_t, kBlockSamples * 2u> samples{};  // decoded cached block, interleaved
@@ -63,17 +87,105 @@ void decode_channel(const std::uint8_t *codes, std::int32_t predictor, std::int3
     }
 }
 
+SyncMutex g_ahead_mutex{"music_ahead"};
+SyncCondition g_ahead_cv{"music_ahead", g_ahead_mutex};
+std::deque<Ahead *> g_ahead_queue;
+bool g_reader_started{};
+
+bool read_window(std::FILE *file, std::uint32_t first, std::uint32_t count, std::vector<std::uint8_t> &data) {
+    data.resize(static_cast<std::size_t>(count) * kBlockBytes);
+    return std::fseek(file, static_cast<long>(kHeaderBytes + first * kBlockBytes), SEEK_SET) == 0 &&
+           std::fread(data.data(), 1u, data.size(), file) == data.size();
+}
+
+void reader_loop() {
+    for (;;) {
+        Ahead *ahead = nullptr;
+        {
+            std::unique_lock lock(g_ahead_mutex);
+            g_ahead_cv.wait(lock, [] { return !g_ahead_queue.empty(); });
+            ahead = g_ahead_queue.front();
+            g_ahead_queue.pop_front();
+        }
+        // Only this thread touches the window while it is busy.
+        const bool ok = read_window(ahead->file, ahead->first, ahead->count, ahead->data);
+        std::lock_guard lock(g_ahead_mutex);
+        ahead->ready = ok;
+        ahead->busy = false;
+        g_ahead_cv.notify_all();
+    }
+}
+
+#if defined(__vita__)
+void *reader_entry(void *) {
+    reader_loop();
+    return nullptr;
+}
+#endif
+
+void start_reader() {
+    if (g_reader_started) return;
+#if defined(__vita__)
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, reader_entry, nullptr) != 0) return;
+    pthread_detach(thread);
+#else
+    std::thread(reader_loop).detach();
+#endif
+    g_reader_started = true;
+}
+
+// Waits until the prefetch thread is done with `ahead`.
+void settle(Ahead &ahead) {
+    std::unique_lock lock(g_ahead_mutex);
+    g_ahead_cv.wait(lock, [&] { return !ahead.busy; });
+}
+
+// Queues the window that will be needed after the current one: the next
+// blocks, or the loop start once the current window holds the loop end.
+void prefetch_next(Track &t) {
+    if (!t.ahead || t.window_blocks == 0u) return;
+    const std::uint32_t loop_end_block = t.header.loop_end / kBlockSamples;
+    std::uint32_t first = t.window_first + t.window_blocks;
+    if (loop_end_block >= t.window_first && loop_end_block < t.window_first + t.window_blocks)
+        first = t.header.loop_start / kBlockSamples;
+    if (first >= t.header.blocks) return;
+    Ahead &ahead = *t.ahead;
+    settle(ahead);
+    if (ahead.ready && ahead.first == first) return;
+    std::lock_guard lock(g_ahead_mutex);
+    ahead.first = first;
+    ahead.count = std::min(kWindowBlocks, t.header.blocks - first);
+    ahead.ready = false;
+    ahead.busy = true;
+    g_ahead_queue.push_back(&ahead);
+    g_ahead_cv.notify_all();
+}
+
 bool load_block(Track &t, std::uint32_t block) {
     if (t.cached_block == block) return true;
     if (block >= t.header.blocks) return false;
     if (block < t.window_first || block >= t.window_first + t.window_blocks) {
-        const std::uint32_t count = std::min(kWindowBlocks, t.header.blocks - block);
-        t.window.resize(static_cast<std::size_t>(count) * kBlockBytes);
-        if (std::fseek(t.file, static_cast<long>(kHeaderBytes + block * kBlockBytes), SEEK_SET) != 0 ||
-            std::fread(t.window.data(), 1u, t.window.size(), t.file) != t.window.size())
-            return false;
-        t.window_first = block;
-        t.window_blocks = count;
+        bool have = false;
+        if (t.ahead) {
+            Ahead &ahead = *t.ahead;
+            settle(ahead);
+            if (ahead.ready && block >= ahead.first && block < ahead.first + ahead.count) {
+                t.window.swap(ahead.data);
+                t.window_first = ahead.first;
+                t.window_blocks = ahead.count;
+                ahead.ready = false;
+                ahead.first = UINT32_MAX;
+                have = true;
+            }
+        }
+        if (!have) {
+            const std::uint32_t count = std::min(kWindowBlocks, t.header.blocks - block);
+            if (!read_window(t.file, block, count, t.window)) return false;
+            t.window_first = block;
+            t.window_blocks = count;
+        }
+        prefetch_next(t);
     }
     const std::uint8_t *raw = t.window.data() + static_cast<std::size_t>(block - t.window_first) * kBlockBytes;
     const auto state = [&](std::uint32_t at, std::int32_t &predictor, std::int32_t &index) {
@@ -120,6 +232,12 @@ int open(const std::uint8_t *riff, std::uint32_t bytes) {
     }
     Track track;
     track.file = file;
+    start_reader();
+    if (g_reader_started) {
+        track.ahead = std::make_unique<Ahead>();
+        track.ahead->file = std::fopen(it->second.c_str(), "rb");
+        if (track.ahead->file == nullptr) track.ahead.reset();
+    }
     track.header = {le32(raw + 8u), le32(raw + 12u), le32(raw + 16u), le32(raw + 20u), le32(raw + 24u),
                     le32(raw + 28u), le32(raw + 32u)};
     track.position = track.header.start;
@@ -131,6 +249,10 @@ int open(const std::uint8_t *riff, std::uint32_t bytes) {
 void close(int handle) {
     const auto it = g_tracks.find(handle);
     if (it == g_tracks.end()) return;
+    if (it->second.ahead) {
+        settle(*it->second.ahead);
+        std::fclose(it->second.ahead->file);
+    }
     std::fclose(it->second.file);
     g_tracks.erase(it);
 }
