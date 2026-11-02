@@ -85,6 +85,9 @@ if(VITA)
         target_compile_definitions(burnout_vita_gl PRIVATE
             BURNOUT_GENERATED_OPT="-O${PSPRECOMP_GENERATED_OPT_LEVEL}" BURNOUT_GE_RENDER=1 BURNOUT_VITA_GL=1
             BURNOUT_VITA_LABEL="${BURNOUT_VITA_GL_LABEL}" BURNOUT_VITA_FILES="${BURNOUT_VITA_GL_FILES}")
+        if(BURNOUT_VITA_PROFILE)
+            target_compile_definitions(burnout_vita_gl PRIVATE BURNOUT_VITA_PROFILE=1)
+        endif()
         target_include_directories(burnout_vita_gl PRIVATE "${BURNOUT_PROFILE_DIR}/host")
         target_link_libraries(burnout_vita_gl PRIVATE burnout_generated
             vitaGL vitashark SceShaccCgExt mathneon taihen_stub SceShaccCg_stub SceKernelDmacMgr_stub

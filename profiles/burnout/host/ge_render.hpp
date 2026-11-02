@@ -59,6 +59,14 @@ std::uint32_t ge_plain_commands(psprecomp::GuestMemory &memory, const std::uint8
                                 std::uint32_t base, std::uint32_t offset);
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset);
+// Asynchronous GE front end (emulation thread, at sceGeListEnQueue): walks
+// the list's top level only, without its CALLs, and copies the source of
+// every block transfer (TRXKICK) there, so the front end can tell the game the
+// GE is done at once (it refills that RAM as soon as it is). Burnout kicks its
+// transfers from the top level only; the front end checks each copy against
+// its own transfer registers and reads guest memory when they disagree.
+void early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
+                     std::uint32_t offset);
 // sceDisplaySetFrameBuf: the frame at `address` is about to be shown.
 void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stride,
                       std::uint32_t format, std::uint64_t vblank);

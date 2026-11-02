@@ -986,7 +986,10 @@ void handle(Request &request, std::vector<GeEvent> &events) {
 
 void *thread_main(void *) {
 #if defined(__vita__)
-    const int changed = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
+    // Core 1, beside the decode worker it feeds (core 2 already has the GL
+    // thread, the SAS mixer and the audio output), ahead of it in priority.
+    const int changed = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 150);
     char line[128];
     std::snprintf(line, sizeof(line), "GE front end started: affinity change 0x%x, mask 0x%x, priority %d, cpu %d",
                   static_cast<unsigned>(changed), static_cast<unsigned>(sceKernelGetThreadCpuAffinityMask(sceKernelGetThreadId())),
@@ -1045,6 +1048,7 @@ template <typename Predicate> void wait(Predicate done) {
 bool ge_front_post_list(std::int32_t id, GeList &list) {
 #if defined(BURNOUT_GE_RENDER)
     if (!front::g_enabled) return false;
+    render::early_transfers(front::g_runtime->memory(), list.pc, list.stall, list.base, list.offset);
     front::g_open_lists.insert(id);
     front::Request request;
     request.kind = front::Request::Kind::List;
@@ -1092,9 +1096,10 @@ bool ge_front_wait() {
 
 // sceGeDrawSync / sceGeListSync: mode 0 waits, otherwise the state is peeked
 // (0 complete, 2 drawing). Burnout polls right after sceGeListEnQueue until
-// the GE is done (it refills the RAM its block transfers read from as soon as
-// it is: reporting completion early blackens streamed textures), so the
-// emulation core gains nothing; the front end stays off by default.
+// the GE is done and then refills the RAM its block transfers read from, so a
+// peek reports completion at once: those sources were copied when the list
+// was queued (render::early_transfers), and the game still waits for each
+// list's FINISH before reusing it.
 std::uint32_t ge_front_sync(std::uint32_t mode, std::int32_t list_id) {
 #if defined(BURNOUT_GE_RENDER)
     if (!front::g_enabled) return 0u;
@@ -1102,7 +1107,7 @@ std::uint32_t ge_front_sync(std::uint32_t mode, std::int32_t list_id) {
         return list_id < 0 ? !front::g_open_lists.empty() : front::g_open_lists.count(list_id) != 0u;
     };
     ge_front_deliver();
-    if (mode != 0u) return pending() ? 2u : 0u;
+    if (mode != 0u) return 0u;
     while (pending()) {
         front::wait([] { return front::g_has_events || front::idle_locked(); });
         ge_front_deliver();

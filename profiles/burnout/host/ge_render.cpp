@@ -138,8 +138,10 @@ struct Transfer {
     bool valid{};
 };
 
-Transfer snapshot_transfer(const psprecomp::GuestMemory &memory, std::uint32_t data) {
-    const auto c = [](std::uint32_t index) { return g_commands[index] & 0x00FFFFFFu; };
+// Transfer registers as of a TRXKICK (`regs` indexed by command).
+Transfer snapshot_transfer_from(const psprecomp::GuestMemory &memory, const std::array<std::uint32_t, 256> &regs,
+                                std::uint32_t data) {
+    const auto c = [&regs](std::uint32_t index) { return regs[index] & 0x00FFFFFFu; };
     Transfer t;
     const std::uint32_t source = (c(0xB2u) & 0xFFFFF0u) | ((c(0xB3u) & 0xFF0000u) << 8u);
     const std::uint32_t source_stride = c(0xB3u) & 0x7F8u;
@@ -164,6 +166,47 @@ Transfer snapshot_transfer(const psprecomp::GuestMemory &memory, std::uint32_t d
     g_transfer_bytes += t.rows.size();
     t.valid = true;
     return t;
+}
+
+Transfer snapshot_transfer(const psprecomp::GuestMemory &memory, std::uint32_t data) {
+    return snapshot_transfer_from(memory, g_commands, data);
+}
+
+// Transfers copied at sceGeListEnQueue (early_transfers), in kick order, with
+// the registers they were taken with.
+struct EarlyTransfer {
+    std::array<std::uint32_t, 8> regs{};  // B2 B3 B4 B5 EB EC EE and the kick
+    Transfer transfer;
+};
+SyncMutex g_early_mutex{"ge_early"};
+std::deque<EarlyTransfer> g_early;
+std::array<std::uint32_t, 256> g_early_regs{};  // emulation thread: TRX registers seen at the top level
+std::uint64_t g_early_used{}, g_early_missed{};
+
+constexpr std::array<std::uint32_t, 7> kTransferRegisters{0xB2u, 0xB3u, 0xB4u, 0xB5u, 0xEBu, 0xECu, 0xEEu};
+
+std::array<std::uint32_t, 8> transfer_key(const std::array<std::uint32_t, 256> &regs, std::uint32_t kick) {
+    std::array<std::uint32_t, 8> key{};
+    for (std::size_t i = 0; i < kTransferRegisters.size(); ++i) key[i] = regs[kTransferRegisters[i]] & 0x00FFFFFFu;
+    key[7] = kick & 0x00FFFFFFu;
+    return key;
+}
+
+// The copy early_transfers made for this kick, if the registers agree.
+bool take_early_transfer(std::uint32_t data, Transfer &out) {
+    const auto key = transfer_key(g_commands, data);
+    std::lock_guard lock(g_early_mutex);
+    while (!g_early.empty()) {
+        EarlyTransfer early = std::move(g_early.front());
+        g_early.pop_front();
+        if (early.regs == key) {
+            out = std::move(early.transfer);
+            ++g_early_used;
+            return true;
+        }
+        ++g_early_missed;
+    }
+    return false;
 }
 
 void apply_transfer(psprecomp::GuestMemory &memory, const Transfer &t) {
@@ -583,7 +626,8 @@ void forward_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::ui
     g_commands[op] = word;
     if (op == 0xEAu) {
         gl::emulation_phase = 6u;
-        Transfer transfer = snapshot_transfer(memory, data);
+        Transfer transfer;
+        if (!take_early_transfer(data, transfer)) transfer = snapshot_transfer(memory, data);
         if ((transfer.destination & 0x0F000000u) == 0x04000000u) {
             // Into VRAM, which only the GE reads: replay in command order.
             g_pending.push_back({word, static_cast<std::uint32_t>(g_pending_transfers.size()), UINT32_MAX});
@@ -686,6 +730,45 @@ std::uint32_t forward_run(psprecomp::GuestMemory &memory, const std::uint8_t *wo
 }
 
 } // namespace
+
+void early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
+                     std::uint32_t offset) {
+    if (!g_options.enabled || g_options.backend != Backend::OpenGL) return;
+    constexpr std::uint32_t kLimit = 1u << 20u;
+    std::vector<EarlyTransfer> found;
+    for (std::uint32_t count = 0; count < kLimit; ++count) {
+        pc &= 0x0FFFFFFCu;
+        if (stall != 0u && pc == (stall & 0x0FFFFFFFu)) break;
+        const std::uint8_t *at = memory.raw_pointer(pc, 4u);
+        if (at == nullptr) break;
+        std::uint32_t word;
+        std::memcpy(&word, at, 4u);
+        const std::uint32_t op = word >> 24u;
+        const std::uint32_t data = word & 0x00FFFFFFu;
+        pc += 4u;
+        switch (op) {
+        case 0x08u: pc = (base | data) + offset; continue;  // JUMP
+        case 0x0Bu: case 0x0Cu: count = kLimit; continue;    // RET at the top level, END
+        case 0x10u: base = (data << 8u) & 0x0F000000u; continue;
+        case 0x13u: offset = data << 8u; continue;
+        case 0x14u: offset = pc - 4u; continue;
+        case 0xB2u: case 0xB3u: case 0xB4u: case 0xB5u: case 0xEBu: case 0xECu: case 0xEEu:
+            g_early_regs[op] = word;
+            continue;
+        case 0xEAu: {
+            EarlyTransfer early;
+            early.regs = transfer_key(g_early_regs, data);
+            early.transfer = snapshot_transfer_from(memory, g_early_regs, data);
+            found.push_back(std::move(early));
+            continue;
+        }
+        default: continue;  // CALL: sub-lists hold no transfers
+        }
+    }
+    if (found.empty()) return;
+    std::lock_guard lock(g_early_mutex);
+    for (EarlyTransfer &early : found) g_early.push_back(std::move(early));
+}
 
 void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count, std::uint32_t base,
                  std::uint32_t offset) {
@@ -842,12 +925,19 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         worst_flip = std::max(worst_flip, now - last_flip);
         last_flip = now;
         if (++g_flips % 300u == 0u) {
-            char line[256];
+            char line[320];
+            std::uint64_t early_used = 0u, early_missed = 0u;
+            {
+                std::lock_guard lock(g_early_mutex);
+                early_used = g_early_used;
+                early_missed = g_early_missed;
+            }
             std::snprintf(line, sizeof(line),
                           "emulation: list scan %.1f ms/flip in %.0f scans, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
-                          "worst flip %.0f ms; file reads %.0f ms (longest %.0f)",
+                          "worst flip %.0f ms; file reads %.0f ms (longest %.0f); early transfers %llu used, %llu missed",
                           g_scan_ms / 300.0, g_scans / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
-                          worst_flip, gl::io_read_ms, gl::io_read_max_ms);
+                          worst_flip, gl::io_read_ms, gl::io_read_max_ms, static_cast<unsigned long long>(early_used),
+                          static_cast<unsigned long long>(early_missed));
             worst_flip = 0.0;
             gl::io_read_ms = gl::io_read_max_ms = 0.0;
             g_skipped_frames = 0u;

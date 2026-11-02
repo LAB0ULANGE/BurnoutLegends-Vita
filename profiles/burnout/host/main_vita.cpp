@@ -89,16 +89,28 @@ constexpr const char *kDefaultScript =
 std::uint32_t *g_framebuffer = nullptr;
 
 #if defined(BURNOUT_VITA_PROFILE)
+#if defined(BURNOUT_VITA_GL)
+constexpr const char *kProfile = "ux0:data/" BURNOUT_VITA_FILES "-profile.txt";
+#else
 constexpr const char *kProfile = "ux0:data/burnout-profile.txt";
+#endif
 std::atomic<bool> g_measuring{false};
 std::atomic<bool> g_profiler_stop{false};
 std::unordered_map<std::uint32_t, std::uint32_t> g_samples;
 
+void write_profile();
+
 // Runs on another core and samples the last block the emulation thread entered.
+// The report is written as soon as the window closes (a player may leave with
+// the PS button rather than START+SELECT).
 int profiler_thread(SceSize, void *) {
     g_samples.reserve(1u << 16u);
+    bool was_measuring = false;
     while (!g_profiler_stop.load(std::memory_order_relaxed)) {
-        if (g_measuring.load(std::memory_order_relaxed)) ++g_samples[static_cast<std::uint32_t>(psprecomp_profile_label)];
+        const bool measuring = g_measuring.load(std::memory_order_relaxed);
+        if (measuring) ++g_samples[static_cast<std::uint32_t>(psprecomp_profile_label)];
+        else if (was_measuring) write_profile();
+        was_measuring = measuring;
         sceKernelDelayThread(100);
     }
     return 0;

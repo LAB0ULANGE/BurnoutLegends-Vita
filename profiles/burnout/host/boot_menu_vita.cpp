@@ -113,7 +113,6 @@ Settings load(const std::string &root) {
     }
     // Before the menu existed, each option was a flag file.
     settings.sound = !exists(root + "no_sound.txt");
-    settings.async_ge = exists(root + "async_ge.txt");
     if (std::FILE *scale = std::fopen((root + "render_scale.txt").c_str(), "r")) {
         int value = 2;
         if (std::fscanf(scale, "%d", &value) == 1) settings.render_scale = value == 1 ? 1 : 2;
@@ -153,7 +152,7 @@ Settings run(const std::string &root, const std::string &build) {
         {"Saut d'images", {"Oui", "Non"}, &skip, "Saute une image si le rendu prend du retard."},
         {"Cache shaders", {"Non", "Oui (exp.)"}, &shaders, "Garde les shaders compiles: demarrage rapide."},
         {"Memoire GPU", {"Normale", "En cache (exp.)"}, &cached, "Experimental: plus rapide, glitchs possibles."},
-        {"GE parallele", {"Non", "Oui (exp.)"}, &async, "Experimental, pas plus rapide pour l'instant."},
+        {"GE parallele", {"Non", "Oui"}, &async, "Listes GE sur un autre coeur: plus fluide."},
         {"> LANCER LE JEU <", {}, &start, "X ou START pour lancer."},
     };
 
