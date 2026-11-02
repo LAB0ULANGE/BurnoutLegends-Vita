@@ -964,31 +964,21 @@ BlendShader set_blend() {
 // Every glUniform makes vitaGL rebuild the program's uniform buffer, so values
 // that did not change since the previous draw are not sent again. A short
 // flat table: the draw program has about twenty uniforms.
+// Last value recorded for each uniform slot (locations are slots, see Slot).
 struct CachedUniform {
-    GLint location{-1};
-    std::uint32_t count{};
+    std::uint32_t count{};  // 0: never recorded
     std::array<float, 30 * 4> values{};
 };
-std::array<CachedUniform, 32> g_uniforms;
-std::size_t g_uniform_count{};
+std::array<CachedUniform, kSlotCount> g_uniforms;
 
-bool uniform_changed(GLint location, const float *values, std::size_t count) {
-    if (location < 0) return false;
-    CachedUniform *cached = nullptr;
-    for (std::size_t i = 0; i < g_uniform_count; ++i)
-        if (g_uniforms[i].location == location) { cached = &g_uniforms[i]; break; }
-    if (cached == nullptr) {
-        if (g_uniform_count == g_uniforms.size() || count > g_uniforms[0].values.size()) return true;
-        cached = &g_uniforms[g_uniform_count++];
-        cached->location = location;
-    } else if (cached->count == count && std::memcmp(cached->values.data(), values, count * sizeof(float)) == 0) {
-        return false;
-    }
-    cached->count = static_cast<std::uint32_t>(count);
-    std::memcpy(cached->values.data(), values, count * sizeof(float));
+bool uniform_changed(GLint slot, const float *values, std::size_t count) {
+    if (slot < 0 || slot >= kSlotCount) return false;
+    CachedUniform &cached = g_uniforms[static_cast<std::size_t>(slot)];
+    if (cached.count == count && std::memcmp(cached.values.data(), values, count * sizeof(float)) == 0) return false;
+    cached.count = static_cast<std::uint32_t>(std::min(count, cached.values.size()));
+    std::memcpy(cached.values.data(), values, cached.count * sizeof(float));
     return true;
 }
-
 
 void uniform4(GLint location, float x, float y, float z, float w) {
     const float values[4]{x, y, z, w};
