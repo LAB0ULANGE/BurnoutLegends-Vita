@@ -550,6 +550,66 @@ void forward_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::ui
 
 } // namespace
 
+namespace {
+
+enum class ForwardKind : std::uint8_t { Plain, Snapshot, Transfer, Control };
+// How the emulation thread treats each opcode inside a run: snapshot pointer
+// and PRIM/LOAD_CLUT commands, TRXKICK, and the control flow that ends a run
+// (as ge_scan's ge_is_control).
+constexpr std::array<ForwardKind, 256> kForwardKind = [] {
+    std::array<ForwardKind, 256> kinds{};
+    for (const std::uint32_t op : {0x01u, 0x02u, 0x04u, 0x12u, 0xB0u, 0xB1u, 0xC4u}) kinds[op] = ForwardKind::Snapshot;
+    kinds[0xEAu] = ForwardKind::Transfer;
+    for (const std::uint32_t op : {0x08u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Eu, 0x0Fu, 0x10u, 0x13u, 0x14u})
+        kinds[op] = ForwardKind::Control;
+    return kinds;
+}();
+
+// The run goes to the worker as one block (it ignores repeated state
+// itself); only the commands snapshots and transfers need are looked at.
+// With `stop_at_control`, the run ends at the first control command
+// (ge_plain_commands); returns the commands taken.
+std::uint32_t forward_run(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count,
+                          std::uint32_t base, std::uint32_t offset, bool stop_at_control) {
+    std::uint32_t start = 0u;
+    const auto emit_run = [&](std::uint32_t end) {
+        if (end == start) return;
+        g_pending_words.push_back(base);
+        g_pending_words.push_back(offset);
+        const auto at = static_cast<std::uint32_t>(g_pending_words.size());
+        const auto *first = reinterpret_cast<const std::uint32_t *>(words) + start;  // guest words are 4-byte aligned
+        g_pending_words.insert(g_pending_words.end(), first, first + (end - start));
+        g_pending.push_back({at, end - start, kRun});
+    };
+    const auto *list = reinterpret_cast<const std::uint32_t *>(words);
+    std::uint32_t i = 0u;
+    for (; i < count; ++i) {
+        const std::uint32_t word = list[i];
+        const std::uint32_t op = word >> 24u;
+        const ForwardKind kind = kForwardKind[op];
+        if (kind == ForwardKind::Plain) {
+            g_commands[op] = word;
+            continue;
+        }
+        if (kind == ForwardKind::Control && stop_at_control) break;
+        g_commands[op] = word;
+        if (kind == ForwardKind::Snapshot) {
+            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
+            if (record != UINT32_MAX) g_pending_records.push_back(record);
+            gl::emulation_phase = 2u;
+        } else if (kind == ForwardKind::Transfer) {
+            emit_run(i);
+            forward_command(memory, word, base, offset);
+            start = i + 1u;
+        }
+    }
+    emit_run(i);
+    gl::emulation_phase = 1u;
+    return i;
+}
+
+} // namespace
+
 void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count, std::uint32_t base,
                  std::uint32_t offset) {
     if (!g_options.enabled || g_options.backend != Backend::OpenGL) return;
@@ -564,40 +624,20 @@ void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std:
         gl::emulation_phase = 1u;
         return;
     }
-    // The run goes to the worker as one block (it ignores repeated state
-    // itself); only the commands snapshots and transfers need are looked at.
-    std::uint32_t start = 0u;
-    const auto emit_run = [&](std::uint32_t end) {
-        if (end == start) return;
-        g_pending_words.push_back(base);
-        g_pending_words.push_back(offset);
-        const auto at = static_cast<std::uint32_t>(g_pending_words.size());
-        const auto *first = reinterpret_cast<const std::uint32_t *>(words) + start;  // guest words are 4-byte aligned
-        g_pending_words.insert(g_pending_words.end(), first, first + (end - start));
-        g_pending.push_back({at, end - start, kRun});
-    };
-    for (std::uint32_t i = 0; i < count; ++i) {
-        std::uint32_t word;
-        std::memcpy(&word, words + i * 4u, 4u);
-        const std::uint32_t op = word >> 24u;
-        g_commands[op] = word;
-        switch (op) {
-        case 0x01u: case 0x02u: case 0x04u: case 0x12u: case 0xB0u: case 0xB1u: case 0xC4u: {
-            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
-            if (record != UINT32_MAX) g_pending_records.push_back(record);
-            gl::emulation_phase = 2u;
-            break;
-        }
-        case 0xEAu:
-            emit_run(i);
-            forward_command(memory, word, base, offset);
-            start = i + 1u;
-            break;
-        default: break;
-        }
+    forward_run(memory, words, count, base, offset, false);
+}
+
+std::uint32_t ge_plain_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t span,
+                                std::uint32_t base, std::uint32_t offset) {
+    if (g_options.enabled && g_options.backend == Backend::OpenGL && g_async) {
+        g_memory = &memory;
+        gl::emulation_phase = 2u;
+        return forward_run(memory, words, span, base, offset, true);
     }
-    emit_run(count);
-    gl::emulation_phase = 1u;
+    std::uint32_t plain = 0u;
+    while (plain < span && kForwardKind[words[plain * 4u + 3u]] != ForwardKind::Control) ++plain;
+    if (plain != 0u) ge_commands(memory, words, plain, base, offset);
+    return plain;
 }
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,

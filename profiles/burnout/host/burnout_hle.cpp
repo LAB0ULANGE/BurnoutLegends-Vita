@@ -769,11 +769,15 @@ void ge_scan(Runtime &rt, GeList &list) {
             if (list.stall != 0u && stall > pc) span = std::min<std::uint64_t>(span, (stall - pc) / 4u);
             if (const std::uint8_t *words = rt.memory().raw_pointer(pc, static_cast<std::size_t>(span) * 4u)) {
                 std::uint32_t plain = 0u;
-                while (plain < span && !ge_is_control(words[plain * 4u + 3u])) ++plain;
-                if (plain != 0u) {
 #if defined(BURNOUT_GE_RENDER)
-                    if (render_runs) render::ge_commands(rt.memory(), words, plain, list.base, list.offset);
+                if (render_runs) {
+                    // One pass finds the run's end and hands it to the renderer.
+                    plain = render::ge_plain_commands(rt.memory(), words, static_cast<std::uint32_t>(span), list.base,
+                                                      list.offset);
+                } else
 #endif
+                    while (plain < span && !ge_is_control(words[plain * 4u + 3u])) ++plain;
+                if (plain != 0u) {
                     list.pc = pc + plain * 4u;
                     k.ge_commands_scanned += plain;
                     count += plain - 1u;

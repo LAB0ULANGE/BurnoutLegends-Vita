@@ -45,6 +45,11 @@ void finish();
 // A run of `count` plain (non control-flow) commands, read in place.
 void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count, std::uint32_t base,
                  std::uint32_t offset);
+// The plain commands at the start of `span` words, up to the first
+// control-flow command: handled as ge_commands does in the same pass that
+// finds where they end. Returns their count.
+std::uint32_t ge_plain_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t span,
+                                std::uint32_t base, std::uint32_t offset);
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset);
 // sceDisplaySetFrameBuf: the frame at `address` is about to be shown.
