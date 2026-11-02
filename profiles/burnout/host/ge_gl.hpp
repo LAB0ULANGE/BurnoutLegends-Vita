@@ -51,10 +51,18 @@ struct Snapshot {
 // Emulation-thread side of the GL worker. Follows the vertex and index
 // pointers and appends to `snapshot` the guest bytes `word` will read, so the
 // worker can draw the frame while the game overwrites them. Returns the
-// record's offset in `snapshot.records`, or UINT32_MAX when the command reads
-// no guest memory.
+// record's offset in `snapshot.records`, or UINT32_MAX when the command needs
+// none.
 std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base,
                                std::uint32_t offset, Snapshot &snapshot);
+// A run of plain commands (see render::ge_commands): PRIM and LOAD_CLUT
+// entries take their records from `records` in order.
+void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uint32_t count, std::uint32_t base,
+            std::uint32_t offset, const Snapshot &snapshot, const std::uint32_t *records, std::size_t &next_record);
+// Worker side of the same rule: whether the PRIM `word` about to be decoded
+// has a record (non-indexed PRIMs of static vertices have none, they are read
+// in place).
+[[nodiscard]] bool prim_has_record() noexcept;
 // The next ge_command reads `record` of `snapshot` instead of guest memory;
 // nullptr goes back to guest memory.
 void use_snapshot(const Snapshot *snapshot, std::uint32_t record);

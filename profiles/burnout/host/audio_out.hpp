@@ -20,6 +20,12 @@ void stop();
 void submit(std::uint32_t channel, const std::int16_t *samples, std::uint32_t frames, bool stereo, std::uint32_t left,
             std::uint32_t right);
 
+// How fast the game should feed `channel`, as a factor on the virtual time
+// one output call lasts: below 1 when the channel's queue runs low (the game
+// runs slower than real time), above 1 when it is well ahead. Always 1 when
+// dumping (PC runs stay deterministic).
+[[nodiscard]] double pace(std::uint32_t channel);
+
 // Diagnostics: frames of silence the output played because no channel had
 // data (underruns), frames dropped from full FIFOs.
 struct Counters {

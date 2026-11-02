@@ -518,12 +518,22 @@ std::array<std::uint8_t, 1024> g_clut{};   // palette cached by LOAD_CLUT, as on
 std::uint64_t g_clut_hash{};
 // Pending batch: vertices in the PSP component formats (see BatchLayout),
 // all of one vertex type.
-std::vector<std::uint8_t> g_batch;
+// Scratch buffers that are always written after they grow: no zero fill.
+template <typename T> struct UninitAllocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = UninitAllocator<U>; };
+    UninitAllocator() = default;
+    template <typename U> UninitAllocator(const UninitAllocator<U> &) noexcept {}
+    template <typename U> void construct(U *p) noexcept { ::new (static_cast<void *>(p)) U; }
+    template <typename U, typename... A> void construct(U *p, A &&...args) { ::new (static_cast<void *>(p)) U(std::forward<A>(args)...); }
+};
+template <typename T> using ScratchVector = std::vector<T, UninitAllocator<T>>;
+
+ScratchVector<std::uint8_t> g_batch;
 std::uint32_t g_batch_count{}, g_batch_vtype{};
 // Non-null: the batch vertices are read in place from the snapshot instead of
 // g_batch (PSP layout already fits, see BatchLayout).
 const std::uint8_t *g_batch_in_place{};
-std::vector<std::uint16_t> g_batch_indices;  // explicit indices (indexed, flat and sprite PRIMs)
+ScratchVector<std::uint16_t> g_batch_indices;  // explicit indices (indexed, flat and sprite PRIMs)
 // The batch's triangles as runs of two words: first vertex (or, kind 7, first
 // explicit index) and count | kind << 24, kind being the PRIM type for lists,
 // strips and fans of consecutive vertices. The GL thread expands them.
@@ -633,9 +643,13 @@ void record(Op op, std::initializer_list<std::uint32_t> args = {}) {
 }
 
 std::uint32_t record_data(const void *bytes, std::size_t size) {
-    const std::size_t at = (g_frame.data.size() + 7u) & ~std::size_t{7u};
-    g_frame.data.resize(at + size);
-    if (size != 0u) std::memcpy(g_frame.data.data() + at, bytes, size);
+    // Appended rather than resized: no zero fill before the copy.
+    std::vector<std::uint8_t> &data = g_frame.data;
+    static constexpr std::uint8_t kPadding[8]{};
+    data.insert(data.end(), kPadding, kPadding + ((8u - (data.size() & 7u)) & 7u));
+    const std::size_t at = data.size();
+    const auto *first = static_cast<const std::uint8_t *>(bytes);
+    data.insert(data.end(), first, first + size);
     return static_cast<std::uint32_t>(at);
 }
 
@@ -1433,7 +1447,7 @@ const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t ad
 // float position and normal and no weights; the world matrix follows as usual.
 std::array<float, 8 * 12> g_bones{};
 std::uint32_t g_bone_cursor{};
-std::vector<std::uint8_t> g_skinned;
+ScratchVector<std::uint8_t> g_skinned;
 
 std::uint32_t skinned_vtype(std::uint32_t vtype) {
     const std::uint32_t nrm = (vtype >> 5u) & 3u;
@@ -1526,7 +1540,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
 
     phase = 2u;
     std::uint32_t max_vertex = 0u;
-    static std::vector<std::uint32_t> indices;
+    static ScratchVector<std::uint32_t> indices;
     indices.resize(count);
     // Flat shading needs per-triangle colours, so it copies vertices.
     const bool flat = (cmd(0x50u) & 1u) == 0u && (cmd(0xD3u) & 1u) == 0u;
@@ -2109,9 +2123,15 @@ void *gl_thread_entry(void *) {
 void submit_frame() {
     std::unique_lock lock(g_gl.mutex);
     g_gl.cv.wait(lock, [] { return g_gl.frames.size() < 2u; });
+    // The next frame starts with the room this one needed, so recording it
+    // does not regrow (and copy) its buffers from nothing.
+    const std::size_t ops = g_frame.ops.size(), data = g_frame.data.size();
     g_gl.frames.push_back(std::move(g_frame));
     g_frame = Frame{};
     g_gl.cv.notify_all();
+    lock.unlock();
+    g_frame.ops.reserve(ops + ops / 4u);
+    g_frame.data.reserve(data + data / 4u);
 }
 
 } // namespace
@@ -2157,9 +2177,20 @@ void finish() {
     g_gl.cv.wait(lock, [] { return g_gl.frames.empty() && !g_gl.busy; });
 }
 
+// Commands that act even when they repeat the register's current word.
+constexpr std::array<bool, 256> kActsWhenRepeated = [] {
+    std::array<bool, 256> acts{};
+    for (const std::uint32_t op : {0x01u, 0x02u, 0x04u, 0x0Cu, 0x2Au, 0x2Bu, 0x3Au, 0x3Bu, 0x3Cu, 0x3Du, 0x3Eu, 0x3Fu,
+                                   0x40u, 0x41u, 0xC4u, 0xEAu})
+        acts[op] = true;
+    return acts;
+}();
+
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset) {
-    g_memory = &memory;
     const std::uint32_t op = word >> 24u;
+    // Most of a list re-sends state that is already set: nothing to do.
+    if (g_commands[op] == word && !kActsWhenRepeated[op]) return;
+    g_memory = &memory;
     const std::uint32_t data = word & 0x00FFFFFFu;
     // Matrix uploads only end the batch when they change an element: games
     // often reload the matrix that is already there.
@@ -2232,6 +2263,18 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
     case 0x04u: case 0xC4u: break;
     default: return UINT32_MAX;
     }
+    if (op == 0x04u) {
+        // Static vertices drawn in order need no record (see prim_has_record).
+        static std::uint32_t layout_vtype = UINT32_MAX, layout_stride = 0u;
+        if (g_scan.vtype != layout_vtype) {
+            layout_vtype = g_scan.vtype;
+            layout_stride = vertex_layout(g_scan.vtype).stride;
+        }
+        if (((g_scan.vtype >> 11u) & 3u) == 0u && static_vertices(g_scan.vertex_address)) {
+            g_scan.vertex_address += (data & 0xFFFFu) * layout_stride;
+            return UINT32_MAX;
+        }
+    }
     const auto record = static_cast<std::uint32_t>(arena.size());
     SnapshotHeader header;
     arena.resize(arena.size() + sizeof(header));
@@ -2286,6 +2329,25 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
     std::memcpy(&arena[record], &header, sizeof(header));
     emulation_phase = 2u;
     return record;
+}
+
+void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uint32_t count, std::uint32_t base,
+            std::uint32_t offset, const Snapshot &snapshot, const std::uint32_t *records, std::size_t &next_record) {
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t word = words[i];
+        const std::uint32_t op = word >> 24u;
+        if (op == 0xC4u || (op == 0x04u && prim_has_record())) {
+            use_snapshot(&snapshot, records[next_record++]);
+            ge_command(memory, word, base, offset);
+            use_snapshot(nullptr, 0u);
+        } else {
+            ge_command(memory, word, base, offset);
+        }
+    }
+}
+
+bool prim_has_record() noexcept {
+    return ((cmd(0x12u) >> 11u) & 3u) != 0u || !static_vertices(g_vertex_address);
 }
 
 void use_snapshot(const Snapshot *snapshot, std::uint32_t record) {

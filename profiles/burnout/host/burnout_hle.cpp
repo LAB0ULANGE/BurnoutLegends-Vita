@@ -1377,10 +1377,18 @@ void audio_submit(Runtime &r, std::uint32_t channel, std::uint32_t left, std::ui
         audio::submit(channel, reinterpret_cast<const std::int16_t *>(data), ch.samples, !ch.mono, left, right);
 }
 
+// Virtual time one output call of `channel` lasts: the samples' real length,
+// scaled so the game keeps the host queue fed when it runs slower than real
+// time (see audio::pace).
+std::uint64_t audio_duration(std::uint32_t channel) {
+    const double us = static_cast<double>(k.audio[channel].samples) * 1000000.0 / 44100.0;
+    return static_cast<std::uint64_t>(us * (audio::enabled() ? audio::pace(channel) : 1.0));
+}
+
 void audio_block(Runtime &r, AllegrexContext &ctx, std::uint32_t channel) {
     if (channel >= k.audio.size()) { ret(ctx, 0x80260003u); return; }
     auto &ch = k.audio[channel];
-    const std::uint64_t duration = (static_cast<std::uint64_t>(ch.samples) * 1000000u) / 44100u;
+    const std::uint64_t duration = audio_duration(channel);
     const std::uint64_t start = std::max(k.time_us, ch.busy_until);
     ch.busy_until = start + duration;
     if (start <= k.time_us) { ret(ctx, 0u); return; }
@@ -1415,7 +1423,7 @@ void install_audio(Runtime &rt) {
     reg(rt, lib, 0xE2D56B2Du, [](Runtime &r, AllegrexContext &ctx) {  // OutputPanned (non-blocking)
         if (arg(ctx, 0) >= k.audio.size()) { ret(ctx, 0x80260003u); return; }
         auto &ch = k.audio[arg(ctx, 0)];
-        const std::uint64_t duration = (static_cast<std::uint64_t>(ch.samples) * 1000000u) / 44100u;
+        const std::uint64_t duration = audio_duration(arg(ctx, 0));
         if (ch.busy_until > k.time_us + duration) { ret(ctx, kErrorAudioBusy); return; }
         ch.busy_until = std::max(k.time_us, ch.busy_until) + duration;
         audio_submit(r, arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), arg(ctx, 3));

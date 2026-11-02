@@ -111,7 +111,9 @@ target_include_directories(burnout_headless PRIVATE "${BURNOUT_PROFILE_DIR}/host
 if(MSVC)
     # Guest code runs on the host stack only one dispatch deep, but generated
     # units chain natively; keep the same headroom as the VCS profile.
-    target_link_options(burnout_headless PRIVATE /STACK:67108864)
+    target_link_options(burnout_headless PRIVATE /STACK:67108864 /DEBUG)
+    # Symbols for the host code (sampling profiler); generated units unchanged.
+    target_compile_options(burnout_headless PRIVATE /Zi)
 endif()
 
 add_executable(burnout_opcode_census tools/opcode_census.cpp)

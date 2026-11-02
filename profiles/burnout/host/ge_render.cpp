@@ -1,4 +1,7 @@
 #include "ge_render.hpp"
+#if defined(_WIN32)
+#include "sampling_profiler_win.hpp"
+#endif
 
 #if defined(BURNOUT_GE_SOFTWARE)
 #include "framebuffer_capture.hpp"
@@ -261,7 +264,17 @@ void trace_op_costs() {
     gl::trace(line.c_str());
 }
 
+#if defined(_WIN32)
+// PSPRECOMP_BURNOUT_PROFILE_WORKER=path samples the decode thread (PC).
+std::unique_ptr<SamplingProfiler> g_worker_profiler;
+std::atomic<bool> g_worker_profiling{true};
+#endif
+
 void worker_loop() {
+#if defined(_WIN32)
+    if (std::getenv("PSPRECOMP_BURNOUT_PROFILE_WORKER") != nullptr)
+        g_worker_profiler = std::make_unique<SamplingProfiler>(g_worker_profiling);
+#endif
     {
         std::string error;
         const bool ok = gl::initialize(error);
@@ -292,17 +305,7 @@ void worker_loop() {
             for (const auto &c : job.commands) {
                 if (c[2] == kRun) {
                     const std::uint32_t *words = job.words.data() + c[0];
-                    const std::uint32_t base = words[-2], offset = words[-1];
-                    for (std::uint32_t i = 0; i < c[1]; ++i) {
-                        const std::uint32_t op = words[i] >> 24u;
-                        if (op == 0x04u || op == 0xC4u) {
-                            gl::use_snapshot(&job.snapshot, job.records[next_record++]);
-                            gl::ge_command(*g_memory, words[i], base, offset);
-                            gl::use_snapshot(nullptr, 0u);
-                        } else {
-                            gl::ge_command(*g_memory, words[i], base, offset);
-                        }
-                    }
+                    gl::ge_run(*g_memory, words, c[1], words[-2], words[-1], job.snapshot, job.records.data(), next_record);
                     continue;
                 }
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
@@ -506,6 +509,12 @@ void account_scan(double ms) noexcept { g_scan_ms += ms; }
 
 void finish() {
     if (g_options.enabled && g_options.backend == Backend::OpenGL) drain_worker();
+#if defined(_WIN32)
+    if (g_worker_profiler) {
+        g_worker_profiling = false;
+        g_worker_profiler->write_report(std::getenv("PSPRECOMP_BURNOUT_PROFILE_WORKER"));
+    }
+#endif
 }
 
 namespace {
@@ -563,8 +572,8 @@ void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std:
         g_pending_words.push_back(base);
         g_pending_words.push_back(offset);
         const auto at = static_cast<std::uint32_t>(g_pending_words.size());
-        g_pending_words.resize(at + (end - start));
-        std::memcpy(g_pending_words.data() + at, words + start * 4u, (end - start) * 4u);
+        const auto *first = reinterpret_cast<const std::uint32_t *>(words) + start;  // guest words are 4-byte aligned
+        g_pending_words.insert(g_pending_words.end(), first, first + (end - start));
         g_pending.push_back({at, end - start, kRun});
     };
     for (std::uint32_t i = 0; i < count; ++i) {

@@ -21,7 +21,8 @@ namespace {
 constexpr std::uint32_t kChannels = 8u;
 constexpr std::uint32_t kGrain = 512u;               // frames per host output call
 constexpr std::uint32_t kCapacity = 16384u;          // frames per channel FIFO (~370 ms)
-constexpr std::uint32_t kPrebuffer = 4096u;          // frames queued before a channel plays (~90 ms)
+constexpr std::uint32_t kPrebuffer = 2048u;          // frames queued before a channel plays (~45 ms)
+constexpr std::uint32_t kTarget = 6144u;             // queue the pacing aims for (~140 ms)
 
 struct Fifo {
     std::vector<std::int16_t> samples = std::vector<std::int16_t>(kCapacity * 2u);
@@ -42,6 +43,8 @@ volatile bool g_stop{};
 
 void *output_thread(void *core_mask) {
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), static_cast<int>(reinterpret_cast<std::uintptr_t>(core_mask)));
+    // Above the GL thread sharing the core: a late output call is a click.
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 64);
     std::array<std::int16_t, kGrain * 2u> out{};
     std::array<std::int32_t, kGrain * 2u> mix{};
     while (!g_stop) {
@@ -159,6 +162,13 @@ void submit(std::uint32_t channel, const std::int16_t *samples, std::uint32_t fr
         fifo.samples[at * 2u + 1u] = scale(samples[stereo ? i * 2u + 1u : i], right);
         ++fifo.count;
     }
+}
+
+double pace(std::uint32_t channel) {
+    if (!g_enabled || !g_dump_dir.empty() || channel >= kChannels) return 1.0;
+    std::lock_guard lock(g_mutex);
+    const double fill = static_cast<double>(g_fifos[channel].count) / static_cast<double>(kTarget);
+    return std::clamp(fill, 0.25, 1.5);
 }
 
 Counters counters() {
