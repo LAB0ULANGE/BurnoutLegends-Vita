@@ -242,9 +242,10 @@ std::array<std::atomic<std::uint32_t>, 16> g_phase_samples{};
 std::array<std::atomic<std::uint32_t>, 16> g_emulation_samples{};
 
 void sample_phases() {
-    for (;;) {
+    for (std::uint32_t tick = 1u;; ++tick) {
         ++g_phase_samples[gl::phase & 15u];
         ++g_emulation_samples[gl::emulation_phase & 15u];
+        if (tick % 250u == 0u) gl::flush_traces();
         host_sleep_ms(1.0);  // shares a core with the GL thread: keep the wakeups rare
     }
 }

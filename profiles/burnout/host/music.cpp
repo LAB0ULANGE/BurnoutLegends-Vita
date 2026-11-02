@@ -14,6 +14,7 @@ namespace {
 constexpr std::uint32_t kHeaderBytes = 36u;
 constexpr std::uint32_t kBlockSamples = 2048u;
 constexpr std::uint32_t kBlockBytes = 8u + kBlockSamples;  // states, then 1024 bytes per channel
+constexpr std::uint32_t kWindowBlocks = 32u;
 
 struct Header {
     std::uint32_t riff_size{}, total{}, start{}, loop_start{}, loop_end{}, block_samples{}, blocks{};
@@ -25,6 +26,10 @@ struct Track {
     std::uint32_t position{};                  // next sample
     std::uint32_t cached_block{UINT32_MAX};
     std::array<std::int16_t, kBlockSamples * 2u> samples{};  // decoded cached block, interleaved
+    // Raw blocks read ahead in one go: the emulation thread reads the memory
+    // card about once a second instead of twenty times.
+    std::vector<std::uint8_t> window;
+    std::uint32_t window_first{UINT32_MAX}, window_blocks{};
 };
 
 std::map<std::uint32_t, std::string> g_paths;  // by RIFF size
@@ -60,10 +65,17 @@ void decode_channel(const std::uint8_t *codes, std::int32_t predictor, std::int3
 
 bool load_block(Track &t, std::uint32_t block) {
     if (t.cached_block == block) return true;
-    std::array<std::uint8_t, kBlockBytes> raw{};
-    if (block >= t.header.blocks || std::fseek(t.file, static_cast<long>(kHeaderBytes + block * kBlockBytes), SEEK_SET) != 0 ||
-        std::fread(raw.data(), 1u, raw.size(), t.file) != raw.size())
-        return false;
+    if (block >= t.header.blocks) return false;
+    if (block < t.window_first || block >= t.window_first + t.window_blocks) {
+        const std::uint32_t count = std::min(kWindowBlocks, t.header.blocks - block);
+        t.window.resize(static_cast<std::size_t>(count) * kBlockBytes);
+        if (std::fseek(t.file, static_cast<long>(kHeaderBytes + block * kBlockBytes), SEEK_SET) != 0 ||
+            std::fread(t.window.data(), 1u, t.window.size(), t.file) != t.window.size())
+            return false;
+        t.window_first = block;
+        t.window_blocks = count;
+    }
+    const std::uint8_t *raw = t.window.data() + static_cast<std::size_t>(block - t.window_first) * kBlockBytes;
     const auto state = [&](std::uint32_t at, std::int32_t &predictor, std::int32_t &index) {
         predictor = static_cast<std::int16_t>(raw[at] | (raw[at + 1u] << 8u));
         index = std::min<std::int32_t>(raw[at + 2u], 88);
@@ -71,8 +83,8 @@ bool load_block(Track &t, std::uint32_t block) {
     std::int32_t pl, il, pr, ir;
     state(0u, pl, il);
     state(4u, pr, ir);
-    decode_channel(raw.data() + 8u, pl, il, t.samples.data());
-    decode_channel(raw.data() + 8u + kBlockSamples / 2u, pr, ir, t.samples.data() + 1);
+    decode_channel(raw + 8u, pl, il, t.samples.data());
+    decode_channel(raw + 8u + kBlockSamples / 2u, pr, ir, t.samples.data() + 1);
     t.cached_block = block;
     return true;
 }

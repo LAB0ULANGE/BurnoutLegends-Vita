@@ -2138,8 +2138,34 @@ void submit_frame() {
 
 } // namespace
 
+namespace {
+SyncMutex g_trace_mutex{"gl_trace"};
+std::string g_trace_queue;
+bool g_trace_queued{};  // set once the renderer is up (until then a hang must leave its trace)
+} // namespace
+
 void trace(const char *message) {
+#if defined(__vita__)
+    if (g_trace_queued) {
+        std::lock_guard lock(g_trace_mutex);
+        g_trace_queue += "[gl] ";
+        g_trace_queue += message;
+        g_trace_queue += '\n';
+        return;
+    }
+#endif
     std::fprintf(stderr, "[gl] %s\n", message);
+    std::fflush(stderr);
+}
+
+void flush_traces() {
+    std::string lines;
+    {
+        std::lock_guard lock(g_trace_mutex);
+        lines.swap(g_trace_queue);
+    }
+    if (lines.empty()) return;
+    std::fwrite(lines.data(), 1u, lines.size(), stderr);
     std::fflush(stderr);
 }
 
@@ -2169,14 +2195,18 @@ bool initialize(std::string &error) {
         return false;
     }
     trace("ready");
+    g_trace_queued = true;
     g_commands.fill(0u);
     return true;
 }
 
 void finish() {
     if (!g_frame.ops.empty()) submit_frame();
-    std::unique_lock lock(g_gl.mutex);
-    g_gl.cv.wait(lock, [] { return g_gl.frames.empty() && !g_gl.busy; });
+    {
+        std::unique_lock lock(g_gl.mutex);
+        g_gl.cv.wait(lock, [] { return g_gl.frames.empty() && !g_gl.busy; });
+    }
+    flush_traces();
 }
 
 // Commands that act even when they repeat the register's current word.

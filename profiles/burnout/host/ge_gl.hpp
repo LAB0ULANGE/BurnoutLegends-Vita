@@ -38,6 +38,9 @@ extern volatile std::uint32_t emulation_phase;
 extern double io_read_ms, io_read_max_ms;
 // One line in the log, flushed at once (bring-up on the Vita).
 void trace(const char *message);
+// Once the renderer runs, Vita traces are queued and written here (by the
+// phase sampler), so no frame waits on the memory card.
+void flush_traces();
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset);
 
