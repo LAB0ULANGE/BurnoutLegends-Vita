@@ -76,8 +76,15 @@ if(VITA)
     if(BURNOUT_VITA_GL)
         add_executable(burnout_vita_gl host/main_vita.cpp host/boot_menu_vita.cpp host/ge_render.cpp host/ge_gl.cpp
             host/gl_context_vita.cpp ${BURNOUT_HOST_SOURCES})
+        # A second build (other generated-code flags) installs next to this
+        # one under its own title ID; the label shows on the launch screen.
+        set(BURNOUT_VITA_GL_TITLE_ID "BRNG00001" CACHE STRING "Title ID of the rendering VPK")
+        set(BURNOUT_VITA_GL_NAME "Burnout recomp GL" CACHE STRING "LiveArea name of the rendering VPK")
+        set(BURNOUT_VITA_GL_LABEL "" CACHE STRING "Build label on the launch screen (empty: none)")
+        set(BURNOUT_VITA_GL_FILES "burnout-gl" CACHE STRING "Report and log names under ux0:data/")
         target_compile_definitions(burnout_vita_gl PRIVATE
-            BURNOUT_GENERATED_OPT="-O${PSPRECOMP_GENERATED_OPT_LEVEL}" BURNOUT_GE_RENDER=1 BURNOUT_VITA_GL=1)
+            BURNOUT_GENERATED_OPT="-O${PSPRECOMP_GENERATED_OPT_LEVEL}" BURNOUT_GE_RENDER=1 BURNOUT_VITA_GL=1
+            BURNOUT_VITA_LABEL="${BURNOUT_VITA_GL_LABEL}" BURNOUT_VITA_FILES="${BURNOUT_VITA_GL_FILES}")
         target_include_directories(burnout_vita_gl PRIVATE "${BURNOUT_PROFILE_DIR}/host")
         target_link_libraries(burnout_vita_gl PRIVATE burnout_generated
             vitaGL vitashark SceShaccCgExt mathneon taihen_stub SceShaccCg_stub SceKernelDmacMgr_stub
@@ -85,9 +92,9 @@ if(VITA)
             SceCtrl_stub SceSysmem_stub ScePower_stub SceKernelThreadMgr_stub SceProcessmgr_stub
             SceLibKernel_stub SceAudio_stub pthread m)
         vita_create_self(eboot_gl.bin burnout_vita_gl UNSAFE)
-        vita_create_vpk(burnout-gl.vpk BRNG00001 eboot_gl.bin
+        vita_create_vpk(burnout-gl.vpk ${BURNOUT_VITA_GL_TITLE_ID} eboot_gl.bin
             VERSION 01.00
-            NAME "Burnout recomp GL")
+            NAME "${BURNOUT_VITA_GL_NAME}")
     endif()
     return()
 endif()

@@ -46,14 +46,6 @@ public:
         pixels_ = static_cast<std::uint32_t *>(base);
         return true;
     }
-    void close() {
-        if (block_ < 0) return;
-        sceDisplaySetFrameBuf(nullptr, SCE_DISPLAY_SETBUF_NEXTFRAME);
-        sceDisplayWaitVblankStart();
-        sceKernelFreeMemBlock(block_);
-        block_ = -1;
-        pixels_ = nullptr;
-    }
     void clear() {
         for (int i = 0; i < kWidth * kHeight; ++i) pixels_[i] = kBackground;
     }
@@ -223,9 +215,9 @@ Settings run(const std::string &root, const std::string &build) {
     screen.clear();
     screen.text(32, 220, "Chargement...", kAccent, 4);
     screen.show();
+    // The block stays allocated: the display shows it until vitaGL sets its
+    // own frame buffers (2 MiB of CDRAM).
     sceDisplayWaitVblankStart();
-    sceDisplayWaitVblankStart();
-    screen.close();
     return settings;
 }
 

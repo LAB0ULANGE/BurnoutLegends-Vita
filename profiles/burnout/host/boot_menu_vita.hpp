@@ -21,7 +21,7 @@ struct Settings {
 void save(const std::string &root, const Settings &settings);
 
 // Shows the menu on a plain framebuffer until the player starts the game.
-// Must run before the renderer takes the display; releases its framebuffer.
+// Must run before the renderer takes the display (its frame buffer stays).
 [[nodiscard]] Settings run(const std::string &root, const std::string &build);
 
 } // namespace burnout::boot_menu

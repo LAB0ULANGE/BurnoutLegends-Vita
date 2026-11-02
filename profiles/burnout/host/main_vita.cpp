@@ -63,8 +63,8 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
 constexpr const char *kBuild = "gl-42";
-constexpr const char *kReport = "ux0:data/burnout-gl.txt";
-constexpr const char *kLog = "ux0:data/burnout-gl.log";
+constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
+constexpr const char *kLog = "ux0:data/" BURNOUT_VITA_FILES ".log";
 burnout::boot_menu::Settings g_settings;
 #else
 constexpr const char *kReport = "ux0:data/burnout-bench.txt";
@@ -223,7 +223,9 @@ int main() {
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     show_status(0xFF804000u);  // blue: running
 #if defined(BURNOUT_VITA_GL)
-    g_settings = burnout::boot_menu::run(kRoot, kBuild);
+    const std::string label = std::string(BURNOUT_VITA_LABEL).empty() ? std::string(kBuild)
+                                                                      : std::string(kBuild) + " " + BURNOUT_VITA_LABEL;
+    g_settings = burnout::boot_menu::run(kRoot, label);
     std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, async GE %d, shader cache %d, cached GPU memory %d\n",
                  kBuild, g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale,
                  g_settings.sound ? 1 : 0, g_settings.frame_skip ? 1 : 0, g_settings.async_ge ? 1 : 0,
