@@ -527,6 +527,8 @@ void configure(const Options &options) {
 #endif
     if (g_options.enabled && g_options.backend == Backend::OpenGL) {
         gl::set_render_scale(g_options.render_scale);
+        gl::set_shader_cache(g_options.shader_cache_dir.string());
+        gl::set_cached_memory(g_options.cached_gpu_memory);
         start_worker();
         std::unique_lock lock(g_jobs_mutex);
         g_jobs_cv.wait(lock, [] { return g_worker_ready; });

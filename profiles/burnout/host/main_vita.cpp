@@ -9,14 +9,17 @@
 // solid status colour: blue running, green done, red error.
 #include "audio_out.hpp"
 #include "music.hpp"
+#include "sas_worker.hpp"
 #include "burnout_run.hpp"
 #if defined(BURNOUT_VITA_GL)
+#include "boot_menu_vita.hpp"
 #include "ge_render.hpp"
 
 #include <psp2/ctrl.h>
 #endif
 
 #include <psp2/display.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/cpu.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
@@ -25,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -44,7 +48,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x768] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x1074] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -58,8 +62,10 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
+constexpr const char *kBuild = "gl-42";
 constexpr const char *kReport = "ux0:data/burnout-gl.txt";
 constexpr const char *kLog = "ux0:data/burnout-gl.log";
+burnout::boot_menu::Settings g_settings;
 #else
 constexpr const char *kReport = "ux0:data/burnout-bench.txt";
 constexpr const char *kLog = "ux0:data/burnout-bench.log";
@@ -147,7 +153,7 @@ void append_report(const std::string &text) {
     out << text;
 }
 
-std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
+std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed) {
     const int arm_set = scePowerSetArmClockFrequency(arm_mhz);
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
@@ -161,14 +167,12 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
     options.script = script;
     options.max_vblanks = 9000u;
 #if defined(BURNOUT_VITA_GL)
-    options.max_vblanks = 60u * 60u * 30u;
+    // The scripted test race stops after 30 minutes; free play never does.
+    options.max_vblanks = timed ? 60u * 60u * 30u : UINT64_MAX;
     options.realtime = true;
-    // ux0:data/burnout/async_ge.txt walks the display lists on another core
-    // (no faster: the game waits for the GE right after submitting).
-    if (std::FILE *flag = std::fopen((root + "async_ge.txt").c_str(), "r")) {
-        std::fclose(flag);
-        options.async_ge = true;
-    }
+    // Walks the display lists on another core (no faster: the game waits for
+    // the GE right after submitting).
+    options.async_ge = g_settings.async_ge;
     options.live_buttons = [] {
         SceCtrlData pad{};
         sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -185,6 +189,7 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
         return (pad.buttons & (SCE_CTRL_START | SCE_CTRL_SELECT)) == (SCE_CTRL_START | SCE_CTRL_SELECT);
     };
 #else
+    (void)timed;
     options.hash_trace = "ux0:data/burnout-hashes.txt";
 #endif
 #if defined(BURNOUT_VITA_PROFILE)
@@ -209,9 +214,24 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script) {
 } // namespace
 
 int main() {
+#if defined(BURNOUT_VITA_GL)
+    // Keep the previous session's log next to the new one.
+    std::remove((std::string(kLog) + ".prev").c_str());
+    std::rename(kLog, (std::string(kLog) + ".prev").c_str());
+#endif
     std::freopen(kLog, "w", stderr);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     show_status(0xFF804000u);  // blue: running
+#if defined(BURNOUT_VITA_GL)
+    g_settings = burnout::boot_menu::run(kRoot, kBuild);
+    std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, async GE %d, shader cache %d, cached GPU memory %d\n",
+                 kBuild, g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale,
+                 g_settings.sound ? 1 : 0, g_settings.frame_skip ? 1 : 0, g_settings.async_ge ? 1 : 0,
+                 g_settings.shader_cache ? 1 : 0, g_settings.cached_gpu_memory ? 1 : 0);
+    const bool scripted = g_settings.auto_race;
+#else
+    const bool scripted = true;
+#endif
     const SceUID awake = sceKernelCreateThread("keep_awake", keep_awake, 0x10000100, 0x1000, 0, 0, nullptr);
     if (awake >= 0) sceKernelStartThread(awake, 0, nullptr);
 
@@ -234,7 +254,9 @@ int main() {
     }
     try {
         burnout::InputScript script;
-        if (std::FILE *custom = std::fopen((std::string(kRoot) + "race.txt").c_str(), "r")) {
+        if (!scripted) {
+            // Free play: the player goes through the menus.
+        } else if (std::FILE *custom = std::fopen((std::string(kRoot) + "race.txt").c_str(), "r")) {
             std::fclose(custom);
             script.load(std::string(kRoot) + "race.txt");
         } else {
@@ -246,37 +268,40 @@ int main() {
         burnout::render::Options render;
         render.enabled = true;
         render.backend = burnout::render::Backend::OpenGL;
-        render.capture_vblanks = {2101u, 3001u};
-        render.capture_dir = "ux0:data/burnout-frames";
-        render.frame_skip = true;
-        // 960x544 (the Vita screen) by default; ux0:data/burnout/render_scale.txt
-        // holding 1 renders at the PSP's 480x272.
-        render.render_scale = 2;
-        if (std::FILE *scale = std::fopen((std::string(kRoot) + "render_scale.txt").c_str(), "r")) {
-            int value = 2;
-            if (std::fscanf(scale, "%d", &value) == 1) render.render_scale = value;
-            std::fclose(scale);
+        if (scripted) {
+            render.capture_vblanks = {2101u, 3001u};
+            render.capture_dir = "ux0:data/burnout-frames";
         }
+        render.frame_skip = g_settings.frame_skip;
+        render.render_scale = g_settings.render_scale;  // 2 = 960x544, 1 = 480x272
+        if (g_settings.shader_cache) {
+            const std::string cache = std::string(kRoot) + "shader_cache";
+            sceIoMkdir(cache.c_str(), 0777);
+            render.shader_cache_dir = cache;
+        }
+        render.cached_gpu_memory = g_settings.cached_gpu_memory;
         std::fprintf(stderr, "[vita] render scale %d\n", render.render_scale);
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::render::configure(render);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
         // Sound: the SAS voices and audio channels to a BGM port, mixed on
-        // core 2 next to the GL thread. ux0:data/burnout/no_sound.txt turns it off.
-        if (std::FILE *off = std::fopen((std::string(kRoot) + "no_sound.txt").c_str(), "r")) {
-            std::fclose(off);
+        // core 2 next to the GL thread.
+        if (!g_settings.sound) {
             std::fprintf(stderr, "[vita] sound off\n");
         } else {
             std::string sound_error;
             if (burnout::audio::start(2, {}, sound_error)) {
                 // Music: the tracks converted by tools/convert_music.py.
                 const int tracks = burnout::music::set_dir(std::string(kRoot) + "music_ima");
+                // SAS mixing next to it, overlapping the game.
+                const bool mixer = burnout::sas_worker::start(2);
+                std::fprintf(stderr, "[vita] SAS mixer thread %s\n", mixer ? "on core 2" : "unavailable");
                 std::fprintf(stderr, "[vita] sound on, %d music tracks\n", tracks);
             } else std::fprintf(stderr, "[vita] sound unavailable: %s\n", sound_error.c_str());
         }
 #endif
-        const std::string report = run_pass(444, script);
+        const std::string report = run_pass(444, script, scripted);
         append_report(report);
 #if defined(BURNOUT_VITA_GL)
         if (burnout::audio::enabled()) {

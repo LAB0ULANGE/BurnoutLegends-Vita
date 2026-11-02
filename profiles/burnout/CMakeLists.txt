@@ -47,6 +47,7 @@ set(BURNOUT_HOST_SOURCES
     host/workload_stats.cpp
     host/audio_out.cpp
     host/sas_core.cpp
+    host/sas_worker.cpp
     host/music.cpp)
 
 if(VITA)
@@ -73,7 +74,7 @@ if(VITA)
     # real pad and real-time pacing. Separate title so the bench stays intact.
     option(BURNOUT_VITA_GL "Also build the vitaGL rendering VPK" ON)
     if(BURNOUT_VITA_GL)
-        add_executable(burnout_vita_gl host/main_vita.cpp host/ge_render.cpp host/ge_gl.cpp
+        add_executable(burnout_vita_gl host/main_vita.cpp host/boot_menu_vita.cpp host/ge_render.cpp host/ge_gl.cpp
             host/gl_context_vita.cpp ${BURNOUT_HOST_SOURCES})
         target_compile_definitions(burnout_vita_gl PRIVATE
             BURNOUT_GENERATED_OPT="-O${PSPRECOMP_GENERATED_OPT_LEVEL}" BURNOUT_GE_RENDER=1 BURNOUT_VITA_GL=1)

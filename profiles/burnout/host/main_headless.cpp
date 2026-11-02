@@ -4,6 +4,7 @@
 // software rasterizer and --capture writes PNG frames.
 #include "audio_out.hpp"
 #include "music.hpp"
+#include "sas_worker.hpp"
 #include "burnout_run.hpp"
 #include "ge_render.hpp"
 
@@ -76,6 +77,7 @@ Cli parse(int argc, char **argv) {
         else if (key == "--capture-dir") cli.render.capture_dir = value();
         else if (key == "--frame-skip") cli.render.frame_skip = true;  // as on the Vita
         else if (key == "--async-ge") o.async_ge = true;  // display lists on another thread, as on the Vita
+        else if (key == "--sas-thread") burnout::sas_worker::start(0);  // SAS mixing on its own thread, as on the Vita
         else if (key == "--music-dir") {  // converted tracks (tools/convert_music.py)
             std::cerr << "music tracks: " << burnout::music::set_dir(value()) << "\n";
         }

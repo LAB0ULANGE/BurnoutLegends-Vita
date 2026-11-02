@@ -1,6 +1,7 @@
 #include "burnout_run.hpp"
 
 #include "burnout_hle.hpp"
+#include "sas_worker.hpp"
 #include "workload_stats.hpp"
 #if defined(BURNOUT_GE_RENDER)
 #include "ge_render.hpp"
@@ -106,6 +107,8 @@ BenchResult run_benchmark(const BenchOptions &options) {
         }
     };
     const double started = host_now_ms();
+    double pace_start = started;
+    std::uint64_t pace_vblank = 0u;
     observer.on_vblank = [&](std::uint64_t vblank) {
         if (options.measuring != nullptr) options.measuring->store(clock.window_open(vblank), std::memory_order_relaxed);
         if (vblank % 600u == 0u) {
@@ -114,9 +117,16 @@ BenchResult run_benchmark(const BenchOptions &options) {
                       << (clock.window_open(vblank) ? " [measuring]" : "") << std::endl;
         }
         if (options.realtime) {
-            // 59.94 Hz: wait while the guest is ahead of the wall clock.
-            const double due = started + static_cast<double>(vblank) * 1001.0 / 60.0;
-            for (double now = host_now_ms(); now < due; now = host_now_ms()) host_sleep_ms(due - now);
+            // 59.94 Hz: wait while the guest is ahead of the wall clock. A guest
+            // more than half a second late (slow frames, the console suspended)
+            // restarts from now, so it never runs flat out to catch up.
+            const double due = pace_start + static_cast<double>(vblank - pace_vblank) * 1001.0 / 60.0;
+            double now = host_now_ms();
+            if (now - due > 500.0) {
+                pace_start = now;
+                pace_vblank = vblank;
+            }
+            for (; now < due; now = host_now_ms()) host_sleep_ms(due - now);
         }
         if (options.quit_requested && options.quit_requested()) runtime.stop("quit requested");
         else if (!options.realtime && clock.window_done(vblank)) runtime.stop("benchmark window complete");
@@ -147,6 +157,7 @@ BenchResult run_benchmark(const BenchOptions &options) {
               << psprecomp::hex32(static_cast<std::uint32_t>(image_end)) << std::endl;
     if (options.async_ge && ge_front_start(runtime)) std::cerr << "[bench] display lists walked on another core" << std::endl;
     runtime.run(elf.runtime_entry(), UINT64_MAX);
+    sas_worker::drain();
 #if defined(BURNOUT_GE_RENDER)
     ge_front_drain();
     render::finish();

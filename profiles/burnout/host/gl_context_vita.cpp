@@ -26,6 +26,11 @@ bool create_context(std::string &error) {
                   info.size_user / 1024, info.size_cdram / 1024, info.size_phycont / 1024, ram / 1024, cdram / 1024,
                   phycont / 1024);
     trace(detail);
+    if (cached_memory()) {
+        // CPU writes to the pools (vertex and index uploads) go through the cache.
+        vglUseCachedMem(GL_TRUE);
+        trace("vitaGL pools in cached memory");
+    }
     // The result only says whether the resolution had to fall back (GL_TRUE);
     // vitaGL has no failure return here.
     if (vglInitWithCustomSizes(0, 960, 544, ram, cdram, phycont, 0, SCE_GXM_MULTISAMPLE_NONE))

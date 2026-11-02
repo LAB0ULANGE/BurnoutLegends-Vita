@@ -22,6 +22,11 @@ namespace burnout::gl {
 bool initialize(std::string &error);
 // Internal resolution as a multiple of the PSP's 480x272 (before initialize).
 void set_render_scale(int scale);
+// Vita, before initialize: where compiled programs are kept (empty: none),
+// and whether vitaGL's pools use cached memory.
+void set_shader_cache(const std::string &directory);
+void set_cached_memory(bool cached);
+[[nodiscard]] bool cached_memory() noexcept;
 // Waits until the GL thread has replayed everything recorded so far.
 void finish();
 

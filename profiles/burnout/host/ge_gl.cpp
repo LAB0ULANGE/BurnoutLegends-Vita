@@ -593,22 +593,19 @@ GLuint compile(GLenum type, const std::string &defines, const char *source, std:
     return shader;
 }
 
-bool link(Program &program, const char *vertex, const char *fragment, bool present, std::string &error,
-          const std::string &defines = {}) {
-    const GLuint vs = compile(GL_VERTEX_SHADER, defines, vertex, error);
-    if (vs == 0u) return false;
-    const GLuint fs = compile(GL_FRAGMENT_SHADER, defines, fragment, error);
-    if (fs == 0u) return false;
-    program.id = glCreateProgram();
-    glAttachShader(program.id, vs);
-    glAttachShader(program.id, fs);
-    glBindAttribLocation(program.id, 0, "a_position");
-    glBindAttribLocation(program.id, 1, "a_texcoord");
+std::string g_shader_cache;  // directory, empty: no cache
+bool g_cached_memory{};
+
+void bind_attributes(GLuint id, bool present) {
+    glBindAttribLocation(id, 0, "a_position");
+    glBindAttribLocation(id, 1, "a_texcoord");
     if (!present) {
-        glBindAttribLocation(program.id, 2, "a_color");
-        glBindAttribLocation(program.id, 3, "a_normal");
+        glBindAttribLocation(id, 2, "a_color");
+        glBindAttribLocation(id, 3, "a_normal");
     }
-    glLinkProgram(program.id);
+}
+
+bool find_uniforms(Program &program, bool present, std::string &error) {
     GLint ok = 0;
     glGetProgramiv(program.id, GL_LINK_STATUS, &ok);
     if (!ok) {
@@ -621,6 +618,78 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
     program.texture = u("u_texture");
     if (present) return true;
     for (int i = 0; i < kSlotCount; ++i) program.slots[i] = u(kSlotNames[i]);
+    return true;
+}
+
+#if defined(__vita__)
+// Program binaries (vitaGL's glGetProgramBinary format) named by a hash of
+// the sources and defines, so a changed shader never loads a stale one.
+// vitaGL does not bound the copy, hence the large buffer.
+constexpr std::size_t kProgramBinaryMax = 1u << 20u;
+
+std::string cache_path(const char *vertex, const char *fragment, const std::string &defines) {
+    std::uint64_t hash = 0xCBF29CE484222325ull;
+    for (const std::string &part : {std::string(vertex), std::string(fragment), defines})
+        for (const char c : part) hash = (hash ^ static_cast<std::uint8_t>(c)) * 0x100000001B3ull;
+    char name[32];
+    std::snprintf(name, sizeof(name), "/%016llx.bin", static_cast<unsigned long long>(hash));
+    return g_shader_cache + name;
+}
+
+bool load_cached(Program &program, const std::string &path, bool present) {
+    std::FILE *file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+    std::vector<std::uint8_t> binary;
+    std::uint8_t chunk[16384];
+    for (std::size_t n; (n = std::fread(chunk, 1, sizeof(chunk), file)) > 0u;) binary.insert(binary.end(), chunk, chunk + n);
+    std::fclose(file);
+    if (binary.size() < 64u) return false;
+    program.id = glCreateProgram();
+    bind_attributes(program.id, present);
+    glProgramBinary(program.id, 0, binary.data(), static_cast<GLsizei>(binary.size()));
+    std::string error;
+    if (find_uniforms(program, present, error)) return true;
+    trace(("cached program unusable, compiling it again: " + error).c_str());
+    glDeleteProgram(program.id);
+    program = {};
+    std::remove(path.c_str());
+    return false;
+}
+
+void store_cached(const Program &program, const std::string &path) {
+    static std::vector<std::uint8_t> binary(kProgramBinaryMax);
+    GLsizei length = 0;
+    GLenum format = 0;
+    glGetProgramBinary(program.id, static_cast<GLsizei>(binary.size()), &length, &format, binary.data());
+    if (length <= 0 || static_cast<std::size_t>(length) > binary.size()) return;
+    const std::string partial = path + ".part";
+    std::FILE *file = std::fopen(partial.c_str(), "wb");
+    if (file == nullptr) return;
+    const bool written = std::fwrite(binary.data(), 1, static_cast<std::size_t>(length), file) == static_cast<std::size_t>(length);
+    if (std::fclose(file) == 0 && written) std::rename(partial.c_str(), path.c_str());
+    else std::remove(partial.c_str());
+}
+#endif
+
+bool link(Program &program, const char *vertex, const char *fragment, bool present, std::string &error,
+          const std::string &defines = {}) {
+#if defined(__vita__)
+    const std::string cached = g_shader_cache.empty() ? std::string() : cache_path(vertex, fragment, defines);
+    if (!cached.empty() && load_cached(program, cached, present)) return true;
+#endif
+    const GLuint vs = compile(GL_VERTEX_SHADER, defines, vertex, error);
+    if (vs == 0u) return false;
+    const GLuint fs = compile(GL_FRAGMENT_SHADER, defines, fragment, error);
+    if (fs == 0u) return false;
+    program.id = glCreateProgram();
+    glAttachShader(program.id, vs);
+    glAttachShader(program.id, fs);
+    bind_attributes(program.id, present);
+    glLinkProgram(program.id);
+    if (!find_uniforms(program, present, error)) return false;
+#if defined(__vita__)
+    if (!cached.empty()) store_cached(program, cached);
+#endif
     return true;
 }
 
@@ -1291,6 +1360,7 @@ struct BatchLayout {
     std::uint32_t tc{}, col{}, nrm{}, pos{}, stride{};
     std::uint32_t tc_size{}, col_size{}, nrm_size{}, pos_size{};  // bytes per component (colour: whole value)
     bool same_as_psp{};
+    bool same_offsets{};  // only the stride differs (padding after the position)
 };
 
 BatchLayout batch_layout(std::uint32_t vtype) {
@@ -1321,8 +1391,10 @@ BatchLayout batch_layout(std::uint32_t vtype) {
         layout.pos = psp.pos;
         layout.stride = psp.stride;
     }
-    layout.same_as_psp = (tc == 0u || psp.tc == layout.tc) && (layout.col_size == 0u || psp.col == layout.col) &&
-                         (nrm == 0u || psp.nrm == layout.nrm) && psp.pos == layout.pos && psp.stride == layout.stride;
+    layout.same_offsets = (tc == 0u || psp.tc == layout.tc) && (layout.col_size == 0u || psp.col == layout.col) &&
+                          (nrm == 0u || psp.nrm == layout.nrm) && psp.pos == layout.pos && psp.stride <= layout.stride &&
+                          (vtype & 0x600u) == 0u;  // no weights in front
+    layout.same_as_psp = layout.same_offsets && psp.stride == layout.stride;
     return layout;
 }
 
@@ -1334,6 +1406,30 @@ void copy_vertex(std::uint8_t *out, const std::uint8_t *in, const BatchLayout &t
 }
 
 BatchLayout g_layout;
+
+// Vertices whose fields already sit at the batch offsets: one fixed-size copy
+// each (the common odd strides get a constant size the compiler inlines).
+template <std::uint32_t N>
+void copy_strided(std::uint8_t *out, std::uint32_t out_stride, const std::uint8_t *in, std::uint32_t count) {
+    for (std::uint32_t i = 0; i < count; ++i, out += out_stride, in += N) std::memcpy(out, in, N);
+}
+
+void copy_vertices(std::uint8_t *out, const std::uint8_t *in, std::uint32_t count, const BatchLayout &to,
+                   const VertexLayout &from) {
+    if (!to.same_offsets) {
+        for (std::uint32_t i = 0; i < count; ++i) copy_vertex(out + i * to.stride, in + i * from.stride, to, from);
+        return;
+    }
+    switch (from.stride) {
+    case 6u: copy_strided<6u>(out, to.stride, in, count); return;
+    case 10u: copy_strided<10u>(out, to.stride, in, count); return;
+    case 14u: copy_strided<14u>(out, to.stride, in, count); return;
+    case 18u: copy_strided<18u>(out, to.stride, in, count); return;
+    case 22u: copy_strided<22u>(out, to.stride, in, count); return;
+    default:
+        for (std::uint32_t i = 0; i < count; ++i) std::memcpy(out + i * to.stride, in + i * from.stride, from.stride);
+    }
+}
 
 // The sun flare's measuring box: the game draws a black quad at the top of the
 // screen (blending off, stencil test on), the sun sprite into it, and reads
@@ -1700,14 +1796,20 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     }
     const BatchLayout &out = g_layout;
     const auto vertex = [&](std::uint32_t i) { return raw + static_cast<std::size_t>(i) * vertex_stride; };
-    // Snapshot vertices already in the batch layout are drawn where they are,
-    // as long as they follow the batch's previous ones.
-    const bool in_place = g_snapshot != nullptr && weights == 0u && out.same_as_psp && !flat && primitive != 6u;
+    // Vertices already in the batch layout, in a snapshot or in static guest
+    // memory, are drawn where they are as long as they follow the batch's
+    // previous ones. A batch that stops following goes on as a copy.
+    const bool placeable = weights == 0u && out.same_as_psp && !flat && primitive != 6u &&
+                           (g_snapshot != nullptr || static_vertices(g_vertex_address));
     const bool follows = g_batch_in_place != nullptr && raw == g_batch_in_place + static_cast<std::size_t>(g_batch_count) * vertex_stride;
-    if (g_batch_count != 0u && (in_place ? !follows : g_batch_in_place != nullptr)) {
-        flush();
-        g_batch_vtype = vtype;
-        g_layout = batch_layout(vtype);
+    const bool in_place = placeable && (g_batch_count == 0u || follows);
+    if (g_batch_in_place != nullptr && !in_place) {
+        const std::uint8_t *placed = g_batch_in_place;
+        const std::uint32_t placed_count = g_batch_count;
+        g_batch_in_place = nullptr;
+        g_batch_count = 0u;
+        g_batch.clear();
+        std::memcpy(append_vertices(placed_count), placed, static_cast<std::size_t>(placed_count) * vertex_stride);
     }
     if (in_place && g_batch_count == 0u) g_batch_in_place = raw;
     const auto base = g_batch_count;
@@ -1728,8 +1830,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     } else if (!flat && primitive != 6u) {
         std::uint8_t *dst = append_vertices(vertex_count);
         if (out.same_as_psp) std::memcpy(dst, raw, static_cast<std::size_t>(vertex_count) * vertex_stride);
-        else
-            for (std::uint32_t i = 0; i < vertex_count; ++i) copy_vertex(dst + i * out.stride, vertex(i), out, layout);
+        else copy_vertices(dst, raw, vertex_count, out, layout);
     }
     const auto emit = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
         if (flat) {
@@ -2285,6 +2386,9 @@ void flush_traces() {
 }
 
 void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
+void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
+void set_cached_memory(bool cached) { g_cached_memory = cached; }
+bool cached_memory() noexcept { return g_cached_memory; }
 
 bool initialize(std::string &error) {
     trace("creating the context");
