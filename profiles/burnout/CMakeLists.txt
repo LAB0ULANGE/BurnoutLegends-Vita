@@ -26,8 +26,13 @@ if(MSVC)
     set_source_files_properties(${BURNOUT_GENERATED} PROPERTIES COMPILE_OPTIONS
         "${BURNOUT_GENERATED_MSVC_OPT};/Ob${BURNOUT_GENERATED_INLINE_LEVEL};/bigobj;${PSPRECOMP_MSVC_MP_FLAG}")
 else()
-    set_source_files_properties(${BURNOUT_GENERATED} PROPERTIES COMPILE_OPTIONS
-        "-O${PSPRECOMP_GENERATED_OPT_LEVEL};-g0")
+    # Extra flags for the generated units only (e.g. relaxed float math).
+    set(BURNOUT_GENERATED_EXTRA_FLAGS "" CACHE STRING "Additional compiler flags for the generated units")
+    set(BURNOUT_GENERATED_GCC_OPTIONS "-O${PSPRECOMP_GENERATED_OPT_LEVEL};-g0")
+    if(BURNOUT_GENERATED_EXTRA_FLAGS)
+        list(APPEND BURNOUT_GENERATED_GCC_OPTIONS ${BURNOUT_GENERATED_EXTRA_FLAGS})
+    endif()
+    set_source_files_properties(${BURNOUT_GENERATED} PROPERTIES COMPILE_OPTIONS "${BURNOUT_GENERATED_GCC_OPTIONS}")
 endif()
 
 add_library(burnout_generated STATIC ${BURNOUT_GENERATED})

@@ -20,6 +20,7 @@
 #include "ge_render.hpp"
 #include "thread_sync.hpp"
 #if defined(__vita__)
+#include <psp2/kernel/cpu.h>
 #include <pthread.h>
 #else
 #include <thread>
@@ -917,6 +918,7 @@ volatile bool g_has_events{};
 std::set<std::int32_t> g_open_lists;     // emulation thread: lists not complete yet
 std::map<std::int32_t, GeList> g_lists;  // front end thread: lists waiting on a stall address
 double g_wait_ms{};                // emulation thread blocked on the front end
+volatile std::uint32_t g_cpu_samples[4]{};  // requests handled per core (Vita)
 
 void handle(Request &request, std::vector<GeEvent> &events) {
     Runtime &rt = *g_runtime;
@@ -945,7 +947,12 @@ void handle(Request &request, std::vector<GeEvent> &events) {
 
 void *thread_main(void *) {
 #if defined(__vita__)
-    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
+    const int changed = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
+    char line[128];
+    std::snprintf(line, sizeof(line), "GE front end started: affinity change 0x%x, mask 0x%x, priority %d, cpu %d",
+                  static_cast<unsigned>(changed), static_cast<unsigned>(sceKernelGetThreadCpuAffinityMask(sceKernelGetThreadId())),
+                  sceKernelGetThreadCurrentPriority(), sceKernelGetCpuId());
+    gl::trace(line);
 #endif
     std::vector<GeEvent> events;
     for (;;) {
@@ -958,6 +965,9 @@ void *thread_main(void *) {
             g_busy = true;
         }
         events.clear();
+#if defined(__vita__)
+        ++g_cpu_samples[sceKernelGetCpuId() & 3];
+#endif
         handle(request, events);
         std::lock_guard lock(g_mutex);
         if (request.kind == Request::Kind::Flip) --g_queued_flips;
@@ -2243,8 +2253,10 @@ std::string thread_time_report(double frames) {
     report += item;
 #if defined(BURNOUT_GE_RENDER)
     if (front::g_enabled) {
-        std::snprintf(item, sizeof(item), "; waited %.1f for the GE front end", front::g_wait_ms / frames);
+        std::snprintf(item, sizeof(item), "; waited %.1f for the GE front end (on cores %u/%u/%u/%u)", front::g_wait_ms / frames,
+                      front::g_cpu_samples[0], front::g_cpu_samples[1], front::g_cpu_samples[2], front::g_cpu_samples[3]);
         report += item;
+        for (auto &count : front::g_cpu_samples) count = 0u;
         front::g_wait_ms = 0.0;
     }
 #endif
