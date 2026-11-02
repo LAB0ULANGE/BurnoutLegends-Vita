@@ -941,6 +941,8 @@ struct BlendShader {
     float alpha{-1.0f};  // >= 0: written as the output alpha
 };
 
+bool is_sun_box_draw(bool textured);  // below, with the batch layout
+
 BlendShader set_blend() {
     BlendShader shader;
     if ((cmd(0x21u) & 1u) == 0u || (cmd(0xD3u) & 1u) != 0u) {
@@ -1152,6 +1154,7 @@ void flush() {
         set_capability(GL_DEPTH_TEST, g_state.depth_test, true);
         set_depth((cmd(0x23u) & 1u) != 0u ? compare(cmd(0xDEu)) : GL_ALWAYS, (cmd(0xE7u) & 1u) == 0u);
         set_color_mask(true, true);
+        if (is_sun_box_draw(textured)) set_color_mask(false, false);
         static const bool no_cull = std::getenv("PSPRECOMP_BURNOUT_NOCULL") != nullptr;
         const bool cull = !no_cull && !through && (cmd(0x1Du) & 1u) != 0u;
         set_capability(GL_CULL_FACE, g_state.cull, cull);
@@ -1331,6 +1334,85 @@ void copy_vertex(std::uint8_t *out, const std::uint8_t *in, const BatchLayout &t
 }
 
 BatchLayout g_layout;
+
+// The sun flare's measuring box: the game draws a black quad at the top of the
+// screen (blending off, stencil test on), the sun sprite into it, and reads
+// the result back from VRAM, which the GL renderer never writes. Left as is it
+// shows as a black square around a second sun; the quad, every through draw
+// covering exactly the same rectangle and every draw sampling the small target
+// the box is copied into are left out (the sky sun stays).
+struct ScreenBox {
+    float x0{}, y0{}, x1{}, y1{};
+    bool valid{};
+};
+ScreenBox g_sun_box;
+std::uint32_t g_sun_copy{UINT32_MAX};  // target key of the box's copy
+
+// Bounding box of a through-mode batch's float texture coordinates.
+bool batch_uv_box(ScreenBox &box) {
+    if ((g_batch_vtype & 0x800000u) == 0u || (g_batch_vtype & 3u) != 3u || g_batch_count == 0u) return false;
+    const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+    box = {1e9f, 1e9f, -1e9f, -1e9f, true};
+    for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+        float uv[2];
+        std::memcpy(uv, vertices + i * g_layout.stride + g_layout.tc, sizeof(uv));
+        box.x0 = std::min(box.x0, uv[0]);
+        box.y0 = std::min(box.y0, uv[1]);
+        box.x1 = std::max(box.x1, uv[0]);
+        box.y1 = std::max(box.y1, uv[1]);
+    }
+    return true;
+}
+
+// Bounding box of a through-mode batch with float positions.
+bool batch_box(ScreenBox &box) {
+    if ((g_batch_vtype & 0x800000u) == 0u || ((g_batch_vtype >> 7u) & 3u) != 3u || g_batch_count == 0u) return false;
+    const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+    box = {1e9f, 1e9f, -1e9f, -1e9f, true};
+    for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+        float xy[2];
+        std::memcpy(xy, vertices + i * g_layout.stride + g_layout.pos, sizeof(xy));
+        box.x0 = std::min(box.x0, xy[0]);
+        box.y0 = std::min(box.y0, xy[1]);
+        box.x1 = std::max(box.x1, xy[0]);
+        box.y1 = std::max(box.y1, xy[1]);
+    }
+    return true;
+}
+
+bool is_sun_box_draw(bool textured) {
+    if (textured && g_sun_box.valid && g_sun_copy != UINT32_MAX &&
+        target_key((cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u)) == g_sun_copy)
+        return true;
+    ScreenBox box;
+    if (g_batch_count > 8u || !batch_box(box)) return false;
+    if (!textured && (cmd(0x21u) & 1u) == 0u && (cmd(0x24u) & 1u) != 0u && box.x1 - box.x0 <= 64.0f &&
+        box.y1 - box.y0 <= 64.0f && g_layout.col_size == 4u) {
+        const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+        for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+            std::uint32_t color;
+            std::memcpy(&color, vertices + i * g_layout.stride + g_layout.col, sizeof(color));
+            if (color != 0u) return false;
+        }
+        g_sun_box = box;
+        return true;
+    }
+    if (!g_sun_box.valid) return false;
+    if (textured) {
+        const std::uint32_t texture = (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u);
+        if (target_key(texture) == g_sun_copy) return true;
+        ScreenBox uv;
+        const auto close_to = [](float a, float b) { return std::abs(a - b) <= 2.0f; };
+        if (target_key(cmd(0x9Cu)) != target_key(texture) && g_targets.count(target_key(texture)) != 0u && batch_uv_box(uv) &&
+            close_to(uv.x0, g_sun_box.x0) && close_to(uv.y0, g_sun_box.y0) && close_to(uv.x1, g_sun_box.x1) && close_to(uv.y1, g_sun_box.y1)) {
+            g_sun_copy = target_key(cmd(0x9Cu));  // the copy itself is harmless
+            return false;
+        }
+    }
+    return g_sun_box.valid && box.x0 == g_sun_box.x0 && box.y0 == g_sun_box.y0 && box.x1 == g_sun_box.x1 &&
+           box.y1 == g_sun_box.y1;
+}
+
 
 std::uint8_t *append_vertices(std::uint32_t count) {
     const std::size_t at = g_batch.size();
@@ -2434,6 +2516,8 @@ void invalidate_textures(std::uint32_t address, std::uint32_t size) {
 }
 
 void present(std::uint32_t address) {
+    g_sun_box.valid = false;
+    g_sun_copy = UINT32_MAX;
     flush();
     phase = 11u;
     ++g_stats.frames;
