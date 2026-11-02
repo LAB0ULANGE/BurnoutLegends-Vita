@@ -412,8 +412,18 @@ Thread *best_ready(std::int32_t *uid_out) {
     return best;
 }
 
+// Interrupt handler time by handler address (thread_time_report).
+struct InterruptTime {
+    double ms{};
+    std::uint32_t count{};
+};
+std::map<std::uint32_t, InterruptTime> g_interrupt_times;
+std::uint32_t g_interrupt_handler{};
+
 void start_interrupt(AllegrexContext &ctx) {
     const PendingInterrupt pending = k.pending_interrupts.front();
+    g_interrupt_handler = pending.handler;
+    ++g_interrupt_times[pending.handler].count;
     k.pending_interrupts.pop_front();
     k.in_interrupt = true;
     ctx.gpr[4] = pending.a0;
@@ -485,7 +495,11 @@ struct Slice {
 } g_slice;
 
 void close_slice() {
-    if (g_slice.uid == kInterruptSlice) g_interrupt_ms += host_now_ms() - g_slice.started;
+    if (g_slice.uid == kInterruptSlice) {
+        const double ms = host_now_ms() - g_slice.started;
+        g_interrupt_ms += ms;
+        g_interrupt_times[g_interrupt_handler].ms += ms;
+    }
     if (g_slice.uid < 0) return;
     const auto it = k.threads.find(g_slice.uid);
     if (it != k.threads.end()) it->second.host_ms += host_now_ms() - g_slice.started;
@@ -1826,7 +1840,9 @@ void thread_return(Runtime &rt, AllegrexContext &ctx) { exit_thread(rt, ctx, ctx
 
 void interrupt_return(Runtime &rt, AllegrexContext &ctx) {
     if (!k.pending_interrupts.empty()) {
+        close_slice();
         start_interrupt(ctx);
+        g_slice = {kInterruptSlice, host_now_ms()};
         return;
     }
     k.in_interrupt = false;
@@ -1947,6 +1963,13 @@ std::string thread_time_report(double frames) {
     std::snprintf(item, sizeof(item), "; interrupts %.1f, outside threads %.1f", g_interrupt_ms / frames,
                   (now - last_report - accounted) / frames);
     report += item;
+    for (auto &[handler, time] : g_interrupt_times) {
+        if (time.ms / frames < 0.1) continue;
+        std::snprintf(item, sizeof(item), " [%08X: %.1f ms, %.1f/flip]", static_cast<unsigned>(handler), time.ms / frames,
+                      time.count / frames);
+        report += item;
+    }
+    g_interrupt_times.clear();
     g_interrupt_ms = 0.0;
     last_report = now;
     return report;

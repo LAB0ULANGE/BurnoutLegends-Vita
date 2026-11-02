@@ -277,6 +277,43 @@ std::uint32_t end_flags() {
 
 std::int32_t envelope_height(int voice) { return valid(voice) ? std::max(g_voices[voice].envelope.height, 0) : 0; }
 
+namespace {
+
+// The rest of the grain from sample `first` once the envelope has settled:
+// the same arithmetic as mix(), with the voice's hot state in locals (stores
+// into the mix buffer would otherwise reload it every sample).
+void mix_settled(Voice &v, std::uint32_t first) {
+    const std::int32_t gain = std::max(v.envelope.height, 0) >> 15;
+    const std::int32_t left = v.left, right = v.right;
+    const std::uint32_t pitch = v.pitch;
+    std::int32_t current = v.current, next = v.next;
+    std::uint32_t fraction = v.fraction;
+    std::int32_t *mix = g_mix.data();
+    for (std::uint32_t i = first; i < g_grain; ++i) {
+        const std::int32_t sample = current + (((next - current) * static_cast<std::int32_t>(fraction)) >> 12);
+        const std::int32_t shaped = (sample * gain) >> 15;
+        mix[i * 2u] += (shaped * left) >> 12;
+        mix[i * 2u + 1u] += (shaped * right) >> 12;
+        fraction += pitch;
+        while (fraction >= 0x1000u) {
+            fraction -= 0x1000u;
+            current = next;
+            next = next_sample(v);
+        }
+        if (v.stream_end && v.sample_at >= v.sample_count) {
+            v.playing = false;
+            v.envelope.state = Off;
+            v.envelope.height = 0;
+            break;
+        }
+    }
+    v.current = current;
+    v.next = next;
+    v.fraction = fraction;
+}
+
+} // namespace
+
 void mix(std::int16_t *out) {
     g_mix.assign(static_cast<std::size_t>(g_grain) * 2u, 0);
     for (Voice &v : g_voices) {
@@ -309,6 +346,10 @@ void mix(std::int16_t *out) {
                 break;
             }
             if (!v.playing) break;
+            if (settled) {
+                mix_settled(v, i + 1u);
+                break;
+            }
         }
     }
     for (std::uint32_t i = 0; i < g_grain * 2u; ++i)
