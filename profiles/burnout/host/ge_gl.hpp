@@ -51,6 +51,14 @@ struct Snapshot {
     std::vector<std::uint8_t> records, vertices;
 };
 
+// Pointer state of the emulation thread, kept apart from the worker's. The
+// pointer and format commands only set it (render::forward_run does that in
+// place); PRIM and LOAD_CLUT go through snapshot_command.
+struct SnapshotState {
+    std::uint32_t vtype{}, clut_low{}, clut_high{}, vertex_address{}, index_address{};
+};
+extern SnapshotState g_scan;
+
 // Emulation-thread side of the GL worker. Follows the vertex and index
 // pointers and appends to `snapshot` the guest bytes `word` will read, so the
 // worker can draw the frame while the game overwrites them. Returns the

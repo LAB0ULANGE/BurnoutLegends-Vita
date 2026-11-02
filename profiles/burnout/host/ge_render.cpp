@@ -447,6 +447,7 @@ double g_emulation_wait_ms{};  // emulation thread blocked on the worker
 bool g_skip_frame{};             // the frame being built is not drawn (frame_skip)
 std::uint64_t g_skipped_frames{};
 double g_scan_ms{};            // emulation thread walking display lists
+std::uint32_t g_scans{};       // ge_scan calls (list submissions and stall updates)
 
 void push_job(Job job) {
     std::unique_lock lock(g_jobs_mutex);
@@ -537,7 +538,10 @@ void configure(const Options &options) {
 
 bool active() noexcept { return g_options.enabled; }
 
-void account_scan(double ms) noexcept { g_scan_ms += ms; }
+void account_scan(double ms) noexcept {
+    g_scan_ms += ms;
+    ++g_scans;
+}
 
 void finish() {
     if (g_options.enabled && g_options.backend == Backend::OpenGL) drain_worker();
@@ -584,13 +588,14 @@ void forward_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::ui
 
 namespace {
 
-enum class ForwardKind : std::uint8_t { Plain, Snapshot, Transfer, Control };
+enum class ForwardKind : std::uint8_t { Plain, Pointer, Snapshot, Transfer, Control };
 // How the emulation thread treats each opcode inside a run: snapshot pointer
 // and PRIM/LOAD_CLUT commands, TRXKICK, and the control flow that ends a run
 // (as ge_scan's ge_is_control).
 constexpr std::array<ForwardKind, 256> kForwardKind = [] {
     std::array<ForwardKind, 256> kinds{};
-    for (const std::uint32_t op : {0x01u, 0x02u, 0x04u, 0x12u, 0xB0u, 0xB1u, 0xC4u}) kinds[op] = ForwardKind::Snapshot;
+    for (const std::uint32_t op : {0x01u, 0x02u, 0x12u, 0xB0u, 0xB1u}) kinds[op] = ForwardKind::Pointer;
+    for (const std::uint32_t op : {0x04u, 0xC4u}) kinds[op] = ForwardKind::Snapshot;
     kinds[0xEAu] = ForwardKind::Transfer;
     for (const std::uint32_t op : {0x08u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Eu, 0x0Fu, 0x10u, 0x13u, 0x14u})
         kinds[op] = ForwardKind::Control;
@@ -625,7 +630,16 @@ std::uint32_t forward_run(psprecomp::GuestMemory &memory, const std::uint8_t *wo
         }
         if (kind == ForwardKind::Control && stop_at_control) break;
         g_commands[op] = word;
-        if (kind == ForwardKind::Snapshot) {
+        if (kind == ForwardKind::Pointer) {
+            const std::uint32_t data = word & 0x00FFFFFFu;
+            switch (op) {
+            case 0x01u: gl::g_scan.vertex_address = ((base | data) + offset) & 0x0FFFFFFFu; break;
+            case 0x02u: gl::g_scan.index_address = ((base | data) + offset) & 0x0FFFFFFFu; break;
+            case 0x12u: gl::g_scan.vtype = data; break;
+            case 0xB0u: gl::g_scan.clut_low = data; break;
+            default: gl::g_scan.clut_high = data; break;
+            }
+        } else if (kind == ForwardKind::Snapshot) {
             const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, g_pending_snapshot);
             if (record != UINT32_MAX) g_pending_records.push_back(record);
             gl::emulation_phase = 2u;
@@ -799,15 +813,16 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         if (++g_flips % 300u == 0u) {
             char line[256];
             std::snprintf(line, sizeof(line),
-                          "emulation: list scan %.1f ms/flip, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
+                          "emulation: list scan %.1f ms/flip in %.0f scans, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
                           "worst flip %.0f ms; file reads %.0f ms (longest %.0f)",
-                          g_scan_ms / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
+                          g_scan_ms / 300.0, g_scans / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
                           worst_flip, gl::io_read_ms, gl::io_read_max_ms);
             worst_flip = 0.0;
             gl::io_read_ms = gl::io_read_max_ms = 0.0;
             gl::trace(("emulation threads (ms/flip): " + thread_time_report(300.0)).c_str());
             g_skipped_frames = 0u;
             g_scan_ms = 0.0;
+            g_scans = 0u;
             gl::trace(line);
             g_emulation_wait_ms = 0.0;
         }

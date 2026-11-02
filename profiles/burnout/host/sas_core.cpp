@@ -281,9 +281,17 @@ void mix(std::int16_t *out) {
     g_mix.assign(static_cast<std::size_t>(g_grain) * 2u, 0);
     for (Voice &v : g_voices) {
         if (!v.playing) continue;
+        // Sustaining at rate 0, the envelope stops moving once a step has
+        // clamped it: the per-sample walk is skipped from there on (most
+        // looped voices spend their life there, and the walk dominates on
+        // the Vita).
+        bool settled = false;
         for (std::uint32_t i = 0; i < g_grain; ++i) {
             const std::int32_t sample = v.current + (((v.next - v.current) * static_cast<std::int32_t>(v.fraction)) >> 12);
-            step(v);
+            if (!settled) {
+                step(v);
+                settled = v.envelope.state == Sustain && v.envelope.sustain_rate == 0;
+            }
             const std::int32_t shaped = (sample * (std::max(v.envelope.height, 0) >> 15)) >> 15;
             g_mix[i * 2u] += (shaped * v.left) >> 12;
             g_mix[i * 2u + 1u] += (shaped * v.right) >> 12;

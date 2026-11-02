@@ -2268,12 +2268,9 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
     }
 }
 
-namespace {
+SnapshotState g_scan;
 
-// Pointer state of the emulation thread, kept apart from the worker's.
-struct SnapshotState {
-    std::uint32_t vtype{}, clut_low{}, clut_high{}, vertex_address{}, index_address{};
-} g_scan;
+namespace {
 
 void append(std::vector<std::uint8_t> &arena, const std::uint8_t *bytes, std::uint32_t size) {
     arena.insert(arena.end(), bytes, bytes + size);

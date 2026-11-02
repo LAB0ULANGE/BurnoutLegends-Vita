@@ -474,12 +474,18 @@ std::uint64_t next_event_time() {
 }
 
 // Host time of the running guest thread, charged when it switches out.
+double g_sas_ms{};  // host time in sas::mix (thread_time_report)
+std::uint32_t g_sas_grains{};
+double g_interrupt_ms{};  // host time in interrupt handlers (the slice uid kInterruptSlice)
+constexpr std::int32_t kInterruptSlice = -2;
+
 struct Slice {
     std::int32_t uid{-1};
     double started{};
 } g_slice;
 
 void close_slice() {
+    if (g_slice.uid == kInterruptSlice) g_interrupt_ms += host_now_ms() - g_slice.started;
     if (g_slice.uid < 0) return;
     const auto it = k.threads.find(g_slice.uid);
     if (it != k.threads.end()) it->second.host_ms += host_now_ms() - g_slice.started;
@@ -494,6 +500,7 @@ void dispatch_next(Runtime &rt, AllegrexContext &ctx) {
             k.interrupted_valid = false;
             k.current = -1;
             start_interrupt(ctx);
+            g_slice = {kInterruptSlice, host_now_ms()};
             return;
         }
         std::int32_t uid = -1;
@@ -1480,7 +1487,12 @@ void install_audio(Runtime &rt) {
     reg(rt, sas, 0xA3589D81u, [](Runtime &r, AllegrexContext &ctx) {  // __sceSasCore(core, out)
         workload::sas_core(k.time_us);
         if (!r.memory().contains(arg(ctx, 1), k.sas_grain * 4u)) { ret(ctx, 0u); return; }
-        if (audio::enabled()) sas::mix(reinterpret_cast<std::int16_t *>(r.memory().raw_pointer(arg(ctx, 1), k.sas_grain * 4u)));
+        if (audio::enabled()) {
+            const double started = host_now_ms();
+            sas::mix(reinterpret_cast<std::int16_t *>(r.memory().raw_pointer(arg(ctx, 1), k.sas_grain * 4u)));
+            g_sas_ms += host_now_ms() - started;
+            ++g_sas_grains;
+        }
         else r.memory().zero(arg(ctx, 1), k.sas_grain * 4u);
         ret(ctx, 0u);
     });
@@ -1906,11 +1918,16 @@ void prepare_boot_thread(Runtime &runtime, const std::string &boot_path) {
 }
 
 std::string thread_time_report(double frames) {
+    const std::int32_t running = g_slice.uid;
     close_slice();
-    if (k.current >= 0) g_slice = {k.current, host_now_ms()};
+    if (running != -1) g_slice = {running, host_now_ms()};
     std::string report;
+    static double last_report = host_now_ms();
+    const double now = host_now_ms();
+    double accounted = g_interrupt_ms;
     for (auto &[uid, thread] : k.threads) {
         (void)uid;
+        accounted += thread.host_ms;
         if (thread.host_ms / frames >= 0.05) {
             char item[96];
             std::snprintf(item, sizeof(item), "%s%s %.1f", report.empty() ? "" : ", ", thread.name.c_str(),
@@ -1919,6 +1936,19 @@ std::string thread_time_report(double frames) {
         }
         thread.host_ms = 0.0;
     }
+    if (g_sas_grains != 0u) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "; sas mix %.1f (%.1f grains)", g_sas_ms / frames, g_sas_grains / frames);
+        report += item;
+        g_sas_ms = 0.0;
+        g_sas_grains = 0u;
+    }
+    char item[96];
+    std::snprintf(item, sizeof(item), "; interrupts %.1f, outside threads %.1f", g_interrupt_ms / frames,
+                  (now - last_report - accounted) / frames);
+    report += item;
+    g_interrupt_ms = 0.0;
+    last_report = now;
     return report;
 }
 
