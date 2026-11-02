@@ -62,7 +62,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-42";
+constexpr const char *kBuild = "gl-43";
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
 constexpr const char *kLog = "ux0:data/" BURNOUT_VITA_FILES ".log";
 burnout::boot_menu::Settings g_settings;
@@ -282,6 +282,7 @@ int main() {
             render.shader_cache_dir = cache;
         }
         render.cached_gpu_memory = g_settings.cached_gpu_memory;
+        render.variant_list = std::string(kRoot) + "shader_variants.txt";
         std::fprintf(stderr, "[vita] render scale %d\n", render.render_scale);
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::render::configure(render);

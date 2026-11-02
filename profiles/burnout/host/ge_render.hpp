@@ -37,6 +37,8 @@ struct Options {
     std::filesystem::path shader_cache_dir;
     // OpenGL (Vita): vitaGL's memory pools in cached memory.
     bool cached_gpu_memory{};
+    // OpenGL: program variants met while playing, compiled at the next launch.
+    std::filesystem::path variant_list;
 };
 
 void configure(const Options &options);

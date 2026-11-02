@@ -1133,7 +1133,11 @@ void flush() {
     }
     const std::uint32_t outer_phase = phase;
     phase = 6u;
-    const double started = host_now_ms();
+    // A clock read costs about 1 us on the Vita and there are ~450 draws a
+    // frame: one in 16 is timed and counts for 16.
+    static std::uint32_t timed_draws = 0u;
+    const bool timed = (timed_draws++ & 15u) == 0u;
+    const double started = timed ? host_now_ms() : 0.0;
     const std::uint32_t address = cmd(0x9Cu);
     const std::uint32_t stride = cmd(0x9Du) & 0x7FCu;
     RenderTarget &target = render_target(target_key(address), stride);
@@ -1265,7 +1269,7 @@ void flush() {
     g_batch_indices.clear();
     g_batch_runs.clear();
     g_batch_index_total = 0u;
-    g_stats.draw_ms += host_now_ms() - started;
+    if (timed) g_stats.draw_ms += (host_now_ms() - started) * 16.0;
     phase = outer_phase;
 }
 
@@ -1723,6 +1727,13 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     }
     const std::uint32_t stride = psp_layout.stride;
 
+    // A skipped frame (frame skip) only follows the vertex and index pointers.
+    if (!g_drawing) {
+        if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
+        else g_vertex_address += count * stride;
+        phase = 0u;
+        return false;
+    }
     if (morphs > 1u || primitive < 3u || (weights != 0u && through)) {  // morphing/points/lines: not yet
         ++g_stats.skipped_primitives;
         static std::unordered_map<std::uint64_t, int> seen;
@@ -2010,6 +2021,19 @@ std::string variant_defines(std::uint32_t key) {
     return text;
 }
 
+// Variants met while playing are appended to this file and compiled at the
+// next launch with the known ones (empty: not kept).
+std::string g_variant_list;
+bool g_booting{true};  // compiling the variants at launch
+
+void remember_variant(std::uint32_t key) {
+    if (g_booting || g_variant_list.empty()) return;
+    if (std::FILE *file = std::fopen(g_variant_list.c_str(), "a")) {
+        std::fprintf(file, "%08X\n", static_cast<unsigned>(key));
+        std::fclose(file);
+    }
+}
+
 void use_program(std::uint32_t key) {
     static const bool uber_only = std::getenv("PSPRECOMP_BURNOUT_UBER") != nullptr;
     auto it = g_variants.find(key);
@@ -2027,6 +2051,7 @@ void use_program(std::uint32_t key) {
             }
         }
         it = g_variants.emplace(key, program).first;
+        remember_variant(key);
         char line[96];
         std::snprintf(line, sizeof(line), "program variant %06X (%u so far) in %.0f ms", static_cast<unsigned>(key),
                       static_cast<unsigned>(g_variants.size()), host_now_ms() - started);
@@ -2043,7 +2068,16 @@ void use_program(std::uint32_t key) {
 constexpr std::uint32_t kKnownVariants[]{
     0x000000u, 0x000001u, 0x000002u, 0x000340u, 0x00040Du, 0x004400u, 0x00440Du, 0x004740u,
     0x005C00u, 0x005C02u, 0x00C602u, 0x01C626u, 0x024400u, 0x1A0000u, 0x1A4400u, 0x1A4540u,
-    0x1A4740u, 0x1E440Du, 0x1E4540u, 0x21C626u, 0x62C602u, 0x7AC602u};
+    0x1A4740u, 0x1E440Du, 0x1E4540u, 0x21C626u, 0x62C602u, 0x7AC602u, 0x380040Du};
+
+void compile_remembered_variants() {
+    if (g_variant_list.empty()) return;
+    std::FILE *file = std::fopen(g_variant_list.c_str(), "r");
+    if (file == nullptr) return;
+    unsigned key = 0u;
+    while (std::fscanf(file, "%x", &key) == 1) use_program(key);
+    std::fclose(file);
+}
 
 void sync_uniforms() {
     if (g_bound == nullptr) use_program(0u);
@@ -2278,6 +2312,8 @@ void gl_thread_main() {
         if (ok) {
             trace("compiling the known program variants");
             for (const std::uint32_t key : kKnownVariants) use_program(key);
+            compile_remembered_variants();
+            g_booting = false;
             g_bound = nullptr;
         }
 #if defined(__vita__)
@@ -2387,6 +2423,7 @@ void flush_traces() {
 
 void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
+void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }
 bool cached_memory() noexcept { return g_cached_memory; }
 

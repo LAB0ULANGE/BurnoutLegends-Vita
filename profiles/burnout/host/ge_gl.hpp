@@ -26,6 +26,9 @@ void set_render_scale(int scale);
 // and whether vitaGL's pools use cached memory.
 void set_shader_cache(const std::string &directory);
 void set_cached_memory(bool cached);
+// File where program variants first needed while playing are kept, so the
+// next launch compiles them up front (empty: none).
+void set_variant_list(const std::string &path);
 [[nodiscard]] bool cached_memory() noexcept;
 // Waits until the GL thread has replayed everything recorded so far.
 void finish();

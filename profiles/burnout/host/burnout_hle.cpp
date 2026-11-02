@@ -508,6 +508,7 @@ struct Slice {
     std::int32_t uid{-1};
     double started{};
 } g_slice;
+std::uint32_t g_dispatches{};  // thread switches and interrupt entries (thread_time_report)
 
 void close_slice() {
     if (g_slice.uid == kInterruptSlice) {
@@ -529,6 +530,7 @@ bool ge_front_wait();
 
 void dispatch_next(Runtime &rt, AllegrexContext &ctx) {
     close_slice();
+    ++g_dispatches;
     for (;;) {
         if (rt.stopped()) return;
         ge_front_deliver();
@@ -2311,8 +2313,9 @@ std::string thread_time_report(double frames) {
         g_sas_grains = 0u;
     }
     char item[96];
-    std::snprintf(item, sizeof(item), "; interrupts %.1f, outside threads %.1f", g_interrupt_ms / frames,
-                  (now - last_report - accounted) / frames);
+    std::snprintf(item, sizeof(item), "; interrupts %.1f, outside threads %.1f; %.0f dispatches", g_interrupt_ms / frames,
+                  (now - last_report - accounted) / frames, g_dispatches / frames);
+    g_dispatches = 0u;
     report += item;
 #if defined(BURNOUT_GE_RENDER)
     if (front::g_enabled) {

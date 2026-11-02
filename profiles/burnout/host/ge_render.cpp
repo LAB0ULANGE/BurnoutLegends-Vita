@@ -14,6 +14,7 @@
 #include "burnout_hle.hpp"
 
 #if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <pthread.h>
 #endif
@@ -392,6 +393,20 @@ void *worker_entry(void *) {
     for (int i = 0; i < 10000; ++i) host_now_ms();
     std::snprintf(line, sizeof(line), "clock read costs %.2f us", (host_now_ms() - before) / 10.0);
     gl::trace(line);
+    // Cheaper clocks, if any (candidates for the per-slice accounting).
+    volatile std::uint32_t sink = 0u;
+    double mark = host_now_ms();
+    for (int i = 0; i < 10000; ++i) sink = sink + sceKernelGetProcessTimeLow();
+    const double process_low = (host_now_ms() - mark) / 10.0;
+    mark = host_now_ms();
+    for (int i = 0; i < 10000; ++i) sink = sink + sceKernelGetProcessTimeLowCore();
+    const double process_low_core = (host_now_ms() - mark) / 10.0;
+    mark = host_now_ms();
+    for (int i = 0; i < 10000; ++i) sink = sink + static_cast<std::uint32_t>(sceKernelGetSystemTimeWide());
+    const double system_wide = (host_now_ms() - mark) / 10.0;
+    std::snprintf(line, sizeof(line), "clock costs (us): ProcessTimeLow %.2f, ProcessTimeLowCore %.2f, SystemTimeWide %.2f",
+                  process_low, process_low_core, system_wide);
+    gl::trace(line);
     worker_loop();
     return nullptr;
 }
@@ -529,6 +544,7 @@ void configure(const Options &options) {
         gl::set_render_scale(g_options.render_scale);
         gl::set_shader_cache(g_options.shader_cache_dir.string());
         gl::set_cached_memory(g_options.cached_gpu_memory);
+        gl::set_variant_list(g_options.variant_list.string());
         start_worker();
         std::unique_lock lock(g_jobs_mutex);
         g_jobs_cv.wait(lock, [] { return g_worker_ready; });
