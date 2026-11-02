@@ -173,6 +173,8 @@ uniform vec4 u_alpha;      // alpha test function, reference, enabled
 uniform vec4 u_fogcolor;
 uniform vec4 u_blendfix;   // rgb scale for a fixed source factor, w: enabled
 uniform vec4 u_alphaout;   // x: replace alpha with y
+uniform vec4 u_colortest;  // colour test reference (0-255), w: function (1 = off)
+uniform vec4 u_colormask;  // channels the colour test compares (0 or 1)
 varying vec3 v_texcoord;
 varying vec4 v_color;
 varying float v_fog;
@@ -197,6 +199,10 @@ void main() {
         if (u_texenv.w > 0.5) c.rgb = min(c.rgb * 2.0, 1.0);
     }
     c.rgb = mix(u_fogcolor.rgb, c.rgb, v_fog);
+    if (u_colortest.w < 0.5 || u_colortest.w > 1.5) {
+        bool equal_rgb = all(equal(floor(c.rgb * 255.0 + 0.5) * u_colormask.rgb, u_colortest.rgb * u_colormask.rgb));
+        if (u_colortest.w < 0.5 || (u_colortest.w < 2.5 ? !equal_rgb : equal_rgb)) discard;
+    }
     if (u_alpha.z > 0.5) {
         float a = floor(c.a * 255.0 + 0.5);
         float r = u_alpha.y;
@@ -377,6 +383,8 @@ uniform vec4 u_alpha;
 uniform vec4 u_fogcolor;
 uniform vec4 u_blendfix;
 uniform vec4 u_alphaout;
+uniform vec4 u_colortest;
+uniform vec4 u_colormask;
 #if TEXTURED
 #if PROJECTIVE
 varying vec3 v_texcoord;
@@ -426,6 +434,16 @@ void main() {
 #endif
 #if FOG
     c.rgb = mix(u_fogcolor.rgb, c.rgb, v_fog);
+#endif
+#if CTEST
+    bool equal_rgb = all(equal(floor(c.rgb * 255.0 + 0.5) * u_colormask.rgb, u_colortest.rgb * u_colormask.rgb));
+#if CTFUNC == 0
+    discard;
+#elif CTFUNC == 2
+    if (!equal_rgb) discard;
+#else
+    if (equal_rgb) discard;
+#endif
 #endif
 #if ATEST
     float a = floor(c.a * 255.0 + 0.5);
@@ -495,12 +513,13 @@ struct Texture {
 // and uploads to whichever program variant draws whatever it has not seen.
 enum Slot : GLint {
     kWorld, kWorldView, kProjection, kViewport, kDepth, kTarget, kFog, kFormat, kTexgen, kUvScale, kTexMatrix,
-    kShade, kLighting, kTexMap, kTexEnv, kEnvColor, kAlpha, kFogColor, kBlendFix, kAlphaOut, kSlotCount
+    kShade, kLighting, kTexMap, kTexEnv, kEnvColor, kAlpha, kFogColor, kBlendFix, kAlphaOut, kColorTest, kColorMask,
+    kSlotCount
 };
 constexpr const char *kSlotNames[kSlotCount]{
     "u_world", "u_world_view", "u_projection", "u_viewport", "u_depth", "u_target", "u_fog",
     "u_format", "u_texgen", "u_uvscale", "u_texmatrix", "u_shade", "u_lighting", "u_texmap",
-    "u_texenv", "u_envcolor", "u_alpha", "u_fogcolor", "u_blendfix", "u_alphaout"};
+    "u_texenv", "u_envcolor", "u_alpha", "u_fogcolor", "u_blendfix", "u_alphaout", "u_colortest", "u_colormask"};
 
 struct Program {
     GLuint id{};
@@ -1088,6 +1107,18 @@ void flush() {
     const bool alpha_enabled = !clear_mode && (cmd(0x22u) & 1u) != 0u;
     uniform4(kAlpha, static_cast<float>(alpha_test & 7u), static_cast<float>((alpha_test >> 8u) & 0xFFu),
                 alpha_enabled ? 1.0f : 0.0f, 0.0f);
+    // Colour test: the sun flare's black quad (alpha only) is drawn with
+    // "not equal to black", so on the PSP none of it lands.
+    const std::uint32_t color_function = !clear_mode && (cmd(0x27u) & 1u) != 0u ? cmd(0xD8u) & 3u : 1u;
+    if (color_function != 1u) {
+        const std::uint32_t ref = cmd(0xD9u), mask = cmd(0xDAu);
+        const auto channel = [](std::uint32_t value, int i) { return static_cast<float>((value >> (i * 8)) & 0xFFu); };
+        uniform4(kColorTest, channel(ref, 0), channel(ref, 1), channel(ref, 2), static_cast<float>(color_function));
+        uniform4(kColorMask, channel(mask, 0) != 0.0f ? 1.0f : 0.0f, channel(mask, 1) != 0.0f ? 1.0f : 0.0f,
+                 channel(mask, 2) != 0.0f ? 1.0f : 0.0f, 0.0f);
+    } else {
+        uniform4(kColorTest, 0.0f, 0.0f, 0.0f, 1.0f);
+    }
 
     // Scissor (inclusive PSP rectangle, y down) in GL window coordinates.
     const std::uint32_t s1 = cmd(0xD4u), s2 = cmd(0xD5u);
@@ -1144,6 +1175,7 @@ void flush() {
     }
     if (fog) variant |= 1u << 9u;
     if (alpha_enabled && (alpha_test & 7u) != 1u) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
+    if (color_function != 1u) variant |= 1u << 23u | color_function << 24u;
     if (blend_scaled) variant |= 1u << 21u;
     if (alpha_out) variant |= 1u << 22u;
     if (g_state.program != variant) {
@@ -1788,7 +1820,8 @@ std::string variant_defines(std::uint32_t key) {
         {"THROUGH", bits(0, 1)},    {"LIT", bits(1, 1)},     {"TEXGEN", bits(2, 2)},  {"SOURCE", bits(4, 2)},
         {"COLFMT", bits(6, 3)},     {"FOG", bits(9, 1)},     {"TEXTURED", bits(10, 1)}, {"TEXFUNC", bits(11, 3)},
         {"TCC", bits(14, 1)},       {"DOUBLE", bits(15, 1)}, {"PROJECTIVE", bits(16, 1)}, {"ATEST", bits(17, 1)},
-        {"ATFUNC", bits(18, 3)},    {"BLENDFIX", bits(21, 1)}, {"ALPHAOUT", bits(22, 1)}};
+        {"ATFUNC", bits(18, 3)},    {"BLENDFIX", bits(21, 1)}, {"ALPHAOUT", bits(22, 1)}, {"CTEST", bits(23, 1)},
+        {"CTFUNC", bits(24, 2)}};
     std::string text;
     for (const auto &[name, value] : defines) text += "#define " + std::string(name) + " " + std::to_string(value) + "\n";
     return text;

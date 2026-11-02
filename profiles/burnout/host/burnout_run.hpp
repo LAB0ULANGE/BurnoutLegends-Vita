@@ -40,6 +40,8 @@ struct BenchOptions {
     std::function<std::uint32_t()> live_buttons;
     std::function<std::uint32_t()> live_analog;  // x | y << 8, 128 = centre
     bool realtime{};
+    // Walk the display lists on another core (ge_front_start).
+    bool async_ge{};
     std::function<bool()> quit_requested;
 };
 

@@ -18,6 +18,12 @@
 #if defined(BURNOUT_GE_RENDER)
 #include "ge_gl.hpp"
 #include "ge_render.hpp"
+#include "thread_sync.hpp"
+#if defined(__vita__)
+#include <pthread.h>
+#else
+#include <thread>
+#endif
 #endif
 
 #include "psprecomp/common.hpp"
@@ -506,10 +512,17 @@ void close_slice() {
     g_slice.uid = -1;
 }
 
+// Asynchronous GE front end (see ge_front_start): callbacks it produced become
+// pending interrupts here; with nothing runnable, the emulation waits for it
+// instead of moving virtual time on.
+void ge_front_deliver();
+bool ge_front_wait();
+
 void dispatch_next(Runtime &rt, AllegrexContext &ctx) {
     close_slice();
     for (;;) {
         if (rt.stopped()) return;
+        ge_front_deliver();
         if (!k.pending_interrupts.empty()) {
             k.interrupted_valid = false;
             k.current = -1;
@@ -527,7 +540,9 @@ void dispatch_next(Runtime &rt, AllegrexContext &ctx) {
             psprecomp::set_runtime_thread_identity(uid, thread->name);
             return;
         }
-        // Nothing runnable: jump virtual time to the next event.
+        // Nothing runnable: the GE finishing is the next event when it is
+        // still busy; otherwise jump virtual time to the next one.
+        if (ge_front_wait()) continue;
         const std::uint64_t before = k.vblanks;
         k.time_us = next_event_time();
         process_time(rt);
@@ -774,7 +789,17 @@ constexpr bool ge_is_control(std::uint8_t op) noexcept {
 
 // Walks a display list only far enough to honour SIGNAL/FINISH callbacks; the
 // commands themselves are discarded (no renderer in the headless build).
-void ge_scan(Runtime &rt, GeList &list) {
+// A SIGNAL or FINISH met by the asynchronous front end, or the end of a list.
+struct GeEvent {
+    std::int32_t callback{-1};
+    bool finish{};
+    std::uint32_t value{};
+    std::int32_t list_done{-1};  // a list id: that list is complete (no callback)
+};
+
+// With `events`, callbacks are recorded there instead of queued (the front
+// end's thread must not touch the kernel state).
+void ge_scan(Runtime &rt, GeList &list, std::vector<GeEvent> *events = nullptr) {
 #if defined(BURNOUT_GE_RENDER)
     struct ScanTimer {
         double started = host_now_ms();
@@ -816,7 +841,7 @@ void ge_scan(Runtime &rt, GeList &list) {
                     while (plain < span && !ge_is_control(words[plain * 4u + 3u])) ++plain;
                 if (plain != 0u) {
                     list.pc = pc + plain * 4u;
-                    k.ge_commands_scanned += plain;
+                    if (events == nullptr) k.ge_commands_scanned += plain;
                     count += plain - 1u;
                     continue;
                 }
@@ -827,8 +852,10 @@ void ge_scan(Runtime &rt, GeList &list) {
         const std::uint32_t op = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
         list.pc = pc + 4u;
-        ++k.ge_commands_scanned;
-        workload::ge_command(rt.memory(), pc, word, list.base, list.offset);
+        if (events == nullptr) {
+            ++k.ge_commands_scanned;
+            workload::ge_command(rt.memory(), pc, word, list.base, list.offset);
+        }
 #if defined(BURNOUT_GE_RENDER)
         render::ge_command(rt.memory(), pc, word, list.base, list.offset);
 #endif
@@ -840,8 +867,14 @@ void ge_scan(Runtime &rt, GeList &list) {
             if (!list.call_stack.empty()) { list.pc = list.call_stack.back(); list.call_stack.pop_back(); }
             break;
         case 0x0Cu: list.done = true; break;                           // END
-        case 0x0Eu: ge_queue_callback(list.callback, false, data); break;  // SIGNAL
-        case 0x0Fu: ge_queue_callback(list.callback, true, data); break;   // FINISH
+        case 0x0Eu:  // SIGNAL
+            if (events != nullptr) events->push_back({list.callback, false, data});
+            else ge_queue_callback(list.callback, false, data);
+            break;
+        case 0x0Fu:  // FINISH
+            if (events != nullptr) events->push_back({list.callback, true, data});
+            else ge_queue_callback(list.callback, true, data);
+            break;
         case 0x10u: list.base = (data << 8u) & 0x0F000000u; break;     // BASE
         case 0x13u: list.offset = data << 8u; break;                   // OFFSET_ADDR
         case 0x14u: list.offset = pc; break;                           // ORIGIN_ADDR
@@ -849,6 +882,185 @@ void ge_scan(Runtime &rt, GeList &list) {
         }
     }
     list.done = true;
+}
+
+// ---------------------------------------------------------------- GE front end
+//
+// On the Vita the display lists are walked on another core, as the PSP's GE
+// runs beside its CPU: sceGeListEnQueue returns at once and the list's
+// SIGNAL/FINISH callbacks arrive when the walk is done. The game double
+// buffers its lists and waits for FINISH before reusing one, as it must on
+// the PSP. Requests (lists, stall updates, flips) are handled in order on the
+// front end's thread, which alone touches the renderer; the kernel state stays
+// on the emulation thread. Off (the default on PC), everything runs inline and
+// the runs stay reproducible.
+namespace front {
+
+struct Request {
+    enum class Kind : std::uint8_t { List, Stall, Flip } kind{};
+    std::int32_t id{};
+    GeList list;
+    std::uint32_t address{}, stride{}, format{};
+    std::uint64_t vblank{};
+};
+
+#if defined(BURNOUT_GE_RENDER)
+Runtime *g_runtime{};
+bool g_enabled{};
+SyncMutex g_mutex{"ge_front"};
+SyncCondition g_cv{"ge_front", g_mutex};
+std::deque<Request> g_requests;
+std::vector<GeEvent> g_events;
+bool g_busy{};                     // a request is being handled
+std::uint32_t g_queued_flips{};
+volatile bool g_has_events{};
+std::set<std::int32_t> g_open_lists;     // emulation thread: lists not complete yet
+std::map<std::int32_t, GeList> g_lists;  // front end thread: lists waiting on a stall address
+double g_wait_ms{};                // emulation thread blocked on the front end
+
+void handle(Request &request, std::vector<GeEvent> &events) {
+    Runtime &rt = *g_runtime;
+    switch (request.kind) {
+    case Request::Kind::List:
+        ge_scan(rt, request.list, &events);
+        if (request.list.done) events.push_back({-1, false, 0u, request.id});
+        else g_lists[request.id] = std::move(request.list);
+        break;
+    case Request::Kind::Stall: {
+        const auto it = g_lists.find(request.id);
+        if (it == g_lists.end()) break;
+        it->second.stall = request.address;
+        ge_scan(rt, it->second, &events);
+        if (it->second.done) {
+            g_lists.erase(it);
+            events.push_back({-1, false, 0u, request.id});
+        }
+        break;
+    }
+    case Request::Kind::Flip:
+        render::frame_buffer_set(rt.memory(), request.address, request.stride, request.format, request.vblank);
+        break;
+    }
+}
+
+void *thread_main(void *) {
+#if defined(__vita__)
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
+#endif
+    std::vector<GeEvent> events;
+    for (;;) {
+        Request request;
+        {
+            std::unique_lock lock(g_mutex);
+            g_cv.wait(lock, [] { return !g_requests.empty(); });
+            request = std::move(g_requests.front());
+            g_requests.pop_front();
+            g_busy = true;
+        }
+        events.clear();
+        handle(request, events);
+        std::lock_guard lock(g_mutex);
+        if (request.kind == Request::Kind::Flip) --g_queued_flips;
+        g_busy = false;
+        if (!events.empty()) {
+            g_events.insert(g_events.end(), events.begin(), events.end());
+            g_has_events = true;
+        }
+        g_cv.notify_all();
+    }
+    return nullptr;
+}
+
+void post(Request request) {
+    std::lock_guard lock(g_mutex);
+    if (request.kind == Request::Kind::Flip) ++g_queued_flips;
+    g_requests.push_back(std::move(request));
+    g_cv.notify_all();
+}
+
+bool idle_locked() { return g_requests.empty() && !g_busy; }
+
+// Blocks the emulation thread until `done` holds (under the lock).
+template <typename Predicate> void wait(Predicate done) {
+    const double started = host_now_ms();
+    {
+        std::unique_lock lock(g_mutex);
+        g_cv.wait(lock, done);
+    }
+    g_wait_ms += host_now_ms() - started;
+}
+#endif
+
+} // namespace front
+
+bool ge_front_post_list(std::int32_t id, GeList &list) {
+#if defined(BURNOUT_GE_RENDER)
+    if (!front::g_enabled) return false;
+    front::g_open_lists.insert(id);
+    front::Request request;
+    request.kind = front::Request::Kind::List;
+    request.id = id;
+    request.list = std::move(list);
+    front::post(std::move(request));
+    return true;
+#else
+    (void)id;
+    (void)list;
+    return false;
+#endif
+}
+
+void ge_front_deliver() {
+#if defined(BURNOUT_GE_RENDER)
+    if (!front::g_has_events) return;
+    std::vector<GeEvent> events;
+    {
+        std::lock_guard lock(front::g_mutex);
+        events.swap(front::g_events);
+        front::g_has_events = false;
+    }
+    for (const GeEvent &event : events) {
+        if (event.list_done >= 0) front::g_open_lists.erase(event.list_done);
+        else ge_queue_callback(event.callback, event.finish, event.value);
+    }
+#endif
+}
+
+bool ge_front_wait() {
+#if defined(BURNOUT_GE_RENDER)
+    if (!front::g_enabled || front::g_open_lists.empty()) return false;
+    {
+        std::lock_guard lock(front::g_mutex);
+        if (front::idle_locked() && !front::g_has_events) return false;
+    }
+    front::wait([] { return front::g_has_events || front::idle_locked(); });
+    ge_front_deliver();
+    return true;
+#else
+    return false;
+#endif
+}
+
+// sceGeDrawSync / sceGeListSync: mode 0 waits, otherwise the state is peeked
+// (0 complete, 2 drawing).
+std::uint32_t ge_front_sync(std::uint32_t mode, std::int32_t list_id) {
+#if defined(BURNOUT_GE_RENDER)
+    if (!front::g_enabled) return 0u;
+    const auto pending = [list_id] {
+        return list_id < 0 ? !front::g_open_lists.empty() : front::g_open_lists.count(list_id) != 0u;
+    };
+    ge_front_deliver();
+    if (mode != 0u) return pending() ? 2u : 0u;
+    while (pending()) {
+        front::wait([] { return front::g_has_events || front::idle_locked(); });
+        ge_front_deliver();
+    }
+    return 0u;
+#else
+    (void)mode;
+    (void)list_id;
+    return 0u;
+#endif
 }
 
 std::uint32_t ge_enqueue(Runtime &rt, const AllegrexContext &ctx) {
@@ -859,6 +1071,7 @@ std::uint32_t ge_enqueue(Runtime &rt, const AllegrexContext &ctx) {
     list.callback = static_cast<std::int32_t>(arg(ctx, 2));
     ++k.ge_lists_submitted;
     workload::ge_list_submitted();
+    if (ge_front_post_list(id, list)) return static_cast<std::uint32_t>(id);
     ge_scan(rt, list);
     if (!list.done) k.ge_lists[id] = std::move(list);
     return static_cast<std::uint32_t>(id);
@@ -1348,7 +1561,21 @@ void install_display_input(Runtime &rt) {
     reg(rt, "sceDisplay", 0x289D82FEu, [](Runtime &r, AllegrexContext &ctx) {  // SetFrameBuf
         workload::end_frame(r.memory());
 #if defined(BURNOUT_GE_RENDER)
-        render::frame_buffer_set(r.memory(), arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), k.vblanks);
+        if (front::g_enabled) {
+            // At most two frames ahead of the front end.
+            front::wait([] { return front::g_queued_flips < 2u; });
+            front::Request request;
+            request.kind = front::Request::Kind::Flip;
+            request.address = arg(ctx, 0);
+            request.stride = arg(ctx, 1);
+            request.format = arg(ctx, 2);
+            request.vblank = k.vblanks;
+            front::post(std::move(request));
+        } else {
+            render::frame_buffer_set(r.memory(), arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), k.vblanks);
+        }
+        static std::uint32_t flips = 0u;
+        if (++flips % 300u == 0u) gl::trace(("emulation threads (ms/flip): " + thread_time_report(300.0)).c_str());
 #endif
         if (k.observer.on_set_frame_buffer) k.observer.on_set_frame_buffer(arg(ctx, 0), k.vblanks);
         ret(ctx, 0u);
@@ -1382,6 +1609,20 @@ void install_ge(Runtime &rt) {
     reg(rt, lib, 0xAB49E76Au, [](Runtime &r, AllegrexContext &ctx) { ret(ctx, ge_enqueue(r, ctx)); });
     reg(rt, lib, 0x1C0D95A6u, [](Runtime &r, AllegrexContext &ctx) { ret(ctx, ge_enqueue(r, ctx)); });
     reg(rt, lib, 0xE0D68148u, [](Runtime &r, AllegrexContext &ctx) {  // UpdateStallAddr
+#if defined(BURNOUT_GE_RENDER)
+        if (front::g_enabled) {
+            const auto id = static_cast<std::int32_t>(arg(ctx, 0));
+            if (front::g_open_lists.count(id) != 0u) {
+                front::Request request;
+                request.kind = front::Request::Kind::Stall;
+                request.id = id;
+                request.address = arg(ctx, 1);
+                front::post(std::move(request));
+            }
+            ret(ctx, 0u);
+            return;
+        }
+#endif
         const auto it = k.ge_lists.find(static_cast<std::int32_t>(arg(ctx, 0)));
         if (it != k.ge_lists.end()) {
             it->second.stall = arg(ctx, 1);
@@ -1390,8 +1631,13 @@ void install_ge(Runtime &rt) {
         }
         ret(ctx, 0u);
     });
-    reg_value(rt, lib, 0x03444EB4u, 0u);  // ListSync: every accepted list is complete
-    reg_value(rt, lib, 0xB287BD61u, 0u);  // DrawSync
+    // ListSync and DrawSync: inline, every accepted list is complete.
+    reg(rt, lib, 0x03444EB4u, [](Runtime &, AllegrexContext &ctx) {  // ListSync(id, mode)
+        ret(ctx, ge_front_sync(arg(ctx, 1), static_cast<std::int32_t>(arg(ctx, 0))));
+    });
+    reg(rt, lib, 0xB287BD61u, [](Runtime &, AllegrexContext &ctx) {  // DrawSync(mode)
+        ret(ctx, ge_front_sync(arg(ctx, 0), -1));
+    });
     reg_value(rt, lib, 0xB448EC0Du, 0u);  // Break
     reg_value(rt, lib, 0x4C06E472u, 0u);  // Continue
     reg(rt, lib, 0xA4FC06A4u, [](Runtime &r, AllegrexContext &ctx) {  // SetCallback
@@ -1933,6 +2179,38 @@ void prepare_boot_thread(Runtime &runtime, const std::string &boot_path) {
     psprecomp::set_runtime_thread_identity(uid, "user_main");
 }
 
+bool ge_front_start(psprecomp::Runtime &runtime) {
+#if defined(BURNOUT_GE_RENDER)
+    if (!render::active()) return false;
+    front::g_runtime = &runtime;
+#if defined(__vita__)
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 256 * 1024);
+    pthread_t thread;
+    const int result = pthread_create(&thread, &attributes, front::thread_main, nullptr);
+    pthread_attr_destroy(&attributes);
+    if (result != 0) return false;
+    pthread_detach(thread);
+#else
+    std::thread(front::thread_main, nullptr).detach();
+#endif
+    front::g_enabled = true;
+    return true;
+#else
+    (void)runtime;
+    return false;
+#endif
+}
+
+void ge_front_drain() {
+#if defined(BURNOUT_GE_RENDER)
+    if (!front::g_enabled) return;
+    std::unique_lock lock(front::g_mutex);
+    front::g_cv.wait(lock, [] { return front::idle_locked(); });
+#endif
+}
+
 std::string thread_time_report(double frames) {
     const std::int32_t running = g_slice.uid;
     close_slice();
@@ -1963,6 +2241,13 @@ std::string thread_time_report(double frames) {
     std::snprintf(item, sizeof(item), "; interrupts %.1f, outside threads %.1f", g_interrupt_ms / frames,
                   (now - last_report - accounted) / frames);
     report += item;
+#if defined(BURNOUT_GE_RENDER)
+    if (front::g_enabled) {
+        std::snprintf(item, sizeof(item), "; waited %.1f for the GE front end", front::g_wait_ms / frames);
+        report += item;
+        front::g_wait_ms = 0.0;
+    }
+#endif
     for (auto &[handler, time] : g_interrupt_times) {
         if (time.ms / frames < 0.1) continue;
         std::snprintf(item, sizeof(item), " [%08X: %.1f ms, %.1f/flip]", static_cast<unsigned>(handler), time.ms / frames,

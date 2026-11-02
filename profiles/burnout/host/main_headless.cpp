@@ -75,6 +75,7 @@ Cli parse(int argc, char **argv) {
         }
         else if (key == "--capture-dir") cli.render.capture_dir = value();
         else if (key == "--frame-skip") cli.render.frame_skip = true;  // as on the Vita
+        else if (key == "--async-ge") o.async_ge = true;  // display lists on another thread, as on the Vita
         else if (key == "--music-dir") {  // converted tracks (tools/convert_music.py)
             std::cerr << "music tracks: " << burnout::music::set_dir(value()) << "\n";
         }

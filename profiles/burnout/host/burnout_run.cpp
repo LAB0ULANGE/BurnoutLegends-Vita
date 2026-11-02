@@ -145,8 +145,10 @@ BenchResult run_benchmark(const BenchOptions &options) {
     std::cerr << "[bench] functions " << runtime.function_count() << ", imports " << imports.size()
               << ", entry " << psprecomp::hex32(elf.runtime_entry()) << ", arena "
               << psprecomp::hex32(static_cast<std::uint32_t>(image_end)) << std::endl;
+    if (options.async_ge && ge_front_start(runtime)) std::cerr << "[bench] display lists walked on another core" << std::endl;
     runtime.run(elf.runtime_entry(), UINT64_MAX);
 #if defined(BURNOUT_GE_RENDER)
+    ge_front_drain();
     render::finish();
 #endif
 

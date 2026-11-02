@@ -51,5 +51,9 @@ void print_hle_summary();
 // Host ms per frame each guest thread ran since the previous call (threads
 // above 0.05 ms), as "name ms, ...".
 [[nodiscard]] std::string thread_time_report(double frames);
+// Walks the display lists on another core from now on (see burnout_hle.cpp,
+// "GE front end"); needs the renderer. ge_front_drain waits until it is idle.
+bool ge_front_start(psprecomp::Runtime &runtime);
+void ge_front_drain();
 
 } // namespace burnout
