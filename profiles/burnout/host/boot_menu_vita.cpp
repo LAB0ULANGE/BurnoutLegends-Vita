@@ -104,9 +104,9 @@ Settings load(const std::string &root) {
             else if (name == "render_scale") settings.render_scale = value == 1 ? 1 : 2;
             else if (name == "sound") settings.sound = value != 0;
             else if (name == "frame_skip") settings.frame_skip = value != 0;
-            else if (name == "async_ge") settings.async_ge = value != 0;
+            else if (name == "async_ge_v2") settings.async_ge = value != 0;
             else if (name == "shader_cache") settings.shader_cache = value != 0;
-            else if (name == "cached_gpu_memory") settings.cached_gpu_memory = value != 0;
+            // cached_gpu_memory is no longer offered: textures went missing on the Vita.
         }
         std::fclose(file);
         return settings;
@@ -124,10 +124,9 @@ Settings load(const std::string &root) {
 void save(const std::string &root, const Settings &settings) {
     std::FILE *file = std::fopen((root + "settings.txt").c_str(), "w");
     if (file == nullptr) return;
-    std::fprintf(file, "auto_race %d\nrender_scale %d\nsound %d\nframe_skip %d\nasync_ge %d\nshader_cache %d\n"
-                       "cached_gpu_memory %d\n",
+    std::fprintf(file, "auto_race %d\nrender_scale %d\nsound %d\nframe_skip %d\nasync_ge_v2 %d\nshader_cache %d\n",
                  flag(settings.auto_race), settings.render_scale, flag(settings.sound), flag(settings.frame_skip),
-                 flag(settings.async_ge), flag(settings.shader_cache), flag(settings.cached_gpu_memory));
+                 flag(settings.async_ge), flag(settings.shader_cache));
     std::fclose(file);
 }
 
@@ -142,7 +141,6 @@ Settings run(const std::string &root, const std::string &build) {
     int sound = flag(!settings.sound);
     int skip = flag(!settings.frame_skip);
     int shaders = flag(settings.shader_cache);
-    int cached = flag(settings.cached_gpu_memory);
     int async = flag(settings.async_ge);
     int start = 0;
     const std::vector<Item> items = {
@@ -151,8 +149,7 @@ Settings run(const std::string &root, const std::string &build) {
         {"Son/musique", {"Oui", "Non"}, &sound, "Sans le son, le jeu tourne un peu plus vite."},
         {"Saut d'images", {"Oui", "Non"}, &skip, "Saute une image si le rendu prend du retard."},
         {"Cache shaders", {"Non", "Oui (exp.)"}, &shaders, "Garde les shaders compiles: demarrage rapide."},
-        {"Memoire GPU", {"Normale", "En cache (exp.)"}, &cached, "Experimental: plus rapide, glitchs possibles."},
-        {"GE parallele", {"Non", "Oui"}, &async, "Listes GE sur un autre coeur: plus fluide."},
+        {"GE parallele", {"Non", "Oui (exp.)"}, &async, "Experimental: plus fluide mais peut planter."},
         {"> LANCER LE JEU <", {}, &start, "X ou START pour lancer."},
     };
 
@@ -207,7 +204,7 @@ Settings run(const std::string &root, const std::string &build) {
     settings.sound = sound == 0;
     settings.frame_skip = skip == 0;
     settings.shader_cache = shaders == 1;
-    settings.cached_gpu_memory = cached == 1;
+    settings.cached_gpu_memory = false;
     settings.async_ge = async == 1;
     save(root, settings);
 
