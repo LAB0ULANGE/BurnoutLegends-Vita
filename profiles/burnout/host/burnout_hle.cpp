@@ -775,9 +775,13 @@ std::int64_t file_read(Runtime &rt, std::int32_t fd, std::uint32_t buffer, std::
     if (host == nullptr && size != 0u) return static_cast<std::int32_t>(kErrorBadFile);
     const double started = host_now_ms();
     const auto read = static_cast<std::int64_t>(std::fread(host, 1u, size, it->second.file));
+#if defined(BURNOUT_GE_RENDER)
     const double took = host_now_ms() - started;
     gl::io_read_ms += took;
     gl::io_read_max_ms = std::max(gl::io_read_max_ms, took);
+#else
+    (void)started;  // no renderer trace in the headless builds
+#endif
     return read;
 }
 
