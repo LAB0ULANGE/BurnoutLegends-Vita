@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "psprecomp/guest_memory.hpp"
 #include "psprecomp/common.hpp"
 
@@ -81,6 +82,17 @@ GuestMemory::GuestMemory(std::uint32_t size_bytes)
     ram_limit16_ = size_bytes - 2u;
     ram_limit32_ = size_bytes - 4u;
 }
+
+#if defined(PSPRECOMP_COUNT_MIRROR_ACCESSES)
+namespace {
+struct MirrorReport {
+    ~MirrorReport() {
+        std::fprintf(stderr, "[memory] generated accesses %llu, through a mirror alias %llu\n",
+                     static_cast<unsigned long long>(aot_access_count), static_cast<unsigned long long>(aot_mirror_count));
+    }
+} g_mirror_report;
+} // namespace
+#endif
 
 std::uint32_t GuestMemory::size() const noexcept { return static_cast<std::uint32_t>(bytes_.size()); }
 std::uint32_t GuestMemory::vram_size() const noexcept { return static_cast<std::uint32_t>(vram_.size()); }

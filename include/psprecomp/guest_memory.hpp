@@ -20,6 +20,10 @@ namespace psprecomp {
 #define PSPRECOMP_MEMORY_FAST_PATH inline __attribute__((always_inline))
 #endif
 
+#if defined(PSPRECOMP_COUNT_MIRROR_ACCESSES)
+inline std::uint64_t aot_access_count{}, aot_mirror_count{};
+#endif
+
 class GuestMemory {
 public:
     static constexpr std::uint32_t kVramPhysicalBase = 0x04000000u;
@@ -150,8 +154,16 @@ public:
             : owner_(owner), ram_data_(ram_data), ram_limit8_(limit8),
               ram_limit16_(limit16), ram_limit32_(limit32),
               write_watch_enabled_(write_watch) {}
-        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static constexpr std::uint32_t ram_offset_of_fast(
-            std::uint32_t address) noexcept {
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static
+#if !defined(PSPRECOMP_COUNT_MIRROR_ACCESSES)
+            constexpr
+#endif
+            std::uint32_t ram_offset_of_fast(std::uint32_t address) noexcept {
+#if defined(PSPRECOMP_COUNT_MIRROR_ACCESSES)
+            // Measurement build: how many generated accesses use a mirror alias.
+            ++aot_access_count;
+            if ((address >> 29u) != 0u) ++aot_mirror_count;
+#endif
             return (address & 0x1FFFFFFFu) - GuestMemory::kPhysicalBase;
         }
         GuestMemory *owner_{};
