@@ -58,18 +58,26 @@ bool decode_block(Voice &v) {
     if (shift > 12) shift = 9;
     const std::int32_t *c = kCoefficients[std::min<std::uint32_t>((b[0] >> 4u) & 0xFu, 4u)];
     if ((flags & 4u) != 0u) v.loop_block = static_cast<std::int32_t>(v.block);
+    // Filter history in locals: the int16 sample stores would otherwise make
+    // the compiler reload it from the voice for every sample.
+    const std::int32_t c0 = c[0], c1 = c[1];
+    std::int32_t history1 = v.history1, history2 = v.history2;
+    std::int16_t *out = v.samples.data();
+    const auto decode = [&](std::int32_t nibble) {
+        std::int32_t s = static_cast<std::int16_t>(static_cast<std::uint16_t>(nibble << 12)) >> shift;
+        s += (history1 * c0 + history2 * c1) >> 6;
+        s = std::clamp(s, -32768, 32767);
+        history2 = history1;
+        history1 = s;
+        return static_cast<std::int16_t>(s);
+    };
     for (std::uint32_t i = 0; i < 14u; ++i) {
         const std::uint8_t d = b[2u + i];
-        for (std::uint32_t half = 0; half < 2u; ++half) {
-            const std::int32_t nibble = half == 0u ? (d & 0xF) : (d >> 4u);
-            std::int32_t s = static_cast<std::int16_t>(static_cast<std::uint16_t>(nibble << 12)) >> shift;
-            s += (v.history1 * c[0] + v.history2 * c[1]) >> 6;
-            s = std::clamp(s, -32768, 32767);
-            v.history2 = v.history1;
-            v.history1 = s;
-            v.samples[i * 2u + half] = static_cast<std::int16_t>(s);
-        }
+        out[i * 2u] = decode(d & 0xF);
+        out[i * 2u + 1u] = decode(d >> 4u);
     }
+    v.history1 = history1;
+    v.history2 = history2;
     v.sample_at = 0u;
     v.sample_count = 28u;
     ++v.block;
@@ -288,8 +296,9 @@ inline void step_local(Envelope &e, bool &playing) {
 // Whether the voice's sample has run out (only next_sample changes it).
 inline bool sample_ended(const Voice &v) { return v.stream_end && v.sample_at >= v.sample_count; }
 
-// Mixes one voice into `mix` for the whole grain.
-void mix_voice(Voice &v, std::int32_t *mix, std::uint32_t grain) {
+// Mixes one voice into `mix` for the whole grain (any voice; noise voices
+// take this path).
+void mix_voice_generic(Voice &v, std::int32_t *mix, std::uint32_t grain) {
     Envelope e = v.envelope;
     bool playing = v.playing;
     const std::int32_t left = v.left, right = v.right;
@@ -328,6 +337,101 @@ void mix_voice(Voice &v, std::int32_t *mix, std::uint32_t grain) {
         }
         if (!playing) break;
     }
+    v.envelope = e;
+    v.playing = playing;
+    v.current = current;
+    v.next = next;
+    v.fraction = fraction;
+}
+
+// The same for a sampled voice, with the sample cursor in locals too.
+void mix_voice(Voice &v, std::int32_t *mix, std::uint32_t grain) {
+    if (v.noise) {
+        mix_voice_generic(v, mix, grain);
+        return;
+    }
+    Envelope e = v.envelope;
+    bool playing = v.playing;
+    const std::int32_t left = v.left, right = v.right;
+    const std::uint32_t pitch = v.pitch;
+    std::int32_t current = v.current, next = v.next;
+    std::uint32_t fraction = v.fraction;
+    std::uint32_t at = v.sample_at, count = v.sample_count;
+    bool stream_end = v.stream_end;
+    const std::int16_t *samples = v.samples.data();
+    // next_sample() on the locals: decode_block() refills the voice's buffer.
+    const auto fetch = [&]() -> std::int32_t {
+        if (at >= count) {
+            if (!decode_block(v)) {
+                stream_end = true;
+                v.stream_end = true;
+                return 0;
+            }
+            at = 0u;
+            count = 28u;
+        }
+        return samples[at++];
+    };
+    // Two loops: the envelope moving (one step per sample), then, once a
+    // rate-0 sustain has settled it, a constant gain (fewer live values: the
+    // per-sample work stays in registers).
+    std::uint32_t i = 0;
+    bool done = false;
+    std::int32_t gain = 0;
+    for (; i < grain; ++i) {
+        const std::int32_t sample = current + (((next - current) * static_cast<std::int32_t>(fraction)) >> 12);
+        step_local(e, playing);
+        const bool settled = e.state == Sustain && e.sustain_rate == 0;
+        gain = std::max(e.height, 0) >> 15;
+        const std::int32_t shaped = (sample * gain) >> 15;
+        mix[i * 2u] += (shaped * left) >> 12;
+        mix[i * 2u + 1u] += (shaped * right) >> 12;
+        fraction += pitch;
+        while (fraction >= 0x1000u) {
+            fraction -= 0x1000u;
+            current = next;
+            next = fetch();
+        }
+        if (stream_end && at >= count) {
+            // The sample ran out: the voice ends as the PSP's does.
+            playing = false;
+            e.state = Off;
+            e.height = 0;
+            done = true;
+            break;
+        }
+        if (!playing) {
+            done = true;
+            break;
+        }
+        if (settled) {
+            ++i;
+            break;
+        }
+    }
+    if (!done) {
+        for (; i < grain; ++i) {
+            const std::int32_t sample = current + (((next - current) * static_cast<std::int32_t>(fraction)) >> 12);
+            const std::int32_t shaped = (sample * gain) >> 15;
+            mix[i * 2u] += (shaped * left) >> 12;
+            mix[i * 2u + 1u] += (shaped * right) >> 12;
+            fraction += pitch;
+            while (fraction >= 0x1000u) {
+                fraction -= 0x1000u;
+                current = next;
+                next = fetch();
+            }
+            if (stream_end && at >= count) {
+                playing = false;
+                e.state = Off;
+                e.height = 0;
+                break;
+            }
+        }
+    }
+    v.sample_at = at;
+    v.sample_count = count;
+    v.stream_end = stream_end;
     v.envelope = e;
     v.playing = playing;
     v.current = current;
