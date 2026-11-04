@@ -30,6 +30,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <thread>
 #include <unordered_map>
 #include <cstdio>
@@ -235,9 +236,17 @@ void block_transfer(psprecomp::GuestMemory &memory, std::uint32_t data) {
 // emulation thread (control flow, callbacks, block transfers); the worker gets
 // a copy of the commands and owns the GL context. At most two frames queue up.
 
+// A run of a cached sub-list (ge_cached_call), read by the worker from the
+// cache's own immutable copy of the words instead of a copy per frame.
+struct CachedRun {
+    std::shared_ptr<const std::vector<std::uint32_t>> words;
+    std::uint32_t first{}, count{}, base{}, offset{};
+};
+
 struct Job {
     enum class Kind { Commands, Present, Capture } kind{};
     std::vector<std::array<std::uint32_t, 3>> commands;
+    std::vector<CachedRun> cached;  // kCachedRun entries carry their index here
     // Runs of plain commands, copied whole: a commands entry {start, count,
     // kRun} with base and offset in the two words before start.
     std::vector<std::uint32_t> words;
@@ -262,12 +271,15 @@ std::vector<std::uint32_t> g_pending_words, g_pending_records;
 // Buffers of finished command jobs, handed back by the worker so the next
 // lists reuse warm memory instead of allocating (and freeing across cores).
 struct SpareBuffers {
+    std::vector<CachedRun> cached;
     std::vector<std::array<std::uint32_t, 3>> commands;
     std::vector<std::uint32_t> words, records;
     std::vector<Transfer> transfers;
 };
 std::vector<SpareBuffers> g_spares;  // under g_jobs_mutex
 constexpr std::uint32_t kRun = UINT32_MAX - 1u;  // commands entry tag (offsets are multiples of 256)
+constexpr std::uint32_t kCachedRun = UINT32_MAX - 2u;  // commands entry tag: {index in Job::cached, 0, kCachedRun}
+std::vector<CachedRun> g_pending_cached;
 std::vector<Transfer> g_pending_transfers;
 gl::Snapshot g_pending_snapshot;
 // Overlap: the worker draws frame N while the emulation runs frame N+1. The
@@ -362,6 +374,12 @@ void worker_loop() {
             gl::set_drawing(!job.skip);
             std::size_t next_record = 0u;
             for (const auto &c : job.commands) {
+                if (c[2] == kCachedRun) {
+                    const CachedRun &run = job.cached[c[0]];
+                    gl::ge_run(*g_memory, run.words->data() + run.first, run.count, run.base, run.offset, job.snapshot,
+                               job.records.data(), next_record);
+                    continue;
+                }
                 if (c[2] == kRun) {
                     const std::uint32_t *words = job.words.data() + c[0];
                     gl::ge_run(*g_memory, words, c[1], words[-2], words[-1], job.snapshot, job.records.data(), next_record);
@@ -405,6 +423,8 @@ void worker_loop() {
         }
         SpareBuffers spare;
         if (job.kind == Job::Kind::Commands) {
+            spare.cached.swap(job.cached);
+            spare.cached.clear();  // drops the references to the cache's words
             spare.commands.swap(job.commands);
             spare.words.swap(job.words);
             spare.records.swap(job.records);
@@ -516,6 +536,10 @@ std::uint64_t g_skipped_frames{};
 std::uint64_t g_behind_skips{};
 std::uint32_t g_skips_in_a_row{};
 double g_scan_ms{};            // emulation thread walking display lists
+// Inside it (Vita trace): cached sub-lists forwarded, lists handed to the
+// worker (with the wait for room), and the guest bytes snapshotted.
+double g_cached_ms{}, g_submit_ms{};
+std::uint64_t g_snapshot_vertex_bytes{}, g_snapshot_record_bytes{}, g_forwarded_words{};
 std::uint32_t g_scans{};       // ge_scan calls (list submissions and stall updates)
 
 void push_job(Job job) {
@@ -545,10 +569,15 @@ void push_job(Job job) {
 
 void submit_pending() {
     if (g_pending.empty()) return;
+    const double submit_started = host_now_ms();
+    g_snapshot_vertex_bytes += g_pending_snapshot.vertices.size();
+    g_snapshot_record_bytes += g_pending_snapshot.records.size();
+    g_forwarded_words += g_pending_words.size();
     Job job;
     job.kind = Job::Kind::Commands;
     job.skip = g_skip_frame;
     job.commands.swap(g_pending);
+    job.cached.swap(g_pending_cached);
     job.transfers.swap(g_pending_transfers);
     job.words.swap(g_pending_words);
     job.records.swap(g_pending_records);
@@ -557,6 +586,7 @@ void submit_pending() {
         if (!g_spares.empty()) {
             SpareBuffers &spare = g_spares.back();
             g_pending.swap(spare.commands);
+            g_pending_cached.swap(spare.cached);
             g_pending_words.swap(spare.words);
             g_pending_records.swap(spare.records);
             g_pending_transfers.swap(spare.transfers);
@@ -572,6 +602,7 @@ void submit_pending() {
     g_pending_snapshot.records.reserve(job.snapshot.records.size());
     g_pending_snapshot.vertices.reserve(job.snapshot.vertices.size());
     push_job(std::move(job));
+    g_submit_ms += host_now_ms() - submit_started;
     if (!g_async) {
         // Without snapshots the GL thread reads guest memory: let it finish too.
         std::unique_lock lock(g_jobs_mutex);
@@ -781,7 +812,9 @@ struct CallSegment {
 struct CachedCall {
     bool cacheable{};
     std::uint32_t changes{};                 // times the words were found changed
-    std::vector<std::uint32_t> words;        // every word up to the RET (excluded), as in memory
+    // Every word up to the RET (excluded), as in memory. Never changed once
+    // built (a rewrite makes a new one): queued jobs may still read it.
+    std::shared_ptr<const std::vector<std::uint32_t>> words;
     std::vector<CallSegment> segments;       // the plain words among them
     std::vector<std::uint8_t> records;       // snapshot records the words needed
     std::vector<std::uint32_t> record_offsets;
@@ -794,7 +827,7 @@ std::uint64_t g_call_hits{}, g_call_walked{}, g_call_hit_words{};
 bool static_range(std::uint32_t address) noexcept { return address >= 0x08800000u && address < 0x09C00000u; }
 
 void forget_words(CachedCall &call) {
-    call.words = {};
+    call.words.reset();
     call.segments = {};
     call.records = {};
     call.record_offsets = {};
@@ -807,6 +840,7 @@ bool classify_call(const psprecomp::GuestMemory &memory, std::uint32_t target, s
                    CachedCall &call) {
     constexpr std::uint32_t kMaxWords = 8192u;
     forget_words(call);
+    std::vector<std::uint32_t> words;
     const gl::SnapshotState saved = gl::g_scan;
     gl::Snapshot snapshot;
     bool ok = false;
@@ -858,7 +892,7 @@ bool classify_call(const psprecomp::GuestMemory &memory, std::uint32_t target, s
                              gl::g_scan.vtype, gl::g_scan.vertex_address);
             break;
         }
-        call.words.push_back(word);
+        words.push_back(word);
         if (control) {
             segment_start = i + 1u;
             continue;
@@ -869,7 +903,8 @@ bool classify_call(const psprecomp::GuestMemory &memory, std::uint32_t target, s
             if (!snapshot.vertices.empty()) break;  // vertices copied: not static after all
         }
     }
-    ok = ok && snapshot.vertices.empty() && !call.words.empty();
+    ok = ok && snapshot.vertices.empty() && !words.empty();
+    if (ok) call.words = std::make_shared<const std::vector<std::uint32_t>>(std::move(words));
     call.exit = gl::g_scan;
     call.exit_base = base;
     call.exit_offset = offset;
@@ -884,12 +919,8 @@ bool classify_call(const psprecomp::GuestMemory &memory, std::uint32_t target, s
 void forward_cached(const CachedCall &call) {
     gl::g_scan = call.exit;
     for (const CallSegment &segment : call.segments) {
-        g_pending_words.push_back(segment.base);
-        g_pending_words.push_back(segment.offset);
-        const auto at = static_cast<std::uint32_t>(g_pending_words.size());
-        const auto first = call.words.begin() + segment.first;
-        g_pending_words.insert(g_pending_words.end(), first, first + segment.count);
-        g_pending.push_back({at, segment.count, kRun});
+        g_pending.push_back({static_cast<std::uint32_t>(g_pending_cached.size()), 0u, kCachedRun});
+        g_pending_cached.push_back({call.words, segment.first, segment.count, segment.base, segment.offset});
     }
     const auto first = static_cast<std::uint32_t>(g_pending_snapshot.records.size());
     g_pending_snapshot.records.insert(g_pending_snapshot.records.end(), call.records.begin(), call.records.end());
@@ -909,7 +940,7 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
     auto [it, inserted] = g_calls.try_emplace(CallKey{target, base, offset, gl::g_scan});
     CachedCall &call = it->second;
     if (!inserted && !call.cacheable) return false;
-    const auto bytes = static_cast<std::uint32_t>(call.words.size() * 4u);
+    const auto bytes = static_cast<std::uint32_t>(call.words != nullptr ? call.words->size() * 4u : 0u);
     // A stall address inside the sub-list: the GE stops there, walk it.
     const std::uint32_t stop = stall & 0x0FFFFFFFu;
     if (stall != 0u && stop >= target && stop <= target + std::max<std::uint32_t>(bytes, 8192u * 4u) + 4u) return false;
@@ -917,12 +948,14 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
         const std::uint8_t *live = memory.raw_pointer(target, bytes + 4u);
         std::uint32_t ret = 0u;
         if (live != nullptr) std::memcpy(&ret, live + bytes, 4u);
-        if (live != nullptr && (ret >> 24u) == 0x0Bu && std::memcmp(live, call.words.data(), bytes) == 0) {
+        const double started = host_now_ms();
+        if (live != nullptr && (ret >> 24u) == 0x0Bu && std::memcmp(live, call.words->data(), bytes) == 0) {
             forward_cached(call);
+            g_cached_ms += host_now_ms() - started;
             base = call.exit_base;
             offset = call.exit_offset;
             ++g_call_hits;
-            g_call_hit_words += call.words.size();
+            g_call_hit_words += call.words->size();
             return true;
         }
         // Rewritten: a sub-list the game rebuilds is not worth caching.
@@ -1147,7 +1180,7 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         worst_flip = std::max(worst_flip, now - last_flip);
         last_flip = now;
         if (++g_flips % 300u == 0u) {
-            char line[400];
+            char line[640];
             std::uint64_t early_used = 0u, early_missed = 0u;
             {
                 std::lock_guard lock(g_early_mutex);
@@ -1157,11 +1190,15 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
             std::snprintf(line, sizeof(line),
                           "emulation: list scan %.1f ms/flip in %.0f scans, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
                           "worst flip %.0f ms; file reads %.0f ms (longest %.0f); early transfers %llu used, %llu missed; %llu skipped when behind; "
-                          "sub-lists %.0f cached (%.0f words), %.1f walked anew per flip",
+                          "sub-lists %.0f cached (%.0f words), %.1f walked anew per flip; in the scan: cached sub-lists %.1f ms, submit %.1f ms, "
+                          "%.0f words forwarded, %.0f KiB vertices and %.0f KiB records copied per flip",
                           g_scan_ms / 300.0, g_scans / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
                           worst_flip, gl::io_read_ms, gl::io_read_max_ms, static_cast<unsigned long long>(early_used),
                           static_cast<unsigned long long>(early_missed), static_cast<unsigned long long>(g_behind_skips),
-                          g_call_hits / 300.0, g_call_hit_words / 300.0, g_call_walked / 300.0);
+                          g_call_hits / 300.0, g_call_hit_words / 300.0, g_call_walked / 300.0, g_cached_ms / 300.0, g_submit_ms / 300.0,
+                          g_forwarded_words / 300.0, g_snapshot_vertex_bytes / 300.0 / 1024.0, g_snapshot_record_bytes / 300.0 / 1024.0);
+            g_cached_ms = g_submit_ms = 0.0;
+            g_snapshot_vertex_bytes = g_snapshot_record_bytes = g_forwarded_words = 0u;
             g_call_hits = g_call_hit_words = g_call_walked = 0u;
             g_behind_skips = 0u;
             worst_flip = 0.0;
