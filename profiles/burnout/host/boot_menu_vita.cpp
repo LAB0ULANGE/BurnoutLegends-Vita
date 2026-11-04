@@ -136,9 +136,27 @@ void save(const std::string &root, const Settings &settings) {
 }
 
 Settings run(const std::string &root, const std::string &build) {
-    Settings settings = load(root);
     Screen screen;
-    if (!screen.open()) return settings;
+    if (!screen.open()) return Settings{};
+    // No choice to make by default: the game starts with the recommended
+    // settings. Holding L at launch opens the menu (saved choices).
+    {
+        sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
+        SceCtrlData pad{};
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        if ((pad.buttons & SCE_CTRL_LTRIGGER) == 0u) {
+            screen.clear();
+            screen.text(16, 16, "BURNOUT LEGENDS", kAccent, 4);
+            screen.text(32, 60, "recomp PS Vita - " + build, kDim, 2);
+            screen.text(32, 220, "Chargement...", kAccent, 4);
+            screen.text(32, 456, "Maintenir L au lancement: options", kDim, 2);
+            screen.text(32, 488, "En jeu: START+SELECT ensemble pour quitter", kDim, 2);
+            screen.show();
+            sceDisplayWaitVblankStart();
+            return Settings{};
+        }
+    }
+    Settings settings = load(root);
 
     // Each value is the index of the choice shown.
     int mode = flag(settings.auto_race);

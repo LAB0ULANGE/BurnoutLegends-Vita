@@ -62,7 +62,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-48";
+constexpr const char *kBuild = "gl-49";
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
 constexpr const char *kLog = "ux0:data/" BURNOUT_VITA_FILES ".log";
 burnout::boot_menu::Settings g_settings;
@@ -246,7 +246,7 @@ int main() {
     std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, shader cache %d\n", kBuild,
                  g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale, g_settings.sound ? 1 : 0,
                  g_settings.frame_skip ? 1 : 0, g_settings.shader_cache ? 1 : 0);
-    std::fprintf(stderr, "[vita] gl-48 options: skip when behind %d, offscreen 1x %d, cached sub-lists %d, sound on core %d\n",
+    std::fprintf(stderr, "[vita] options: skip when behind %d, offscreen 1x %d, cached sub-lists %d, sound on core %d\n",
                  g_settings.skip_when_behind ? 1 : 0, g_settings.offscreen_1x ? 1 : 0, g_settings.cache_sublists ? 1 : 0,
                  g_settings.sound_core1 ? 1 : 2);
     const bool scripted = g_settings.auto_race;
