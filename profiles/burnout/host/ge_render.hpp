@@ -30,6 +30,12 @@ struct Options {
     // OpenGL: when the renderer is behind, skip drawing a frame (at most every
     // other one) instead of making the game wait, so it keeps its speed.
     bool frame_skip{};
+    // OpenGL: with frame_skip, a frame whose lists find the renderer two
+    // lists behind is not drawn either, and several frames in a row may be
+    // skipped: the game never waits for the GPU side.
+    bool skip_when_behind{};
+    // OpenGL: render targets narrower than the screen at 1x.
+    bool offscreen_1x{};
     // OpenGL: internal resolution, a multiple of 480x272.
     int render_scale{1};
     // OpenGL (Vita): compiled shader programs kept in this directory (empty:

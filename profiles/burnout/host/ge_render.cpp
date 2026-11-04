@@ -16,6 +16,7 @@
 #if defined(__vita__)
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/power.h>
 #include <pthread.h>
 #endif
 
@@ -508,6 +509,11 @@ bool forwarded(std::uint32_t op, std::uint32_t word) {
 double g_emulation_wait_ms{};  // emulation thread blocked on the worker
 bool g_skip_frame{};             // the frame being built is not drawn (frame_skip)
 std::uint64_t g_skipped_frames{};
+// skip_when_behind: lists turned into skipped ones because two were already
+// queued (instead of the game waiting for the renderer), and the skipped
+// frames in a row so far.
+std::uint64_t g_behind_skips{};
+std::uint32_t g_skips_in_a_row{};
 double g_scan_ms{};            // emulation thread walking display lists
 std::uint32_t g_scans{};       // ge_scan calls (list submissions and stall updates)
 
@@ -517,6 +523,14 @@ void push_job(Job job) {
         const double started = host_now_ms();
         const std::uint32_t outer = gl::emulation_phase;
         gl::emulation_phase = 7u;
+        // Renderer behind: rather than slowing the game down, the rest of
+        // this frame is followed without drawing (the screen keeps the last
+        // one).
+        if (!job.skip && g_options.frame_skip && g_options.skip_when_behind && g_queued_command_jobs >= 2u) {
+            job.skip = true;
+            if (!g_skip_frame) ++g_behind_skips;
+            g_skip_frame = true;
+        }
         // A skipped frame costs the worker little: no need to wait for it.
         const std::uint32_t room = job.skip ? 4u : 2u;
         g_jobs_cv.wait(lock, [room] { return g_queued_command_jobs < room; });
@@ -586,6 +600,7 @@ void configure(const Options &options) {
 #endif
     if (g_options.enabled && g_options.backend == Backend::OpenGL) {
         gl::set_render_scale(g_options.render_scale);
+        gl::set_offscreen_1x(g_options.offscreen_1x);
         gl::set_shader_cache(g_options.shader_cache_dir.string());
         gl::set_cached_memory(g_options.cached_gpu_memory);
         gl::set_variant_list(g_options.variant_list.string());
@@ -922,10 +937,16 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         push_job(std::move(present));
         // Decide for the next frame: skip it when the worker is still busy
         // with earlier lists, but never two frames in a row.
+        g_skips_in_a_row = g_skip_frame ? g_skips_in_a_row + 1u : 0u;
         if (g_options.frame_skip) {
             std::lock_guard lock(g_jobs_mutex);
-            g_skip_frame = !g_skip_frame && g_queued_command_jobs >= 2u;
+            // skip_when_behind allows several in a row (at most 3), so the
+            // game keeps its speed whatever the GPU manages.
+            const bool may_skip = g_options.skip_when_behind ? g_skips_in_a_row < 3u : !g_skip_frame;
+            g_skip_frame = may_skip && g_queued_command_jobs >= 2u;
             if (g_skip_frame) ++g_skipped_frames;
+        } else {
+            g_skip_frame = false;
         }
         // Longest gap between two flips: the hitches a player sees.
         static double last_flip = host_now_ms(), worst_flip = 0.0;
@@ -942,16 +963,23 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
             }
             std::snprintf(line, sizeof(line),
                           "emulation: list scan %.1f ms/flip in %.0f scans, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
-                          "worst flip %.0f ms; file reads %.0f ms (longest %.0f); early transfers %llu used, %llu missed",
+                          "worst flip %.0f ms; file reads %.0f ms (longest %.0f); early transfers %llu used, %llu missed; %llu skipped when behind",
                           g_scan_ms / 300.0, g_scans / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
                           worst_flip, gl::io_read_ms, gl::io_read_max_ms, static_cast<unsigned long long>(early_used),
-                          static_cast<unsigned long long>(early_missed));
+                          static_cast<unsigned long long>(early_missed), static_cast<unsigned long long>(g_behind_skips));
+            g_behind_skips = 0u;
             worst_flip = 0.0;
             gl::io_read_ms = gl::io_read_max_ms = 0.0;
             g_skipped_frames = 0u;
             g_scan_ms = 0.0;
             g_scans = 0u;
             gl::trace(line);
+#if defined(__vita__)
+            // A plugin may change the clocks behind the game's back.
+            std::snprintf(line, sizeof(line), "clocks: ARM %d MHz, GPU %d MHz, GPU crossbar %d MHz", scePowerGetArmClockFrequency(),
+                          scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
+            gl::trace(line);
+#endif
             g_emulation_wait_ms = 0.0;
         }
     }

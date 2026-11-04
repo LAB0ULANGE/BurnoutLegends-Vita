@@ -168,7 +168,10 @@ void append_report(const std::string &text) {
 std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed) {
     const int arm_set = scePowerSetArmClockFrequency(arm_mhz);
     scePowerSetBusClockFrequency(222);
-    scePowerSetGpuClockFrequency(222);
+    // The GPU's maximum for applications, and its memory crossbar with it
+    // (the GPU side is what limits the heavier tracks at 960x544).
+    const int gpu_set = scePowerSetGpuClockFrequency(222);
+    const int xbar_set = scePowerSetGpuXbarClockFrequency(166);
 
     burnout::BenchOptions options;
     const std::string root = kRoot;
@@ -210,7 +213,9 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
     std::ostringstream title;
     title << "burnout-bench (PS Vita headless) ARM " << scePowerGetArmClockFrequency() << " MHz (requested " << arm_mhz
           << ", ret 0x" << std::hex << arm_set << std::dec << "), bus "
-          << scePowerGetBusClockFrequency() << " MHz";
+          << scePowerGetBusClockFrequency() << " MHz, GPU " << scePowerGetGpuClockFrequency() << " MHz (ret 0x" << std::hex
+          << gpu_set << std::dec << "), GPU crossbar " << scePowerGetGpuXbarClockFrequency() << " MHz (ret 0x" << std::hex
+          << xbar_set << std::dec << ")";
     options.title = title.str();
     std::fprintf(stderr, "[vita] %s\n", options.title.c_str());
 

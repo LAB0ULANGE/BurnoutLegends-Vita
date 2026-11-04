@@ -569,6 +569,21 @@ GLuint g_vertex_buffer{}, g_index_buffer{};  // wrap per-draw scratch memory (vg
 Stats g_stats;
 psprecomp::GuestMemory *g_memory{};
 
+// What the GPU is asked to do, for the "gpu:" trace line every 300 frames
+// (decode thread). Each framebuffer switch ends a GXM scene, which on the
+// tiled SGX stores the target and later reloads it.
+struct TargetUse {
+    std::uint64_t draws{}, binds{}, sampled{}, blended{}, through{};
+    int width{};
+};
+struct GpuCounters {
+    std::uint64_t switches{}, draws{}, blended{}, discards{}, through{}, samples{};
+    std::unordered_map<std::uint32_t, TargetUse> targets;  // by target key
+} g_gpu;
+// Scale of each render target as created (decode thread): the screen-sized
+// ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
+bool g_offscreen_1x{};
+
 std::uint32_t cmd(std::uint32_t index) noexcept { return g_commands[index] & 0x00FFFFFFu; }
 float float24(std::uint32_t data) noexcept { return std::bit_cast<float>(data << 8u); }
 
@@ -819,6 +834,7 @@ void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v) 
 // ---------------------------------------------------------------- render targets
 
 std::uint32_t target_key(std::uint32_t address) noexcept { return address & 0x001FFFF0u; }
+extern int g_scale;
 
 RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     auto [it, inserted] = g_targets.try_emplace(key);
@@ -828,8 +844,14 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     target.height = 272;
     target.texture = g_next_texture_id++;
     target.framebuffer = g_next_framebuffer_id++;
+    // Screen-sized targets (the frame buffers) at the render scale; narrower
+    // ones are the game's effect buffers, which offscreen_1x keeps at 1x.
+    const int scale = g_offscreen_1x && target.width < 480 ? 1 : g_scale;
     record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
-                              static_cast<std::uint32_t>(target.height)});
+                              static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(scale)});
+    char line[96];
+    std::snprintf(line, sizeof(line), "render target %06X: %dx%d at x%d", key, target.width, target.height, scale);
+    trace(line);
     // The GL thread binds and clears it, and sets its sampling.
     forget_state();
     for (GLint &value : target.sampling) value = -1;
@@ -917,6 +939,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     if ((address & 0x0F000000u) == 0x04000000u) {
         const auto it = g_targets.find(target_key(address));
         if (it != g_targets.end()) {
+            ++g_gpu.samples;
+            ++g_gpu.targets[target_key(address)].sampled;
             bind_texture_object(it->second.texture);
             set_sampling(it->second.sampling, linear, true, true);
             return {static_cast<float>(width) / static_cast<float>(it->second.width),
@@ -1143,9 +1167,15 @@ void flush() {
     const std::uint32_t address = cmd(0x9Cu);
     const std::uint32_t stride = cmd(0x9Du) & 0x7FCu;
     RenderTarget &target = render_target(target_key(address), stride);
+    TargetUse &use = g_gpu.targets[target_key(address)];
+    use.width = target.width;
+    ++use.draws;
+    ++g_gpu.draws;
     if (g_state.framebuffer != target.framebuffer) {
         g_state.framebuffer = target.framebuffer;
         record(Op::BindFramebuffer, {target.framebuffer});
+        ++use.binds;
+        ++g_gpu.switches;
     }
     if (g_state.viewport_w != target.width || g_state.viewport_h != target.height) {
         g_state.viewport_w = target.width;
@@ -1253,6 +1283,9 @@ void flush() {
     }
     if (fog) variant |= 1u << 9u;
     if (alpha_enabled && (alpha_test & 7u) != 1u) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
+    if (g_state.blend == 1) { ++g_gpu.blended; ++use.blended; }
+    if (through) { ++g_gpu.through; ++use.through; }
+    if ((alpha_enabled && (alpha_test & 7u) != 1u) || color_function != 1u) ++g_gpu.discards;
     if (color_function != 1u) variant |= 1u << 23u | color_function << 24u;
     if (blend_scaled) variant |= 1u << 21u;
     if (alpha_out) variant |= 1u << 22u;
@@ -1958,6 +1991,11 @@ GLuint gl_texture(GLuint id) {
     return g_gl_textures[id];
 }
 
+// GL thread: scale of each framebuffer id, and of the one bound (scissor and
+// viewport are recorded in PSP pixels).
+std::vector<int> g_framebuffer_scales;
+int g_bound_scale{1};
+
 void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int height) {
     const GLuint texture = gl_texture(texture_id);
     glBindTexture(GL_TEXTURE_2D, texture);
@@ -2227,10 +2265,11 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
     if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_gl_framebuffers[framebuffer_id]);
         // The visible 480x272 at the render scale, averaged back to PSP size.
-        const auto s = static_cast<std::uint32_t>(g_scale);
+        const int scale = framebuffer_id < g_framebuffer_scales.size() ? g_framebuffer_scales[framebuffer_id] : g_scale;
+        const auto s = static_cast<std::uint32_t>(scale);
         const std::uint32_t w = 480u * s, h = 272u * s;
         std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4u);
-        glReadPixels(0, (height - 272) * g_scale, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE,
+        glReadPixels(0, (height - 272) * scale, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE,
                      rgba.data());
         rgb.resize(480u * 272u * 3u);
         for (std::uint32_t y = 0; y < 272u; ++y)
@@ -2266,17 +2305,18 @@ void replay(const Frame &frame) {
         }
         case Op::FrontFace: glFrontFace(op[0]); op += 1; break;
         case Op::Scissor:
-            glScissor(static_cast<GLint>(op[0]) * g_scale, static_cast<GLint>(op[1]) * g_scale,
-                      static_cast<GLsizei>(op[2]) * g_scale, static_cast<GLsizei>(op[3]) * g_scale);
+            glScissor(static_cast<GLint>(op[0]) * g_bound_scale, static_cast<GLint>(op[1]) * g_bound_scale,
+                      static_cast<GLsizei>(op[2]) * g_bound_scale, static_cast<GLsizei>(op[3]) * g_bound_scale);
             op += 4;
             break;
         case Op::Viewport:
-            glViewport(0, 0, static_cast<GLsizei>(op[0]) * g_scale, static_cast<GLsizei>(op[1]) * g_scale);
+            glViewport(0, 0, static_cast<GLsizei>(op[0]) * g_bound_scale, static_cast<GLsizei>(op[1]) * g_bound_scale);
             op += 2;
             break;
         case Op::UseProgram: use_program(op[0]); op += 1; break;
         case Op::BindFramebuffer:
             glBindFramebuffer(GL_FRAMEBUFFER, op[0] < g_gl_framebuffers.size() ? g_gl_framebuffers[op[0]] : 0u);
+            g_bound_scale = op[0] < g_framebuffer_scales.size() ? g_framebuffer_scales[op[0]] : g_scale;
             op += 1;
             break;
         case Op::BindTexture: glBindTexture(GL_TEXTURE_2D, gl_texture(op[0])); op += 1; break;
@@ -2289,10 +2329,15 @@ void replay(const Frame &frame) {
         case Op::Uniform4: set_slot(op[0], floats(op[2]), op[1] * 4u, false); op += 3; break;
         case Op::UniformMatrix: set_slot(op[0], floats(op[1]), 16u, true); op += 2; break;
         case Op::Draw: draw(frame, op); op += 9; break;
-        case Op::CreateTarget:
-            create_target(op[0], op[1], static_cast<int>(op[2]) * g_scale, static_cast<int>(op[3]) * g_scale);
-            op += 4;
+        case Op::CreateTarget: {
+            const int scale = static_cast<int>(op[4]);
+            create_target(op[0], op[1], static_cast<int>(op[2]) * scale, static_cast<int>(op[3]) * scale);
+            if (op[0] >= g_framebuffer_scales.size()) g_framebuffer_scales.resize(op[0] + 1u, g_scale);
+            g_framebuffer_scales[op[0]] = scale;
+            g_bound_scale = scale;  // create_target leaves it bound
+            op += 5;
             break;
+        }
         case Op::Present: {
             const double started = host_now_ms();
             present_target(op[0], static_cast<int>(op[1]));
@@ -2426,6 +2471,7 @@ void flush_traces() {
 }
 
 void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
+void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }
@@ -2694,6 +2740,24 @@ void present(std::uint32_t address) {
                       (g_gl_busy_ms.load() - last_busy) / n,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0);
         trace(line);
+        // GPU work per frame, and the busiest render targets.
+        std::snprintf(line, sizeof(line),
+                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f 2D), %.1f target samples per frame",
+                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.through / n,
+                      g_gpu.samples / n);
+        trace(line);
+        std::vector<std::pair<std::uint32_t, TargetUse>> used(g_gpu.targets.begin(), g_gpu.targets.end());
+        std::sort(used.begin(), used.end(), [](const auto &a, const auto &b) { return a.second.draws > b.second.draws; });
+        std::string targets = "gpu targets (key width: draws/binds/samples/blended/2D per frame):";
+        for (std::size_t i = 0; i < used.size() && i < 6u; ++i) {
+            const TargetUse &u = used[i].second;
+            char item[96];
+            std::snprintf(item, sizeof(item), " %06X %d: %.0f/%.1f/%.1f/%.0f/%.0f", used[i].first, u.width, u.draws / n,
+                          u.binds / n, u.sampled / n, u.blended / n, u.through / n);
+            targets += item;
+        }
+        trace(targets.c_str());
+        g_gpu = GpuCounters{};
         last = g_stats;
         last_wall = wall;
         last_busy = g_gl_busy_ms.load();
