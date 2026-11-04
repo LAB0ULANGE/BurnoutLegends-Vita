@@ -106,6 +106,10 @@ Settings load(const std::string &root) {
             else if (name == "frame_skip") settings.frame_skip = value != 0;
             else if (name == "async_ge_v2") settings.async_ge = value != 0;
             else if (name == "shader_cache") settings.shader_cache = value != 0;
+            else if (name == "skip_when_behind") settings.skip_when_behind = value != 0;
+            else if (name == "offscreen_1x") settings.offscreen_1x = value != 0;
+            else if (name == "cache_sublists") settings.cache_sublists = value != 0;
+            else if (name == "sound_core1") settings.sound_core1 = value != 0;
             // cached_gpu_memory is no longer offered: textures went missing on the Vita.
         }
         std::fclose(file);
@@ -124,9 +128,10 @@ Settings load(const std::string &root) {
 void save(const std::string &root, const Settings &settings) {
     std::FILE *file = std::fopen((root + "settings.txt").c_str(), "w");
     if (file == nullptr) return;
-    std::fprintf(file, "auto_race %d\nrender_scale %d\nsound %d\nframe_skip %d\nasync_ge_v2 %d\nshader_cache %d\n",
-                 flag(settings.auto_race), settings.render_scale, flag(settings.sound), flag(settings.frame_skip),
-                 flag(settings.async_ge), flag(settings.shader_cache));
+    std::fprintf(file, "auto_race %d\nrender_scale %d\nsound %d\nframe_skip %d\nshader_cache %d\n", flag(settings.auto_race),
+                 settings.render_scale, flag(settings.sound), flag(settings.frame_skip), flag(settings.shader_cache));
+    std::fprintf(file, "skip_when_behind %d\noffscreen_1x %d\ncache_sublists %d\nsound_core1 %d\n", flag(settings.skip_when_behind),
+                 flag(settings.offscreen_1x), flag(settings.cache_sublists), flag(settings.sound_core1));
     std::fclose(file);
 }
 
@@ -141,19 +146,25 @@ Settings run(const std::string &root, const std::string &build) {
     int sound = flag(!settings.sound);
     int skip = flag(!settings.frame_skip);
     int shaders = flag(settings.shader_cache);
-    int async = flag(settings.async_ge);
+    int behind = flag(!settings.skip_when_behind);
+    int offscreen = flag(!settings.offscreen_1x);
+    int sublists = flag(!settings.cache_sublists);
+    int sound_core = flag(!settings.sound_core1);
     int start = 0;
     const std::vector<Item> items = {
         {"Mode", {"Jeu libre", "Course test auto"}, &mode, "Course test: menus joues seuls jusqu'a une course."},
         {"Resolution", {"960x544 (Vita)", "480x272 (PSP)"}, &resolution, "480x272: soulage le GPU, image plus floue."},
         {"Son/musique", {"Oui", "Non"}, &sound, "Sans le son, le jeu tourne un peu plus vite."},
         {"Saut d'images", {"Oui", "Non"}, &skip, "Saute une image si le rendu prend du retard."},
+        {"Attendre GPU", {"Non (vitesse)", "Oui"}, &behind, "Non: le jeu garde sa vitesse, des images sautent."},
+        {"Buffers effets", {"1x (rapide)", "Pleine res."}, &offscreen, "Petits buffers d'effets du jeu en 480x272."},
+        {"Cache listes", {"Oui", "Non"}, &sublists, "Sous-listes inchangees recopiees: soulage le CPU."},
+        {"Coeur du son", {"1 (libre)", "2 (avec GL)"}, &sound_core, "Mixage audio loin du thread graphique."},
         {"Cache shaders", {"Non", "Oui (exp.)"}, &shaders, "Garde les shaders compiles: demarrage rapide."},
-        {"GE parallele", {"Non", "Oui (exp.)"}, &async, "Experimental: plus fluide mais peut planter."},
         {"> LANCER LE JEU <", {}, &start, "X ou START pour lancer."},
     };
 
-    constexpr int kTop = 96, kRow = 34;
+    constexpr int kTop = 90, kRow = 28;
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
     int cursor = static_cast<int>(items.size()) - 1;
     std::uint32_t held = 0xFFFFFFFFu;  // ignore buttons already down at launch
@@ -168,7 +179,7 @@ Settings run(const std::string &root, const std::string &build) {
                 const int y = kTop + static_cast<int>(i) * kRow;
                 const bool selected = static_cast<int>(i) == cursor;
                 const std::uint32_t colour = selected ? kSelected : kText;
-                if (selected) screen.fill(0, y - 5, kWidth, 34, kHighlight);
+                if (selected) screen.fill(0, y - 2, kWidth, kRow, kHighlight);
                 if (selected) screen.text(8, y, ">", kSelected, 3);
                 screen.text(40, y, item.label, colour, 3);
                 if (!item.choices.empty())
@@ -205,7 +216,11 @@ Settings run(const std::string &root, const std::string &build) {
     settings.frame_skip = skip == 0;
     settings.shader_cache = shaders == 1;
     settings.cached_gpu_memory = false;
-    settings.async_ge = async == 1;
+    settings.async_ge = false;
+    settings.skip_when_behind = behind == 0;
+    settings.offscreen_1x = offscreen == 0;
+    settings.cache_sublists = sublists == 0;
+    settings.sound_core1 = sound_core == 0;
     save(root, settings);
 
     screen.clear();

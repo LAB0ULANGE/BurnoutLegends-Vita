@@ -11,9 +11,14 @@ struct Settings {
     int render_scale{2};    // 2 = 960x544, 1 = the PSP's 480x272
     bool sound{true};
     bool frame_skip{true};  // drop a frame when the GPU side falls behind
-    bool async_ge{};        // display lists walked on another core (experimental)
+    bool async_ge{};        // display lists walked on another core (no longer offered: crashed)
     bool shader_cache{};    // compiled shader programs kept on the memory card
-    bool cached_gpu_memory{};  // vitaGL pools in cached memory (experimental)
+    bool cached_gpu_memory{};  // vitaGL pools in cached memory (no longer offered)
+    // gl-48, each on its own so the log tells which one helps or breaks.
+    bool skip_when_behind{true};  // the game never waits for the GPU side (frames skipped instead)
+    bool offscreen_1x{true};      // the game's effect buffers at 1x
+    bool cache_sublists{true};    // unchanged GE sub-lists forwarded from a copy
+    bool sound_core1{true};       // SAS mixer and audio output on core 1 instead of beside the GL thread
 };
 
 // Loads the saved settings (or the old per-option flag files).

@@ -62,7 +62,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-47";
+constexpr const char *kBuild = "gl-48";
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
 constexpr const char *kLog = "ux0:data/" BURNOUT_VITA_FILES ".log";
 burnout::boot_menu::Settings g_settings;
@@ -243,10 +243,12 @@ int main() {
     const std::string label = std::string(BURNOUT_VITA_LABEL).empty() ? std::string(kBuild)
                                                                       : std::string(kBuild) + " " + BURNOUT_VITA_LABEL;
     g_settings = burnout::boot_menu::run(kRoot, label);
-    std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, async GE %d, shader cache %d, cached GPU memory %d\n",
-                 kBuild, g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale,
-                 g_settings.sound ? 1 : 0, g_settings.frame_skip ? 1 : 0, g_settings.async_ge ? 1 : 0,
-                 g_settings.shader_cache ? 1 : 0, g_settings.cached_gpu_memory ? 1 : 0);
+    std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, shader cache %d\n", kBuild,
+                 g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale, g_settings.sound ? 1 : 0,
+                 g_settings.frame_skip ? 1 : 0, g_settings.shader_cache ? 1 : 0);
+    std::fprintf(stderr, "[vita] gl-48 options: skip when behind %d, offscreen 1x %d, cached sub-lists %d, sound on core %d\n",
+                 g_settings.skip_when_behind ? 1 : 0, g_settings.offscreen_1x ? 1 : 0, g_settings.cache_sublists ? 1 : 0,
+                 g_settings.sound_core1 ? 1 : 2);
     const bool scripted = g_settings.auto_race;
 #else
     const bool scripted = true;
@@ -294,6 +296,9 @@ int main() {
             render.capture_dir = "ux0:data/burnout-frames";
         }
         render.frame_skip = g_settings.frame_skip;
+        render.skip_when_behind = g_settings.skip_when_behind;
+        render.offscreen_1x = g_settings.offscreen_1x;
+        render.cache_sublists = g_settings.cache_sublists;
         render.render_scale = g_settings.render_scale;  // 2 = 960x544, 1 = 480x272
         if (g_settings.shader_cache) {
             const std::string cache = std::string(kRoot) + "shader_cache";
@@ -308,17 +313,19 @@ int main() {
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
         // Sound: the SAS voices and audio channels to a BGM port, mixed on
-        // core 2 next to the GL thread.
+        // core 1 (beside the decode worker, which often waits) or core 2
+        // (beside the GL thread, the busiest on the heavier tracks).
         if (!g_settings.sound) {
             std::fprintf(stderr, "[vita] sound off\n");
         } else {
             std::string sound_error;
-            if (burnout::audio::start(2, {}, sound_error)) {
+            const int sound_core = g_settings.sound_core1 ? 1 : 2;
+            if (burnout::audio::start(sound_core, {}, sound_error)) {
                 // Music: the tracks converted by tools/convert_music.py.
                 const int tracks = burnout::music::set_dir(std::string(kRoot) + "music_ima");
                 // SAS mixing next to it, overlapping the game.
-                const bool mixer = burnout::sas_worker::start(2);
-                std::fprintf(stderr, "[vita] SAS mixer thread %s\n", mixer ? "on core 2" : "unavailable");
+                const bool mixer = burnout::sas_worker::start(sound_core);
+                std::fprintf(stderr, "[vita] SAS mixer thread %s %d\n", mixer ? "on core" : "unavailable, core", sound_core);
                 std::fprintf(stderr, "[vita] sound on, %d music tracks\n", tracks);
             } else std::fprintf(stderr, "[vita] sound unavailable: %s\n", sound_error.c_str());
         }
