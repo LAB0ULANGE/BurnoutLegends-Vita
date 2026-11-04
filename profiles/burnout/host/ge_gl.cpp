@@ -1294,6 +1294,20 @@ void flush() {
         record(Op::UseProgram, {variant});
     }
 
+    {
+        // Bring-up: PSPRECOMP_BURNOUT_TARGET_TRACE=N lists frame N's draws by target.
+        static const long trace_frame = [] {
+            const char *v = std::getenv("PSPRECOMP_BURNOUT_TARGET_TRACE");
+            return v != nullptr ? std::atol(v) : -1L;
+        }();
+        if (trace_frame >= 0 && g_stats.frames == static_cast<std::uint64_t>(trace_frame)) {
+            const std::uint32_t texture = (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u);
+            const bool samples_target = textured && (texture & 0x0F000000u) == 0x04000000u && g_targets.count(target_key(texture)) != 0u;
+            std::fprintf(stderr, "[tt] target %06X n=%u through=%d masked=%d blend=%d sample=%s%06X clear=%d\n", target_key(address),
+                         g_batch_count, through ? 1 : 0, g_state.color_mask == 0 ? 1 : 0, g_state.blend == 1 ? 1 : 0,
+                         samples_target ? "T" : "-", samples_target ? target_key(texture) : 0u, clear_mode ? 1 : 0);
+        }
+    }
     phase = 9u;
     bind_vertices();
     ++g_stats.batches;
