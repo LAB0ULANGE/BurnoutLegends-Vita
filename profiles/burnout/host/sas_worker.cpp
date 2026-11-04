@@ -89,10 +89,22 @@ void post(std::function<void()> work) {
     g_cv.notify_all();
 }
 
+std::atomic<std::uint64_t> g_wait_us{0u}, g_waits{0u};
+
 void drain() {
     if (!active()) return;
     std::unique_lock lock(g_mutex);
+    if (g_queue.empty() && !g_running_work) return;
+    // Work still queued or running: the emulation waits for it (traced).
+    const double started = host_now_ms();
     g_cv.wait(lock, [] { return g_queue.empty() && !g_running_work; });
+    g_wait_us.fetch_add(static_cast<std::uint64_t>((host_now_ms() - started) * 1000.0), std::memory_order_relaxed);
+    g_waits.fetch_add(1u, std::memory_order_relaxed);
+}
+
+double take_wait_ms(std::uint64_t &waits) {
+    waits = g_waits.exchange(0u, std::memory_order_relaxed);
+    return static_cast<double>(g_wait_us.exchange(0u, std::memory_order_relaxed)) / 1000.0;
 }
 
 double take_busy_ms() { return static_cast<double>(g_busy_us.exchange(0u, std::memory_order_relaxed)) / 1000.0; }

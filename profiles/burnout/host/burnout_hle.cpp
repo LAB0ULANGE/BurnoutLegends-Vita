@@ -2333,10 +2333,17 @@ std::string thread_time_report(double frames) {
     }
     if (sas_worker::active()) g_sas_ms = sas_worker::take_busy_ms();
     if (g_sas_grains != 0u) {
-        char item[96];
+        char item[160];
         std::snprintf(item, sizeof(item), "; sas mix %.1f (%.1f grains%s)", g_sas_ms / frames, g_sas_grains / frames,
                       sas_worker::active() ? ", other core" : "");
         report += item;
+        if (sas_worker::active()) {
+            std::uint64_t waits = 0u;
+            const double waited = sas_worker::take_wait_ms(waits);
+            std::snprintf(item, sizeof(item), ", emulation waited %.1f in %.1f waits", waited / frames,
+                          static_cast<double>(waits) / frames);
+            report += item;
+        }
         g_sas_ms = 0.0;
         g_sas_grains = 0u;
     }

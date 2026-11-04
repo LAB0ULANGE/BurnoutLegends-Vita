@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 
 // Runs the SAS synthesizer (sas_core) on its own thread, so mixing a grain
@@ -22,5 +23,8 @@ void drain();
 
 // Host time the worker spent running work, in ms, since the last call.
 [[nodiscard]] double take_busy_ms();
+// Host time drain() spent waiting for the worker, in ms, and how many times
+// it had to, since the last call.
+[[nodiscard]] double take_wait_ms(std::uint64_t &waits);
 
 } // namespace burnout::sas_worker
