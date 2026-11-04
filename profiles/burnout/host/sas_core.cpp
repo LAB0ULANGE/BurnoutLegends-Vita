@@ -113,39 +113,6 @@ void walk(std::int32_t &height, Curve curve, std::int32_t rate) {
     height = static_cast<std::int32_t>(std::clamp<std::int64_t>(h, -1, kEnvelopeMax + 1ll));
 }
 
-void step(Voice &v) {
-    Envelope &e = v.envelope;
-    switch (e.state) {
-    case Off: break;
-    case Attack:
-        walk(e.height, e.attack, e.attack_rate);
-        if (e.height >= kEnvelopeMax) {
-            e.height = kEnvelopeMax;
-            e.state = Decay;
-        }
-        break;
-    case Decay:
-        walk(e.height, e.decay, e.decay_rate);
-        if (e.height <= e.sustain_level) {
-            e.height = std::max(e.sustain_level, 0);
-            e.state = Sustain;
-        }
-        break;
-    case Sustain:
-        walk(e.height, e.sustain, e.sustain_rate);
-        e.height = std::clamp(e.height, 0, kEnvelopeMax);
-        break;
-    case Release:
-        walk(e.height, e.release, e.release_rate);
-        if (e.height <= 0) {
-            e.height = 0;
-            e.state = Off;
-            v.playing = false;
-        }
-        break;
-    }
-}
-
 // sceSasSetSimpleADSR bit fields (the SPU's ADSR registers).
 std::int32_t simple_rate(std::uint32_t n) {
     n &= 0x7Fu;
@@ -279,18 +246,69 @@ std::int32_t envelope_height(int voice) { return valid(voice) ? std::max(g_voice
 
 namespace {
 
-// The rest of the grain from sample `first` once the envelope has settled:
-// the same arithmetic as mix(), with the voice's hot state in locals (stores
-// into the mix buffer would otherwise reload it every sample).
-void mix_settled(Voice &v, std::uint32_t first) {
-    const std::int32_t gain = std::max(v.envelope.height, 0) >> 15;
+// The per-sample loops keep the voice's hot state in locals: the mix buffer
+// holds int32 like most Voice fields, so writing it would otherwise make the
+// compiler reload the whole voice every sample (cheap on a PC, ruinous on the
+// Vita's Cortex-A9, where the mixer ran ~16x slower than the PC for 2.5x on
+// the game code). The arithmetic is unchanged, sample for sample.
+
+// Envelope step on a local copy (step() above, with `playing` apart).
+inline void step_local(Envelope &e, bool &playing) {
+    switch (e.state) {
+    case Off: break;
+    case Attack:
+        walk(e.height, e.attack, e.attack_rate);
+        if (e.height >= kEnvelopeMax) {
+            e.height = kEnvelopeMax;
+            e.state = Decay;
+        }
+        break;
+    case Decay:
+        walk(e.height, e.decay, e.decay_rate);
+        if (e.height <= e.sustain_level) {
+            e.height = std::max(e.sustain_level, 0);
+            e.state = Sustain;
+        }
+        break;
+    case Sustain:
+        walk(e.height, e.sustain, e.sustain_rate);
+        e.height = std::clamp(e.height, 0, kEnvelopeMax);
+        break;
+    case Release:
+        walk(e.height, e.release, e.release_rate);
+        if (e.height <= 0) {
+            e.height = 0;
+            e.state = Off;
+            playing = false;
+        }
+        break;
+    }
+}
+
+// Whether the voice's sample has run out (only next_sample changes it).
+inline bool sample_ended(const Voice &v) { return v.stream_end && v.sample_at >= v.sample_count; }
+
+// Mixes one voice into `mix` for the whole grain.
+void mix_voice(Voice &v, std::int32_t *mix, std::uint32_t grain) {
+    Envelope e = v.envelope;
+    bool playing = v.playing;
     const std::int32_t left = v.left, right = v.right;
     const std::uint32_t pitch = v.pitch;
     std::int32_t current = v.current, next = v.next;
     std::uint32_t fraction = v.fraction;
-    std::int32_t *mix = g_mix.data();
-    for (std::uint32_t i = first; i < g_grain; ++i) {
+    bool ended = sample_ended(v);
+    // Sustaining at rate 0, the envelope stops moving once a step has
+    // clamped it: the per-sample walk is skipped from there on (most looped
+    // voices spend their life there).
+    bool settled = false;
+    std::int32_t gain = 0;
+    for (std::uint32_t i = 0; i < grain; ++i) {
         const std::int32_t sample = current + (((next - current) * static_cast<std::int32_t>(fraction)) >> 12);
+        if (!settled) {
+            step_local(e, playing);
+            settled = e.state == Sustain && e.sustain_rate == 0;
+            gain = std::max(e.height, 0) >> 15;
+        }
         const std::int32_t shaped = (sample * gain) >> 15;
         mix[i * 2u] += (shaped * left) >> 12;
         mix[i * 2u + 1u] += (shaped * right) >> 12;
@@ -299,14 +317,19 @@ void mix_settled(Voice &v, std::uint32_t first) {
             fraction -= 0x1000u;
             current = next;
             next = next_sample(v);
+            ended = sample_ended(v);
         }
-        if (v.stream_end && v.sample_at >= v.sample_count) {
-            v.playing = false;
-            v.envelope.state = Off;
-            v.envelope.height = 0;
+        if (ended) {
+            // The sample ran out: the voice ends as the PSP's does.
+            playing = false;
+            e.state = Off;
+            e.height = 0;
             break;
         }
+        if (!playing) break;
     }
+    v.envelope = e;
+    v.playing = playing;
     v.current = current;
     v.next = next;
     v.fraction = fraction;
@@ -316,44 +339,11 @@ void mix_settled(Voice &v, std::uint32_t first) {
 
 void mix(std::int16_t *out) {
     g_mix.assign(static_cast<std::size_t>(g_grain) * 2u, 0);
-    for (Voice &v : g_voices) {
-        if (!v.playing) continue;
-        // Sustaining at rate 0, the envelope stops moving once a step has
-        // clamped it: the per-sample walk is skipped from there on (most
-        // looped voices spend their life there, and the walk dominates on
-        // the Vita).
-        bool settled = false;
-        for (std::uint32_t i = 0; i < g_grain; ++i) {
-            const std::int32_t sample = v.current + (((v.next - v.current) * static_cast<std::int32_t>(v.fraction)) >> 12);
-            if (!settled) {
-                step(v);
-                settled = v.envelope.state == Sustain && v.envelope.sustain_rate == 0;
-            }
-            const std::int32_t shaped = (sample * (std::max(v.envelope.height, 0) >> 15)) >> 15;
-            g_mix[i * 2u] += (shaped * v.left) >> 12;
-            g_mix[i * 2u + 1u] += (shaped * v.right) >> 12;
-            v.fraction += v.pitch;
-            while (v.fraction >= 0x1000u) {
-                v.fraction -= 0x1000u;
-                v.current = v.next;
-                v.next = next_sample(v);
-            }
-            if (v.stream_end && v.sample_at >= v.sample_count) {
-                // The sample ran out: the voice ends as the PSP's does.
-                v.playing = false;
-                v.envelope.state = Off;
-                v.envelope.height = 0;
-                break;
-            }
-            if (!v.playing) break;
-            if (settled) {
-                mix_settled(v, i + 1u);
-                break;
-            }
-        }
-    }
+    std::int32_t *mix = g_mix.data();
+    for (Voice &v : g_voices)
+        if (v.playing) mix_voice(v, mix, g_grain);
     for (std::uint32_t i = 0; i < g_grain * 2u; ++i)
-        out[i] = static_cast<std::int16_t>(std::clamp(g_mix[i], -32768, 32767));
+        out[i] = static_cast<std::int16_t>(std::clamp(mix[i], -32768, 32767));
 }
 
 } // namespace burnout::sas
