@@ -31,6 +31,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -745,7 +746,199 @@ std::uint32_t forward_run(psprecomp::GuestMemory &memory, const std::uint8_t *wo
     return i;
 }
 
+// ------------------------------------------------------- cached sub-lists
+//
+// Most of a frame's commands are in sub-lists the top level CALLs (models),
+// and most of those are the same words every frame, called in the same
+// state. A sub-list already seen with the same words and the same entry
+// state is forwarded from a copy made the first time, with the snapshot
+// records it needed then, instead of being walked command by command. Only
+// leaf sub-lists qualify: no control flow but BASE/OFFSET and the final RET,
+// no SIGNAL/FINISH, no transfer, and nothing drawn from outside the static
+// range, so what they forward depends only on their words and entry state.
+
+struct CallKey {
+    std::uint32_t target{}, base{}, offset{};
+    gl::SnapshotState entry{};
+    bool operator==(const CallKey &other) const noexcept {
+        return target == other.target && base == other.base && offset == other.offset && entry.vtype == other.entry.vtype &&
+               entry.vertex_address == other.entry.vertex_address && entry.index_address == other.entry.index_address &&
+               entry.clut_low == other.entry.clut_low && entry.clut_high == other.entry.clut_high;
+    }
+};
+struct CallKeyHash {
+    std::size_t operator()(const CallKey &k) const noexcept {
+        std::uint64_t h = (static_cast<std::uint64_t>(k.target) << 32u) ^ k.base ^ (k.offset * 0x9E3779B1u);
+        for (const std::uint32_t v : {k.entry.vtype, k.entry.vertex_address, k.entry.index_address, k.entry.clut_low, k.entry.clut_high})
+            h = (h ^ v) * 0x100000001B3ull;
+        return static_cast<std::size_t>(h ^ (h >> 29u));
+    }
+};
+// A stretch of the sub-list forwarded with one base and offset.
+struct CallSegment {
+    std::uint32_t base{}, offset{}, first{}, count{};
+};
+struct CachedCall {
+    bool cacheable{};
+    std::uint32_t changes{};                 // times the words were found changed
+    std::vector<std::uint32_t> words;        // every word up to the RET (excluded), as in memory
+    std::vector<CallSegment> segments;       // the plain words among them
+    std::vector<std::uint8_t> records;       // snapshot records the words needed
+    std::vector<std::uint32_t> record_offsets;
+    gl::SnapshotState exit{};                // pointer state after the RET
+    std::uint32_t exit_base{}, exit_offset{};
+};
+std::unordered_map<CallKey, CachedCall, CallKeyHash> g_calls;
+std::uint64_t g_call_hits{}, g_call_walked{}, g_call_hit_words{};
+
+bool static_range(std::uint32_t address) noexcept { return address >= 0x08800000u && address < 0x09C00000u; }
+
+void forget_words(CachedCall &call) {
+    call.words = {};
+    call.segments = {};
+    call.records = {};
+    call.record_offsets = {};
+}
+
+// Walks the sub-list at `target` as ge_scan and forward_run would, into
+// `call`, from the current pointer state. False when it does not qualify (the
+// caller then walks it as usual); the pointer state is left as it was.
+bool classify_call(const psprecomp::GuestMemory &memory, std::uint32_t target, std::uint32_t base, std::uint32_t offset,
+                   CachedCall &call) {
+    constexpr std::uint32_t kMaxWords = 8192u;
+    forget_words(call);
+    const gl::SnapshotState saved = gl::g_scan;
+    gl::Snapshot snapshot;
+    bool ok = false;
+    std::uint32_t segment_start = 0u;
+    const auto close_segment = [&](std::uint32_t end) {
+        // The plain words since the last control word, at the base and
+        // offset they were read with.
+        if (end > segment_start) call.segments.push_back({base, offset, segment_start, end - segment_start});
+    };
+    for (std::uint32_t i = 0; i < kMaxWords; ++i) {
+        const std::uint32_t pc = target + i * 4u;
+        const std::uint8_t *at = memory.raw_pointer(pc, 4u);
+        if (at == nullptr) break;
+        std::uint32_t word;
+        std::memcpy(&word, at, 4u);
+        const std::uint32_t op = word >> 24u;
+        const std::uint32_t data = word & 0x00FFFFFFu;
+        if (op == 0x0Bu) {  // RET
+            close_segment(i);
+            ok = true;
+            break;
+        }
+        bool fail = false;
+        bool control = false;
+        switch (op) {
+        case 0x10u: control = true; close_segment(i); base = (data << 8u) & 0x0F000000u; break;  // BASE
+        case 0x13u: control = true; close_segment(i); offset = data << 8u; break;                // OFFSET_ADDR
+        case 0x14u: control = true; close_segment(i); offset = pc; break;                        // ORIGIN_ADDR
+        case 0x08u: case 0x0Au: case 0x0Cu: case 0x0Eu: case 0x0Fu:  // JUMP CALL END SIGNAL FINISH
+        case 0xB2u: case 0xB3u: case 0xB4u: case 0xB5u: case 0xEAu: case 0xEBu: case 0xECu: case 0xEDu: case 0xEEu:
+            fail = true;
+            break;
+        case 0x04u: {
+            const bool indexed = ((gl::g_scan.vtype >> 11u) & 3u) != 0u;
+            fail = !static_range(gl::g_scan.vertex_address) || (indexed && !static_range(gl::g_scan.index_address));
+            break;
+        }
+        case 0xC4u: {
+            const std::uint32_t clut = (gl::g_scan.clut_low & 0xFFFFF0u) | ((gl::g_scan.clut_high << 8u) & 0x0F000000u);
+            fail = !static_range(clut);
+            break;
+        }
+        default: break;
+        }
+        if (fail) {
+            static int reported = 0;
+            if (std::getenv("PSPRECOMP_BURNOUT_CALL_DEBUG") != nullptr && reported++ < 40)
+                std::fprintf(stderr, "[calls] %08X fails at word %u op %02X vtype %06x vaddr %08x\n", target, i, op,
+                             gl::g_scan.vtype, gl::g_scan.vertex_address);
+            break;
+        }
+        call.words.push_back(word);
+        if (control) {
+            segment_start = i + 1u;
+            continue;
+        }
+        if (kForwardKind[op] == ForwardKind::Pointer || kForwardKind[op] == ForwardKind::Snapshot) {
+            const std::uint32_t record = gl::snapshot_command(memory, word, base, offset, snapshot);
+            if (record != UINT32_MAX) call.record_offsets.push_back(record);
+            if (!snapshot.vertices.empty()) break;  // vertices copied: not static after all
+        }
+    }
+    ok = ok && snapshot.vertices.empty() && !call.words.empty();
+    call.exit = gl::g_scan;
+    call.exit_base = base;
+    call.exit_offset = offset;
+    gl::g_scan = saved;
+    call.records.swap(snapshot.records);
+    call.cacheable = ok;
+    if (!ok) forget_words(call);
+    return ok;
+}
+
+// What walking the sub-list would have forwarded, from the copy.
+void forward_cached(const CachedCall &call) {
+    gl::g_scan = call.exit;
+    for (const CallSegment &segment : call.segments) {
+        g_pending_words.push_back(segment.base);
+        g_pending_words.push_back(segment.offset);
+        const auto at = static_cast<std::uint32_t>(g_pending_words.size());
+        const auto first = call.words.begin() + segment.first;
+        g_pending_words.insert(g_pending_words.end(), first, first + segment.count);
+        g_pending.push_back({at, segment.count, kRun});
+    }
+    const auto first = static_cast<std::uint32_t>(g_pending_snapshot.records.size());
+    g_pending_snapshot.records.insert(g_pending_snapshot.records.end(), call.records.begin(), call.records.end());
+    for (const std::uint32_t record : call.record_offsets) g_pending_records.push_back(first + record);
+}
+
 } // namespace
+
+bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, std::uint32_t &base, std::uint32_t &offset,
+                    std::uint32_t stall) {
+    if (!g_options.enabled || g_options.backend != Backend::OpenGL || !g_async || !g_options.cache_sublists) return false;
+    target &= 0x0FFFFFFCu;
+    if (!static_range(target)) return false;
+    // Each entry state of each sub-list is a key: bounded, in case some state
+    // never repeats.
+    if (g_calls.size() > 32768u) g_calls.clear();
+    auto [it, inserted] = g_calls.try_emplace(CallKey{target, base, offset, gl::g_scan});
+    CachedCall &call = it->second;
+    if (!inserted && !call.cacheable) return false;
+    const auto bytes = static_cast<std::uint32_t>(call.words.size() * 4u);
+    // A stall address inside the sub-list: the GE stops there, walk it.
+    const std::uint32_t stop = stall & 0x0FFFFFFFu;
+    if (stall != 0u && stop >= target && stop <= target + std::max<std::uint32_t>(bytes, 8192u * 4u) + 4u) return false;
+    if (!inserted) {
+        const std::uint8_t *live = memory.raw_pointer(target, bytes + 4u);
+        std::uint32_t ret = 0u;
+        if (live != nullptr) std::memcpy(&ret, live + bytes, 4u);
+        if (live != nullptr && (ret >> 24u) == 0x0Bu && std::memcmp(live, call.words.data(), bytes) == 0) {
+            forward_cached(call);
+            base = call.exit_base;
+            offset = call.exit_offset;
+            ++g_call_hits;
+            g_call_hit_words += call.words.size();
+            return true;
+        }
+        // Rewritten: a sub-list the game rebuilds is not worth caching.
+        if (++call.changes > 4u) {
+            call.cacheable = false;
+            forget_words(call);
+            return false;
+        }
+    }
+    ++g_call_walked;
+    if (!classify_call(memory, target, base, offset, call)) return false;
+    forward_cached(call);
+    base = call.exit_base;
+    offset = call.exit_offset;
+    return true;
+}
 
 bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
                      std::uint32_t offset) {
@@ -954,7 +1147,7 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         worst_flip = std::max(worst_flip, now - last_flip);
         last_flip = now;
         if (++g_flips % 300u == 0u) {
-            char line[320];
+            char line[400];
             std::uint64_t early_used = 0u, early_missed = 0u;
             {
                 std::lock_guard lock(g_early_mutex);
@@ -963,10 +1156,13 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
             }
             std::snprintf(line, sizeof(line),
                           "emulation: list scan %.1f ms/flip in %.0f scans, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
-                          "worst flip %.0f ms; file reads %.0f ms (longest %.0f); early transfers %llu used, %llu missed; %llu skipped when behind",
+                          "worst flip %.0f ms; file reads %.0f ms (longest %.0f); early transfers %llu used, %llu missed; %llu skipped when behind; "
+                          "sub-lists %.0f cached (%.0f words), %.1f walked anew per flip",
                           g_scan_ms / 300.0, g_scans / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
                           worst_flip, gl::io_read_ms, gl::io_read_max_ms, static_cast<unsigned long long>(early_used),
-                          static_cast<unsigned long long>(early_missed), static_cast<unsigned long long>(g_behind_skips));
+                          static_cast<unsigned long long>(early_missed), static_cast<unsigned long long>(g_behind_skips),
+                          g_call_hits / 300.0, g_call_hit_words / 300.0, g_call_walked / 300.0);
+            g_call_hits = g_call_hit_words = g_call_walked = 0u;
             g_behind_skips = 0u;
             worst_flip = 0.0;
             gl::io_read_ms = gl::io_read_max_ms = 0.0;

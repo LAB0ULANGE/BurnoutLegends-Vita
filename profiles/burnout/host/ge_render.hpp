@@ -36,6 +36,9 @@ struct Options {
     bool skip_when_behind{};
     // OpenGL: render targets narrower than the screen at 1x.
     bool offscreen_1x{};
+    // OpenGL: unchanged leaf sub-lists forwarded from a copy instead of
+    // walked (ge_cached_call).
+    bool cache_sublists{};
     // OpenGL: internal resolution, a multiple of 480x272.
     int render_scale{1};
     // OpenGL (Vita): compiled shader programs kept in this directory (empty:
@@ -65,6 +68,12 @@ std::uint32_t ge_plain_commands(psprecomp::GuestMemory &memory, const std::uint8
                                 std::uint32_t base, std::uint32_t offset);
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset);
+// CALL of the sub-list at `target` (emulation thread, ge_scan): when it is a
+// leaf sub-list already seen with the same words, forwards it as walking it
+// would and returns true, `base` and `offset` updated by the BASE/OFFSET
+// commands inside; the caller then goes on as if it had returned.
+bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, std::uint32_t &base, std::uint32_t &offset,
+                    std::uint32_t stall);
 // Asynchronous GE front end (emulation thread, at sceGeListEnQueue): walks
 // the list's top level only, without its CALLs, and copies the source of
 // every block transfer (TRXKICK) there, so the front end can tell the game the

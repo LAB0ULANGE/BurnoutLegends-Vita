@@ -78,6 +78,7 @@ Cli parse(int argc, char **argv) {
         else if (key == "--frame-skip") cli.render.frame_skip = true;  // as on the Vita
         else if (key == "--skip-when-behind") cli.render.skip_when_behind = true;  // with --frame-skip
         else if (key == "--offscreen-1x") cli.render.offscreen_1x = true;  // effect buffers at 1x
+        else if (key == "--cache-sublists") cli.render.cache_sublists = true;  // unchanged sub-lists from a copy
         else if (key == "--async-ge") o.async_ge = true;  // display lists on another thread, as on the Vita
         else if (key == "--sas-thread") burnout::sas_worker::start(0);  // SAS mixing on its own thread, as on the Vita
         else if (key == "--music-dir") {  // converted tracks (tools/convert_music.py)

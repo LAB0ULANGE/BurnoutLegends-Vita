@@ -883,6 +883,12 @@ void ge_scan(Runtime &rt, GeList &list, std::vector<GeEvent> *events = nullptr) 
         switch (op) {
         case 0x08u: list.pc = target(); break;                         // JUMP
         case 0x0Au: {  // CALL
+#if defined(BURNOUT_GE_RENDER)
+            // An unchanged sub-list seen before goes to the renderer whole.
+            if (events == nullptr && render_runs &&
+                render::ge_cached_call(rt.memory(), target(), list.base, list.offset, list.stall))
+                break;
+#endif
             list.call_stack.push_back(list.pc);
             list.pc = target();
             // The sub-lists (models, ~1500 a frame) are scattered: start
