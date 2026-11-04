@@ -110,6 +110,7 @@ Settings load(const std::string &root) {
             else if (name == "offscreen_1x") settings.offscreen_1x = value != 0;
             else if (name == "cache_sublists") settings.cache_sublists = value != 0;
             else if (name == "sound_core1") settings.sound_core1 = value != 0;
+            else if (name == "sas_thread") settings.sas_thread = value != 0;
             // cached_gpu_memory is no longer offered: textures went missing on the Vita.
         }
         std::fclose(file);

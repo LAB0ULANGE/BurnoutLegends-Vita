@@ -19,6 +19,7 @@ struct Settings {
     bool offscreen_1x{};          // the game's effect buffers at 1x (off: changed the car lighting, gain negligible)
     bool cache_sublists{true};    // unchanged GE sub-lists forwarded from a copy
     bool sound_core1{true};       // SAS mixer and audio output on core 1 instead of beside the GL thread
+    bool sas_thread{};            // SAS mixing on its own thread (off: cost core 0 more than it saved)
 };
 
 // Loads the saved settings (or the old per-option flag files).

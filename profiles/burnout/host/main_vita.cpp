@@ -62,7 +62,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-52";
+constexpr const char *kBuild = "gl-53";
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
 constexpr const char *kLog = "ux0:data/" BURNOUT_VITA_FILES ".log";
 burnout::boot_menu::Settings g_settings;
@@ -246,9 +246,9 @@ int main() {
     std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, shader cache %d\n", kBuild,
                  g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale, g_settings.sound ? 1 : 0,
                  g_settings.frame_skip ? 1 : 0, g_settings.shader_cache ? 1 : 0);
-    std::fprintf(stderr, "[vita] options: skip when behind %d, offscreen 1x %d, cached sub-lists %d, sound on core %d\n",
+    std::fprintf(stderr, "[vita] options: skip when behind %d, offscreen 1x %d, cached sub-lists %d, sound on core %d, SAS thread %d\n",
                  g_settings.skip_when_behind ? 1 : 0, g_settings.offscreen_1x ? 1 : 0, g_settings.cache_sublists ? 1 : 0,
-                 g_settings.sound_core1 ? 1 : 2);
+                 g_settings.sound_core1 ? 1 : 2, g_settings.sas_thread ? 1 : 0);
     const bool scripted = g_settings.auto_race;
 #else
     const bool scripted = true;
@@ -323,9 +323,16 @@ int main() {
             if (burnout::audio::start(sound_core, {}, sound_error)) {
                 // Music: the tracks converted by tools/convert_music.py.
                 const int tracks = burnout::music::set_dir(std::string(kRoot) + "music_ima");
-                // SAS mixing next to it, overlapping the game.
-                const bool mixer = burnout::sas_worker::start(sound_core);
-                std::fprintf(stderr, "[vita] SAS mixer thread %s %d\n", mixer ? "on core" : "unavailable, core", sound_core);
+                // SAS mixing: on the emulation thread by default. The game
+                // reads the voices' state right after each grain, so a mixer
+                // thread never overlapped it and its queue and wake-ups cost
+                // core 0 more than the mixing itself (PC: SND 1.0 vs 0.6 ms).
+                if (g_settings.sas_thread) {
+                    const bool mixer = burnout::sas_worker::start(sound_core);
+                    std::fprintf(stderr, "[vita] SAS mixer thread %s %d\n", mixer ? "on core" : "unavailable, core", sound_core);
+                } else {
+                    std::fprintf(stderr, "[vita] SAS mixing on the emulation thread\n");
+                }
                 std::fprintf(stderr, "[vita] sound on, %d music tracks\n", tracks);
             } else std::fprintf(stderr, "[vita] sound unavailable: %s\n", sound_error.c_str());
         }
