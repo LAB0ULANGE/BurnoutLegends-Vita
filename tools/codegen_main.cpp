@@ -908,6 +908,32 @@ bool profile_labels_enabled() {
     return enabled;
 }
 
+// PSPRECOMP_BLOCK_COUNTS=1: every block counts its executions in
+// psprecomp_block_counts (indexed by (address - 0x08800000) / 4), for a
+// measurement build that lists the blocks a run executes.
+bool block_counts_enabled() {
+    static const bool enabled = std::getenv("PSPRECOMP_BLOCK_COUNTS") != nullptr;
+    return enabled;
+}
+
+// PSPRECOMP_HOT_BLOCKS=file: the guest addresses (hex, one per line) of the
+// blocks a training run executed. Every other block's label is marked cold,
+// so GCC moves that code out of the hot path and favours the executed blocks
+// when it allocates registers. The code itself is unchanged.
+const std::set<std::uint32_t> *hot_blocks() {
+    static const std::optional<std::set<std::uint32_t>> blocks = []() -> std::optional<std::set<std::uint32_t>> {
+        const char *path = std::getenv("PSPRECOMP_HOT_BLOCKS");
+        if (path == nullptr) return std::nullopt;
+        std::ifstream in(path);
+        std::set<std::uint32_t> set;
+        std::string line;
+        while (std::getline(in, line))
+            if (!line.empty()) set.insert(static_cast<std::uint32_t>(std::stoul(line, nullptr, 16)));
+        return set;
+    }();
+    return blocks ? &*blocks : nullptr;
+}
+
 struct VfpuPrefixState {
     std::array<std::optional<std::uint32_t>, 3> control{};
     [[nodiscard]] bool all_default() const {
@@ -1070,7 +1096,11 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
         const auto regular = [&](const psprecomp::DecodedInstruction &instruction, std::uint32_t at) {
             return lower_known_vfpu_prefixes(emit_regular(instruction, at), vfpu_prefixes);
         };
-        body << "L_" << psprecomp::hex32(block_start).substr(2) << ":\n";
+        body << "L_" << psprecomp::hex32(block_start).substr(2) << ":";
+        if (const auto *hot = hot_blocks(); hot != nullptr && !hot->contains(block_start)) body << " PSPRECOMP_COLD_LABEL;";
+        body << "\n";
+        if (block_counts_enabled())
+            body << "    ++psprecomp_block_counts[(" << psprecomp::hex32(block_start) << "u - 0x08800000u) >> 2u];\n";
         if (profile_labels_enabled())
             body << "    psprecomp_profile_label = " << psprecomp::hex32(block_start) << "u;\n";
         std::uint32_t pc = block_start;
@@ -1701,6 +1731,10 @@ int generate_auto(const std::filesystem::path &elf_path,
     units_header << "} // namespace psprecomp\n";
     if (profile_labels_enabled())
         units_header << "extern \"C\" volatile std::uint32_t psprecomp_profile_label;\n";
+    if (block_counts_enabled()) units_header << "extern \"C\" std::uint32_t psprecomp_block_counts[];\n";
+    if (hot_blocks() != nullptr)
+        units_header << "#if defined(__GNUC__)\n#define PSPRECOMP_COLD_LABEL __attribute__((cold))\n#else\n"
+                        "#define PSPRECOMP_COLD_LABEL\n#endif\n";
     (void)write_text_if_changed(units_header_path, units_header.str());
 
     std::set<std::filesystem::path> expected_cpp;

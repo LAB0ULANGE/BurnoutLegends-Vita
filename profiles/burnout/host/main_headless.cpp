@@ -108,6 +108,23 @@ Cli parse(int argc, char **argv) {
 
 } // namespace
 
+// Block execution counts of a PSPRECOMP_BLOCK_COUNTS corpus (16 MiB of code
+// space, one counter per instruction slot); written as the list of executed
+// block addresses when PSPRECOMP_BLOCK_COUNTS_OUT names a file.
+extern "C" {
+std::uint32_t psprecomp_block_counts[1u << 22];
+}
+
+namespace {
+void write_block_counts() {
+    const char *path = std::getenv("PSPRECOMP_BLOCK_COUNTS_OUT");
+    if (path == nullptr) return;
+    std::ofstream out(path);
+    for (std::uint32_t i = 0; i < (1u << 22); ++i)
+        if (psprecomp_block_counts[i] != 0u) out << std::hex << (0x08800000u + i * 4u) << ' ' << std::dec << psprecomp_block_counts[i] << '\n';
+}
+} // namespace
+
 int main(int argc, char **argv) {
     try {
         Cli cli = parse(argc, argv);
@@ -126,6 +143,7 @@ int main(int argc, char **argv) {
 #if defined(_WIN32)
         if (profiler) profiler->write_report(cli.profile);
 #endif
+        write_block_counts();
         std::cout << result.report;
         std::ofstream(cli.report) << result.report;
         return result.complete ? 0 : 1;
