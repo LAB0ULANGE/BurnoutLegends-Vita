@@ -519,6 +519,7 @@ struct Texture {
     bool mipmapped{};  // uploaded with a generated mip chain
     std::uint8_t min_alpha{255u};  // lowest texel alpha of the upload
     std::uint32_t upload_mode{};   // g_probe_mode it was uploaded in
+    bool foliage{};                // cut-out and mostly green (trees, bushes)
     GLint sampling[4]{-1, -1, -1, -1};
 };
 
@@ -610,6 +611,23 @@ bool g_stencil_ab{};
 // (normal), 1 CLUT textures as GXM P8 paletted textures (no mips), 2 RGBA8
 // without mips. (gl-64 probed 1 scissor 1/16, 2 no discard, 3 untextured.)
 bool g_gpu_probe{};
+// Test: cut-out draws (alpha-tested, not blended: trees, hedges, fences) are not drawn.
+bool g_no_cutouts{std::getenv("PSPRECOMP_BURNOUT_NO_CUTOUTS") != nullptr};
+bool g_draw_is_cutout{};
+bool g_texture_foliage{};  // the texture bind_texture last bound is foliage
+// Cut-out textures not drawn (trees): guest addresses; PC: PSPRECOMP_BURNOUT_SKIP_TEX=a,b,...
+std::vector<std::uint32_t> g_skipped_cutouts = [] {
+    std::vector<std::uint32_t> list;
+    if (const char *v = std::getenv("PSPRECOMP_BURNOUT_SKIP_TEX")) {
+        for (const char *at = v; *at != 0;) {
+            char *end = nullptr;
+            list.push_back(static_cast<std::uint32_t>(std::strtoul(at, &end, 16)) & 0x0FFFFFFFu);
+            if (end == at) break;
+            at = *end == ',' ? end + 1 : end;
+        }
+    }
+    return list;
+}();
 // Opaque alpha-tested draws as 0/1-alpha blending (no discard).
 bool g_alpha_blend_test{std::getenv("PSPRECOMP_BURNOUT_ALPHA_BLEND_TEST") != nullptr};
 std::atomic<std::uint32_t> g_probe_mode{0u};
@@ -1096,12 +1114,25 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             std::uint8_t min_alpha = 255u;
             for (std::size_t i = 3u; i < rgba.size(); i += 4u) min_alpha = std::min(min_alpha, rgba[i]);
             texture.min_alpha = min_alpha;
-            if (std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr) {
+            {
+                // Foliage (trees, bushes): a cut-out texture whose visible
+                // texels are mostly green. The "no trees" option skips those.
                 std::size_t clear = 0u;
-                for (std::size_t i = 3u; i < rgba.size(); i += 4u) clear += rgba[i] <= 16u ? 1u : 0u;
-                std::fprintf(stderr, "[texfmt] fmt %u clutfmt %u %ux%u levels %u swz %d minA %u clear %.3f addr %08X\n", format,
-                             cmd(0xC5u) & 3u, width, height, levels, swizzled ? 1 : 0, min_alpha,
-                             static_cast<double>(clear) / static_cast<double>(width * height), address);
+                std::uint64_t sum[3]{};
+                for (std::size_t i = 0u; i < rgba.size(); i += 4u) {
+                    if (rgba[i + 3u] <= 16u) { ++clear; continue; }
+                    sum[0] += rgba[i]; sum[1] += rgba[i + 1u]; sum[2] += rgba[i + 2u];
+                }
+                const std::size_t texels = static_cast<std::size_t>(width) * height;
+                const double clear_fraction = static_cast<double>(clear) / static_cast<double>(texels);
+                const double opaque = static_cast<double>(std::max<std::size_t>(texels - clear, 1u));
+                const double r = static_cast<double>(sum[0]) / opaque, g = static_cast<double>(sum[1]) / opaque,
+                             b = static_cast<double>(sum[2]) / opaque;
+                texture.foliage = (address & 0x0F000000u) == 0x04000000u && clear_fraction >= 0.05 && g >= b * 1.4 && r <= g * 1.25 && g < 200.0;
+                if (std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr)
+                    std::fprintf(stderr, "[texfmt] fmt %u clutfmt %u %ux%u levels %u swz %d minA %u clear %.3f rgb %.0f %.0f %.0f foliage %d addr %08X\n",
+                                 format, cmd(0xC5u) & 3u, width, height, levels, swizzled ? 1 : 0, min_alpha, clear_fraction, r, g, b,
+                                 texture.foliage ? 1 : 0, address);
             }
             if (upload_mode == 1u && (format == 4u || format == 5u)) {
                 // Indices as stored (one byte each) and the 256-entry palette.
@@ -1137,6 +1168,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     }
     set_sampling(texture.sampling, linear, clamp_u, clamp_v, min_filter);
     g_texture_min_alpha = texture.min_alpha;
+    g_texture_foliage = texture.foliage;
     return {1.0f, 1.0f, 0.0f, 0.0f};
 }
 
@@ -1447,6 +1479,7 @@ void flush() {
         }
     }
     if (alpha_testing) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
+    g_draw_is_cutout = alpha_testing && textured && !clear_mode && g_state.blend == 0;
     if (alpha_testing && !clear_mode && g_state.blend == 0 && color_function == 1u &&
         (g_alpha_blend_test || g_probe_mode.load(std::memory_order_relaxed) == 1u)) {
         variant |= 1u << 26u;
@@ -1534,6 +1567,21 @@ void flush() {
                 return;
             }
         }
+    }
+    const auto skipped_cutout = [&] {
+        if (!g_draw_is_cutout || g_skipped_cutouts.empty()) return false;
+        const std::uint32_t texture = (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u);
+        return std::find(g_skipped_cutouts.begin(), g_skipped_cutouts.end(), texture) != g_skipped_cutouts.end();
+    };
+    if ((g_no_cutouts && g_draw_is_cutout && g_texture_foliage) || skipped_cutout()) {
+        g_batch.clear();
+        g_batch_count = 0u;
+        g_batch_in_place = nullptr;
+        g_batch_indices.clear();
+        g_batch_runs.clear();
+        g_batch_index_total = 0u;
+        phase = outer_phase;
+        return;
     }
     phase = 9u;
     bind_vertices();
@@ -2841,6 +2889,7 @@ void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
+void set_no_trees(bool enabled) { g_no_cutouts = g_no_cutouts || enabled; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }

@@ -29,6 +29,8 @@ void set_offscreen_1x(bool enabled);
 void set_stencil_ab(bool enabled);
 // Diagnostic: GPU probe modes rotating every 600 frames (see ge_gl.cpp).
 void set_gpu_probe(bool enabled);
+// Foliage (cut-out, mostly green scenery textures: trees, bushes) is not drawn.
+void set_no_trees(bool enabled);
 // Vita, before initialize: where compiled programs are kept (empty: none),
 // and whether vitaGL's pools use cached memory.
 void set_shader_cache(const std::string &directory);
