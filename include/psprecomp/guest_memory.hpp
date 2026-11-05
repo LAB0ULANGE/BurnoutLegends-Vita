@@ -70,6 +70,44 @@ public:
     // GuestMemory and preserve the original validation/watch behavior.
     class AotFastView {
     public:
+#if defined(PSPRECOMP_AOT_PAGE_TABLE)
+        // Page-table build: every canonical 2 MiB page maps to host memory
+        // (RAM, the 2 MiB VRAM for each VRAM mirror, or a scratch page for
+        // addresses the PSP has no memory at), so an access is a table load
+        // and an add with no test and no call. With no call on the hot path
+        // the generated code can keep guest registers in host registers.
+        // Write watches are not supported in this build. An entry holds its
+        // page's host address minus the page's guest address, for every 2 MiB
+        // of the 32-bit space (mirrors included), so the host pointer is
+        // entry + address: a shift, a table load and the access itself.
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t *page_pointer(std::uint32_t address) const noexcept {
+            return reinterpret_cast<std::uint8_t *>(pages_[address >> 21u] + address);
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
+            return *page_pointer(address);
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint16_t aot_load16(std::uint32_t address) const {
+            return GuestMemory::read_le16(page_pointer(address));
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32(std::uint32_t address) const {
+            return GuestMemory::read_le32(page_pointer(address));
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) const {
+            *page_pointer(address) = value;
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store16(std::uint32_t address, std::uint16_t value) const {
+            GuestMemory::write_le16(page_pointer(address), value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store32(std::uint32_t address, std::uint32_t value) const {
+            GuestMemory::write_le32(page_pointer(address), value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_load_quad(std::uint32_t address, float *value) const {
+            std::memcpy(value, page_pointer(address), 16u);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store_quad(std::uint32_t address, const float *value) const {
+            std::memcpy(page_pointer(address), value, 16u);
+        }
+#else
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
             const std::uint32_t offset = ram_offset_of_fast(address);
             if (offset <= ram_limit8_) return ram_data_[offset];
@@ -145,15 +183,16 @@ public:
             }
             owner_->aot_store_quad_slow(address, value);
         }
+#endif
 
     private:
         friend class GuestMemory;
         AotFastView(GuestMemory *owner, std::uint8_t *ram_data,
                     std::uint32_t limit8, std::uint32_t limit16,
-                    std::uint32_t limit32, bool write_watch) noexcept
+                    std::uint32_t limit32, bool write_watch, const std::uintptr_t *pages) noexcept
             : owner_(owner), ram_data_(ram_data), ram_limit8_(limit8),
               ram_limit16_(limit16), ram_limit32_(limit32),
-              write_watch_enabled_(write_watch) {}
+              write_watch_enabled_(write_watch), pages_(pages) {}
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static
 #if !defined(PSPRECOMP_COUNT_MIRROR_ACCESSES)
             constexpr
@@ -172,11 +211,12 @@ public:
         std::uint32_t ram_limit16_{};
         std::uint32_t ram_limit32_{};
         bool write_watch_enabled_{};
+        const std::uintptr_t *pages_{};
     };
 
     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH AotFastView aot_fast_view() noexcept {
         return AotFastView(this, ram_data_, ram_limit8_, ram_limit16_, ram_limit32_,
-                           write_watch_enabled_);
+                           write_watch_enabled_, aot_pages_.data());
     }
 
     // Fast paths used only by statically generated AOT code. They retain
@@ -362,6 +402,11 @@ private:
 
     std::vector<std::uint8_t> vram_;
     std::vector<std::uint8_t> bytes_;
+    // AotFastView page table (PSPRECOMP_AOT_PAGE_TABLE): for each 2 MiB page of
+    // the 32-bit guest space, host address of the page minus its guest
+    // address; pages with no PSP memory share scratch_page_.
+    std::vector<std::uint8_t> scratch_page_;
+    std::vector<std::uintptr_t> aot_pages_;
     // Cached view of bytes_ for the inline fast paths.  Neither region is ever
     // resized after construction, so these stay valid for the object's life.
     //

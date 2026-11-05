@@ -68,6 +68,15 @@ option(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW
 if(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW)
     add_compile_definitions(PSPRECOMP_AOT_PRIVATE_MEMORY_VIEW=1)
 endif()
+# Guest accesses from generated code through a 2 MiB page table: no range test
+# and no slow-path call (GCC/ARM: -27% instructions in a hot unit). Accesses
+# where the PSP has no memory read/write a scratch page instead of failing,
+# and write watches are ignored. Global: AotFastView must be the same in
+# every translation unit.
+option(PSPRECOMP_AOT_PAGE_TABLE "Generated code accesses guest memory through a page table" OFF)
+if(PSPRECOMP_AOT_PAGE_TABLE)
+    add_compile_definitions(PSPRECOMP_AOT_PAGE_TABLE=1)
+endif()
 if(MSVC AND PSPRECOMP_NATIVE_AVX2)
     add_compile_options($<$<CONFIG:Release>:/arch:AVX2>
                         $<$<CONFIG:RelWithDebInfo>:/arch:AVX2>)

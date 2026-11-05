@@ -81,6 +81,20 @@ GuestMemory::GuestMemory(std::uint32_t size_bytes)
     ram_limit8_ = size_bytes - 1u;
     ram_limit16_ = size_bytes - 2u;
     ram_limit32_ = size_bytes - 4u;
+    // Page table for the AOT fast view. The scratch page (plus a guard for a
+    // quad access at its end) absorbs accesses where the PSP has no memory,
+    // which the checked path reports as errors.
+    constexpr std::uint32_t kPage = 2u * 1024u * 1024u;
+    scratch_page_.assign(kPage + 16u, 0u);
+    aot_pages_.resize(2048u);
+    for (std::uint32_t page = 0; page < 2048u; ++page) {
+        const std::uint32_t address = page * kPage;
+        const std::uint32_t c = canonical(address);
+        std::uint8_t *host = scratch_page_.data();
+        if (c >= kPhysicalBase && c - kPhysicalBase < size_bytes) host = bytes_.data() + (c - kPhysicalBase);
+        else if (is_vram_window(c)) host = vram_.data();
+        aot_pages_[page] = reinterpret_cast<std::uintptr_t>(host) - address;
+    }
 }
 
 #if defined(PSPRECOMP_COUNT_MIRROR_ACCESSES)
