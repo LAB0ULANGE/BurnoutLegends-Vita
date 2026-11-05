@@ -238,6 +238,11 @@ void block_transfer(psprecomp::GuestMemory &memory, std::uint32_t data) {
 
 // A run of a cached sub-list (ge_cached_call), read by the worker from the
 // cache's own immutable copy of the words instead of a copy per frame.
+// Only the emulation thread may copy or drop these references: the Vita's
+// libstdc++ counts them without atomics (__gthread_active_p() is false there,
+// its weak __pthread_key_create is unresolved), so a reference dropped by the
+// worker raced with the emulation thread and corrupted the heap (gl-53 crash
+// in _malloc_r). The worker moves the runs back in g_returned_cached.
 struct CachedRun {
     std::shared_ptr<const std::vector<std::uint32_t>> words;
     std::uint32_t first{}, count{}, base{}, offset{};
@@ -271,12 +276,14 @@ std::vector<std::uint32_t> g_pending_words, g_pending_records;
 // Buffers of finished command jobs, handed back by the worker so the next
 // lists reuse warm memory instead of allocating (and freeing across cores).
 struct SpareBuffers {
-    std::vector<CachedRun> cached;
     std::vector<std::array<std::uint32_t, 3>> commands;
     std::vector<std::uint32_t> words, records;
     std::vector<Transfer> transfers;
 };
 std::vector<SpareBuffers> g_spares;  // under g_jobs_mutex
+// Cached runs of finished jobs, moved (never copied or destroyed) by the
+// worker; the emulation thread drops their references. Under g_jobs_mutex.
+std::vector<std::vector<CachedRun>> g_returned_cached;
 constexpr std::uint32_t kRun = UINT32_MAX - 1u;  // commands entry tag (offsets are multiples of 256)
 constexpr std::uint32_t kCachedRun = UINT32_MAX - 2u;  // commands entry tag: {index in Job::cached, 0, kCachedRun}
 std::vector<CachedRun> g_pending_cached;
@@ -423,8 +430,6 @@ void worker_loop() {
         }
         SpareBuffers spare;
         if (job.kind == Job::Kind::Commands) {
-            spare.cached.swap(job.cached);
-            spare.cached.clear();  // drops the references to the cache's words
             spare.commands.swap(job.commands);
             spare.words.swap(job.words);
             spare.records.swap(job.records);
@@ -435,6 +440,7 @@ void worker_loop() {
             spare.transfers.clear();
         }
         std::lock_guard lock(g_jobs_mutex);
+        if (!job.cached.empty()) g_returned_cached.push_back(std::move(job.cached));
         if (job.kind == Job::Kind::Commands && g_spares.size() < 4u) g_spares.push_back(std::move(spare));
         if (job.kind == Job::Kind::Commands) --g_queued_command_jobs;
         g_worker_busy = false;
@@ -581,18 +587,25 @@ void submit_pending() {
     job.transfers.swap(g_pending_transfers);
     job.words.swap(g_pending_words);
     job.records.swap(g_pending_records);
+    std::vector<std::vector<CachedRun>> returned;
     {
         std::lock_guard lock(g_jobs_mutex);
+        returned.swap(g_returned_cached);
         if (!g_spares.empty()) {
             SpareBuffers &spare = g_spares.back();
             g_pending.swap(spare.commands);
-            g_pending_cached.swap(spare.cached);
             g_pending_words.swap(spare.words);
             g_pending_records.swap(spare.records);
             g_pending_transfers.swap(spare.transfers);
             g_spares.pop_back();
         }
     }
+    // Here, on the emulation thread, the finished jobs' references go.
+    for (auto &runs : returned) {
+        runs.clear();
+        if (g_pending_cached.capacity() < runs.capacity()) g_pending_cached.swap(runs);
+    }
+    returned.clear();
     g_pending.reserve(job.commands.size());
     g_pending_words.reserve(job.words.size());
     g_pending_records.reserve(job.records.size());
