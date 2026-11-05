@@ -452,19 +452,26 @@ void main() {
     float a = floor(c.a * 255.0 + 0.5);
     float r = u_alpha.y;
 #if ATFUNC == 0
-    discard;
+    bool fail = true;
 #elif ATFUNC == 2
-    if (a != r) discard;
+    bool fail = a != r;
 #elif ATFUNC == 3
-    if (a == r) discard;
+    bool fail = a == r;
 #elif ATFUNC == 4
-    if (a >= r) discard;
+    bool fail = a >= r;
 #elif ATFUNC == 5
-    if (a > r) discard;
+    bool fail = a > r;
 #elif ATFUNC == 6
-    if (a <= r) discard;
+    bool fail = a <= r;
 #else
-    if (a < r) discard;
+    bool fail = a < r;
+#endif
+#if ATBLEND
+    // Opaque draw: blending with a 0/1 alpha gives the alpha test's colours
+    // without a discard (a punch-through object stalls the Vita's GPU).
+    c.a = fail ? 0.0 : 1.0;
+#else
+    if (fail) discard;
 #endif
 #endif
 #if BLENDFIX
@@ -590,7 +597,7 @@ struct TargetUse {
     int width{};
 };
 struct GpuCounters {
-    std::uint64_t switches{}, draws{}, blended{}, discards{}, discards_dropped{}, through{}, samples{}, textured{}, mipmapped{}, minmip{}, skinned{}, weights{}, copied{}, skin_calls{}, skin_hits{};
+    std::uint64_t switches{}, draws{}, blended{}, discards{}, discards_dropped{}, alpha_blended{}, through{}, samples{}, textured{}, mipmapped{}, minmip{}, skinned{}, weights{}, copied{}, skin_calls{}, skin_hits{};
     double skin_ms{};
     std::unordered_map<std::uint32_t, TargetUse> targets;  // by target key
 } g_gpu;
@@ -603,6 +610,8 @@ bool g_stencil_ab{};
 // (normal), 1 CLUT textures as GXM P8 paletted textures (no mips), 2 RGBA8
 // without mips. (gl-64 probed 1 scissor 1/16, 2 no discard, 3 untextured.)
 bool g_gpu_probe{};
+// Opaque alpha-tested draws as 0/1-alpha blending (no discard).
+bool g_alpha_blend_test{std::getenv("PSPRECOMP_BURNOUT_ALPHA_BLEND_TEST") != nullptr};
 std::atomic<std::uint32_t> g_probe_mode{0u};
 std::uint32_t probe_key(std::uint32_t key) noexcept {
     return key;
@@ -1024,7 +1033,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     // RAM are re-hashed once per frame.
     static const bool recheck_vram = std::getenv("PSPRECOMP_BURNOUT_VRAM_RECHECK") != nullptr;
     const bool in_vram = (address & 0x0F000000u) == 0x04000000u && !recheck_vram;
-    const std::uint32_t upload_mode = g_probe_mode.load(std::memory_order_relaxed);
+    const std::uint32_t upload_mode = 0u;  // gl-66 probe: 1 P8 paletted, 2 no mips (no GPU difference)
     const bool reformat = !fresh && texture.upload_mode != upload_mode;
     if ((reformat || (in_vram ? texture.stale : texture.checked_frame != g_stats.frames)) && source != nullptr) {
         texture.checked_frame = g_stats.frames;
@@ -1438,21 +1447,30 @@ void flush() {
         }
     }
     if (alpha_testing) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
+    if (alpha_testing && !clear_mode && g_state.blend == 0 && color_function == 1u &&
+        (g_alpha_blend_test || g_probe_mode.load(std::memory_order_relaxed) == 1u)) {
+        variant |= 1u << 26u;
+        set_capability(GL_BLEND, g_state.blend, true);
+        set_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        set_blend_equation(GL_FUNC_ADD);
+        ++g_gpu.alpha_blended;
+    }
     static const bool atest_stats = std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr;
     if (atest_stats && alpha_testing) {
         static std::unordered_map<std::string, int> seen;
         static std::uint64_t calls = 0u;
         char key[160];
-        std::snprintf(key, sizeof(key), "func %u ref %u mask %02X tex %d tcc %d texfunc %u texmin %u vmin %u blend %d zwrite %u vtype %06X",
+        std::snprintf(key, sizeof(key), "func %u ref %u mask %02X tex %d tcc %d texfunc %u texmin %u vmin %u blend %d zwrite %u vtype %06X tex %08X",
                       alpha_test & 7u, (alpha_test >> 8u) & 0xFFu, (alpha_test >> 16u) & 0xFFu, textured ? 1 : 0,
                       (texfunc & 0x100u) != 0u ? 1 : 0, texfunc & 7u, g_texture_min_alpha, g_batch_min_alpha, g_state.blend,
-                      (cmd(0xE7u) & 0xFFFFu) == 0u ? 1u : 0u, g_batch_vtype);
+                      (cmd(0xE7u) & 0xFFFFu) == 0u ? 1u : 0u, g_batch_vtype,
+                      (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u));
         ++seen[key];
-        if (++calls % 20000u == 0u) {
+        if (++calls % 60000u == 0u) {
             std::vector<std::pair<int, std::string>> top;
             for (const auto &[k, v] : seen) top.push_back({v, k});
             std::sort(top.rbegin(), top.rend());
-            for (std::size_t i = 0; i < top.size() && i < 25u; ++i) std::fprintf(stderr, "[atest] %6d %s\n", top[i].first, top[i].second.c_str());
+            for (std::size_t i = 0; i < top.size() && i < 40u; ++i) std::fprintf(stderr, "[atest] %6d %s\n", top[i].first, top[i].second.c_str());
             seen.clear();
         }
     }
@@ -2389,7 +2407,7 @@ std::string variant_defines(std::uint32_t key) {
         {"COLFMT", bits(6, 3)},     {"FOG", bits(9, 1)},     {"TEXTURED", bits(10, 1)}, {"TEXFUNC", bits(11, 3)},
         {"TCC", bits(14, 1)},       {"DOUBLE", bits(15, 1)}, {"PROJECTIVE", bits(16, 1)}, {"ATEST", bits(17, 1)},
         {"ATFUNC", bits(18, 3)},    {"BLENDFIX", bits(21, 1)}, {"ALPHAOUT", bits(22, 1)}, {"CTEST", bits(23, 1)},
-        {"CTFUNC", bits(24, 2)}};
+        {"CTFUNC", bits(24, 2)},    {"ATBLEND", bits(26, 1)}};
     std::string text;
     for (const auto &[name, value] : defines) text += "#define " + std::string(name) + " " + std::to_string(value) + "\n";
     return text;
@@ -3066,7 +3084,7 @@ void present(std::uint32_t address) {
     flush();
     phase = 11u;
     ++g_stats.frames;
-    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 3u), std::memory_order_relaxed);
+    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 2u), std::memory_order_relaxed);
     if (g_stats.frames <= 3u) {
         char line[64];
         std::snprintf(line, sizeof(line), "frame %llu", static_cast<unsigned long long>(g_stats.frames));
@@ -3093,12 +3111,12 @@ void present(std::uint32_t address) {
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       (g_gl_busy_ms.load() - last_busy) / n,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
-                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 3u) : -1);
+                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 2u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
-                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
-                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.discards_dropped / n, g_gpu.through / n,
+                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f as blending, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
+                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.discards_dropped / n, g_gpu.alpha_blended / n, g_gpu.through / n,
                       g_gpu.samples / n, g_gpu.textured / n, g_gpu.mipmapped / n, g_gpu.minmip / n, g_gpu.skinned / n, g_gpu.weights / n, g_gpu.skin_calls / n, g_gpu.skin_hits / n, g_gpu.skin_ms / n, g_gpu.copied / n / 1024.0);
         trace(line);
         std::vector<std::pair<std::uint32_t, TargetUse>> used(g_gpu.targets.begin(), g_gpu.targets.end());
