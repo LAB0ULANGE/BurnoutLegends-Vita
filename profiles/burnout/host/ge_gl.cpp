@@ -19,6 +19,9 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -641,9 +644,13 @@ std::uint32_t stencil_mode() noexcept { return g_stencil_ab ? static_cast<std::u
 std::uint32_t cmd(std::uint32_t index) noexcept { return g_commands[index] & 0x00FFFFFFu; }
 float float24(std::uint32_t data) noexcept { return std::bit_cast<float>(data << 8u); }
 
+// Test: variant fragment shaders at medium precision (half floats on the SGX).
+bool g_fragment_mediump{};
+
 GLuint compile(GLenum type, const std::string &defines, const char *source, std::string &error) {
 #if defined(__vita__)
-    const std::string text = defines + source;
+    const bool mediump = g_fragment_mediump && type == GL_FRAGMENT_SHADER && !defines.empty();
+    const std::string text = (mediump ? std::string("precision mediump float;\n") : std::string()) + defines + source;
 #else
     const std::string text = "#version 120\n" + defines + source;
 #endif
@@ -2090,6 +2097,38 @@ struct SkinEntry {
 };
 std::unordered_map<std::uint64_t, SkinEntry> g_skin_cache;
 
+// memcmp(a, b, n) == 0 for the skin cache: both sides are usually cold (the
+// snapshot was just copied on the other core, the entry was last read a
+// frame ago), so lines ahead are fetched while these compare.
+inline void skin_prefetch(const void *address) noexcept {
+#if defined(_MSC_VER)
+    _mm_prefetch(static_cast<const char *>(address), _MM_HINT_T0);
+#else
+    __builtin_prefetch(address);
+#endif
+}
+
+bool same_bytes(const std::uint8_t *a, const std::uint8_t *b, std::size_t n) noexcept {
+    std::size_t i = 0u;
+    for (std::size_t at = 0u; at < n && at < 128u; at += 32u) {
+        skin_prefetch(a + at);
+        skin_prefetch(b + at);
+    }
+    for (; i + 32u <= n; i += 32u) {
+        skin_prefetch(a + i + 128u);
+        skin_prefetch(b + i + 128u);
+        std::uint32_t diff = 0u;
+        for (std::size_t j = 0u; j < 32u; j += 4u) {
+            std::uint32_t x, y;
+            std::memcpy(&x, a + i + j, 4u);
+            std::memcpy(&y, b + i + j, 4u);
+            diff |= x ^ y;
+        }
+        if (diff != 0u) return false;
+    }
+    return std::memcmp(a + i, b + i, n - i) == 0;
+}
+
 const std::uint8_t *skin_cached(const std::uint8_t *raw, std::uint32_t count, std::uint32_t vtype, const VertexLayout &from,
                                 const VertexLayout &to) {
     const std::size_t source_bytes = static_cast<std::size_t>(count) * from.stride;
@@ -2099,7 +2138,7 @@ const std::uint8_t *skin_cached(const std::uint8_t *raw, std::uint32_t count, st
     SkinEntry &entry = g_skin_cache[key];
     const bool hit = entry.vtype == vtype && entry.count == count && entry.source.size() == source_bytes &&
                      std::memcmp(entry.bones.data(), g_bones.data(), bone_floats * sizeof(float)) == 0 &&
-                     std::memcmp(entry.source.data(), raw, source_bytes) == 0;
+                     same_bytes(entry.source.data(), raw, source_bytes);
     entry.used_frame = g_stats.frames;
     if (hit) {
         ++g_gpu.skin_hits;
@@ -2889,6 +2928,7 @@ void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
+void set_fragment_mediump(bool enabled) { g_fragment_mediump = enabled; }
 void set_no_trees(bool enabled) { g_no_cutouts = g_no_cutouts || enabled; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }

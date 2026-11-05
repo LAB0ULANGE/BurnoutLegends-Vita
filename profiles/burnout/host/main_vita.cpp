@@ -63,9 +63,11 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-68-notrees";
+constexpr const char *kBuild = "gl-69d-profil";
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
-constexpr bool kNoTrees = true;  // test: trees and bushes not drawn (GPU cost of cut-outs)
+constexpr bool kNoTrees = false;
+constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
+constexpr bool kSoundCore2 = false;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
 constexpr bool kDiagnosticCaptures = false;  // true: frames to ux0:data/burnout-frames during play
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
@@ -248,6 +250,7 @@ int main() {
     const std::string label = std::string(BURNOUT_VITA_LABEL).empty() ? std::string(kBuild)
                                                                       : std::string(kBuild) + " " + BURNOUT_VITA_LABEL;
     g_settings = burnout::boot_menu::run(kRoot, label);
+    if (kSoundCore2) g_settings.sound_core1 = false;  // test: SAS mixer and audio beside the GL thread
     std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, shader cache %d\n", kBuild,
                  g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale, g_settings.sound ? 1 : 0,
                  g_settings.frame_skip ? 1 : 0, g_settings.shader_cache ? 1 : 0);
@@ -323,6 +326,7 @@ int main() {
         burnout::gl::set_stencil_ab(kStencilAB);
         burnout::gl::set_gpu_probe(kGpuProbe);
         burnout::gl::set_no_trees(kNoTrees);
+        burnout::gl::set_fragment_mediump(kMediump);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
         // Sound: the SAS voices and audio channels to a BGM port, mixed on
