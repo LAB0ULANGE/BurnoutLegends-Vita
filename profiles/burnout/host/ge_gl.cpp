@@ -506,6 +506,7 @@ struct Texture {
     std::uint64_t checked_frame{UINT64_MAX};
     std::uint32_t address{}, bytes{};
     bool stale{true};  // VRAM texture: a block transfer may have rewritten it
+    bool mipmapped{};  // uploaded with a generated mip chain
     GLint sampling[4]{-1, -1, -1, -1};
 };
 
@@ -577,13 +578,15 @@ struct TargetUse {
     int width{};
 };
 struct GpuCounters {
-    std::uint64_t switches{}, draws{}, blended{}, discards{}, through{}, samples{};
+    std::uint64_t switches{}, draws{}, blended{}, discards{}, through{}, samples{}, textured{}, mipmapped{}, minmip{}, skinned{}, weights{}, copied{}, skin_calls{};
+    double skin_ms{};
     std::unordered_map<std::uint32_t, TargetUse> targets;  // by target key
 } g_gpu;
 // Scale of each render target as created (decode thread): the screen-sized
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
 bool g_stencil_ab{};
+bool g_mipmaps{std::getenv("PSPRECOMP_BURNOUT_NO_MIPMAPS") == nullptr};
 // Stencil A/B diagnostic: 0 full, 1 minimal, 2 off, rotating every 600 frames.
 std::uint32_t stencil_mode() noexcept { return g_stencil_ab ? static_cast<std::uint32_t>((g_stats.frames / 600u) % 3u) : 0u; }
 
@@ -847,8 +850,8 @@ void bind_texture_object(GLuint name) {
 }
 
 // Sampler parameters live in the texture object: only set when they change.
-void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v) {
-    const GLint wanted[4]{linear ? GL_LINEAR : GL_NEAREST, linear ? GL_LINEAR : GL_NEAREST,
+void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v, GLint min_filter = 0) {
+    const GLint wanted[4]{min_filter != 0 ? min_filter : linear ? GL_LINEAR : GL_NEAREST, linear ? GL_LINEAR : GL_NEAREST,
                           clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT, clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT};
     static constexpr GLenum names[4]{GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T};
     for (int i = 0; i < 4; ++i)
@@ -975,6 +978,10 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
         }
     }
 
+    ++g_gpu.textured;
+    const std::uint32_t levels = (cmd(0xC2u) >> 16u) & 7u;
+    if (levels != 0u) ++g_gpu.mipmapped;
+    if ((cmd(0xC6u) & 7u) >= 4u) ++g_gpu.minmip;
     const std::uint32_t bits = texture_bits(format);
     const std::uint32_t row_bytes = std::max<std::uint32_t>(buffer_width, width) * bits / 8u;
     const std::uint32_t bytes = row_bytes * height;
@@ -1048,12 +1055,25 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                     std::fclose(file);
                 }
             }
-            record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size())});
+            // The game's textures carry mip levels (most of the scenery's):
+            // the GPU builds the chain from level 0 instead. Without one a
+            // distant road samples a 256-texel texture sparsely, which on the
+            // SGX misses the texture cache on nearly every fetch.
+            texture.mipmapped = g_mipmaps && levels != 0u && width >= 8u && height >= 8u;
+            record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()), texture.mipmapped ? 1u : 0u});
             g_frame.blobs.push_back(std::move(rgba));
             ++g_stats.texture_uploads;
         }
     }
-    set_sampling(texture.sampling, linear, clamp_u, clamp_v);
+    // PSP minification modes 4-7: nearest/linear texel, nearest/linear level.
+    GLint min_filter = 0;
+    const std::uint32_t min_mode = cmd(0xC6u) & 7u;
+    if (texture.mipmapped && levels != 0u && min_mode >= 4u) {
+        static constexpr GLint modes[4]{GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST, GL_NEAREST_MIPMAP_LINEAR,
+                                        GL_LINEAR_MIPMAP_LINEAR};
+        min_filter = modes[min_mode - 4u];
+    }
+    set_sampling(texture.sampling, linear, clamp_u, clamp_v, min_filter);
     return {1.0f, 1.0f, 0.0f, 0.0f};
 }
 
@@ -1930,7 +1950,12 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
             skinned_from = psp_vtype;
             skinned_layout = vertex_layout(vtype);
         }
+        g_gpu.skinned += vertex_count;
+        g_gpu.weights += static_cast<std::uint64_t>(vertex_count) * (((psp_vtype >> 14u) & 7u) + 1u);
+        const double skin_started = host_now_ms();
         raw = skin(raw, vertex_count, psp_vtype, psp_layout, skinned_layout);
+        g_gpu.skin_ms += host_now_ms() - skin_started;
+        ++g_gpu.skin_calls;
         source_layout = &skinned_layout;
     }
     const VertexLayout &layout = *source_layout;
@@ -1966,6 +1991,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         g_batch_in_place = nullptr;
         g_batch_count = 0u;
         g_batch.clear();
+        g_gpu.copied += static_cast<std::size_t>(placed_count) * vertex_stride;
         std::memcpy(append_vertices(placed_count), placed, static_cast<std::size_t>(placed_count) * vertex_stride);
     }
     if (in_place && g_batch_count == 0u) g_batch_in_place = raw;
@@ -2438,7 +2464,8 @@ void replay(const Frame &frame) {
         case Op::TexImage:
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), 0, GL_RGBA,
                          GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
-            op += 3;
+            if (op[3] != 0u) glGenerateMipmap(GL_TEXTURE_2D);
+            op += 4;
             break;
         case Op::Uniform4: set_slot(op[0], floats(op[2]), op[1] * 4u, false); op += 3; break;
         case Op::UniformMatrix: set_slot(op[0], floats(op[1]), 16u, true); op += 2; break;
@@ -2840,7 +2867,7 @@ void present(std::uint32_t address) {
         static double last_busy = 0.0, last_present = 0.0;
         const double wall = host_now_ms();
         const double n = static_cast<double>(g_stats.frames - last.frames);
-        char line[256];
+        char line[384];
         std::snprintf(line, sizeof(line),
                       "frame %llu: %.1f ms/frame wall, decode %.1f, record %.1f, present %.1f, idle %.1f; %.0f PRIM, %.0f batches, %.0f vertices (%.0f lit), %llu texture uploads",
                       static_cast<unsigned long long>(g_stats.frames), (wall - last_wall) / n,
@@ -2857,9 +2884,9 @@ void present(std::uint32_t address) {
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
-                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f 2D), %.1f target samples per frame",
+                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.2f ms), %.0f KiB re-copied per frame",
                       g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.through / n,
-                      g_gpu.samples / n);
+                      g_gpu.samples / n, g_gpu.textured / n, g_gpu.mipmapped / n, g_gpu.minmip / n, g_gpu.skinned / n, g_gpu.weights / n, g_gpu.skin_calls / n, g_gpu.skin_ms / n, g_gpu.copied / n / 1024.0);
         trace(line);
         std::vector<std::pair<std::uint32_t, TargetUse>> used(g_gpu.targets.begin(), g_gpu.targets.end());
         std::sort(used.begin(), used.end(), [](const auto &a, const auto &b) { return a.second.draws > b.second.draws; });
