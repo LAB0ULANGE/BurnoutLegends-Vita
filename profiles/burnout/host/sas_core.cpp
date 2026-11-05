@@ -4,7 +4,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <array>
+#include <atomic>
+#include <thread>
 #include <vector>
+
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#endif
 
 namespace burnout::sas {
 
@@ -44,11 +50,24 @@ struct Voice {
 
 // Two banks of voices: the one mixed into sound, and a shadow the emulation
 // thread advances without making sound when a mixer thread renders the
-// first (see set_state_only). Each thread picks its bank.
+// first (see set_state_only). The thread that asked for the shadow works on
+// it, every other thread on the audio bank. (Not thread_local: on the Vita
+// the mixer thread saw the emulation thread's choice and made no sound.)
 std::array<Voice, kVoices> g_audio_voices, g_shadow_voices;
-thread_local bool t_state_only{};
-thread_local std::array<Voice, kVoices> *t_voices{&g_audio_voices};
-#define g_voices (*t_voices)
+std::atomic<bool> g_shadow_enabled{false};
+#if defined(__vita__)
+using ThreadId = SceUID;
+inline ThreadId current_thread() noexcept { return sceKernelGetThreadId(); }
+#else
+using ThreadId = std::thread::id;
+inline ThreadId current_thread() noexcept { return std::this_thread::get_id(); }
+#endif
+ThreadId g_shadow_thread{};
+inline bool state_only() noexcept {
+    return g_shadow_enabled.load(std::memory_order_relaxed) && current_thread() == g_shadow_thread;
+}
+#define t_state_only (state_only())
+#define g_voices (*(state_only() ? &g_shadow_voices : &g_audio_voices))
 std::uint32_t g_grain{256u};
 std::vector<std::int32_t> g_mix;
 
@@ -488,6 +507,10 @@ void advance_voice(Voice &v, std::uint32_t grain) {
             if (!settled) {
                 step_local(e, playing);
                 settled = e.state == Sustain && e.sustain_rate == 0;
+            } else if (!ended) {
+                // Settled: only the fraction moves for the rest of the grain.
+                fraction = static_cast<std::uint32_t>((fraction + static_cast<std::uint64_t>(pitch) * (grain - i)) & 0xFFFu);
+                break;
             }
             fraction += pitch;
             fraction &= 0xFFFu;  // the while loop of the mix, as one step
@@ -544,19 +567,32 @@ void advance_voice(Voice &v, std::uint32_t grain) {
             break;
         }
     }
-    if (!done) {
-        for (; i < grain; ++i) {
-            fraction += pitch;
-            while (fraction >= 0x1000u) {
-                fraction -= 0x1000u;
-                fetch();
+    if (!done && i < grain) {
+        // Settled envelope: the rest of the grain only moves the sample
+        // cursor, a block at a time. Where exactly a sample running out
+        // stops the voice does not matter: it is off either way, and a key
+        // on resets the cursor.
+        const std::uint64_t total = fraction + static_cast<std::uint64_t>(pitch) * (grain - i);
+        fraction = static_cast<std::uint32_t>(total & 0xFFFu);
+        std::uint64_t steps = total >> 12u;
+        while (steps != 0u) {
+            if (at >= count) {
+                if (!skip_block(v)) {
+                    stream_end = true;
+                    v.stream_end = true;
+                    break;
+                }
+                at = 0u;
+                count = 28u;
             }
-            if (stream_end && at >= count) {
-                playing = false;
-                e.state = Off;
-                e.height = 0;
-                break;
-            }
+            const std::uint32_t take = static_cast<std::uint32_t>(std::min<std::uint64_t>(steps, count - at));
+            at += take;
+            steps -= take;
+        }
+        if (stream_end && at >= count) {
+            playing = false;
+            e.state = Off;
+            e.height = 0;
         }
     }
     v.sample_at = at;
@@ -569,9 +605,9 @@ void advance_voice(Voice &v, std::uint32_t grain) {
 
 } // namespace
 
-void set_state_only(bool state_only) {
-    t_state_only = state_only;
-    t_voices = state_only ? &g_shadow_voices : &g_audio_voices;
+void set_state_only(bool enabled) {
+    if (enabled) g_shadow_thread = current_thread();
+    g_shadow_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 void mix(std::int16_t *out) {

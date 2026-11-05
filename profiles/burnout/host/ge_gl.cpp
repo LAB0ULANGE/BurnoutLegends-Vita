@@ -584,6 +584,8 @@ struct GpuCounters {
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
 bool g_stencil_ab{};
+// Stencil A/B diagnostic: 0 full, 1 minimal, 2 off, rotating every 600 frames.
+std::uint32_t stencil_mode() noexcept { return g_stencil_ab ? static_cast<std::uint32_t>((g_stats.frames / 600u) % 3u) : 0u; }
 
 std::uint32_t cmd(std::uint32_t index) noexcept { return g_commands[index] & 0x00FFFFFFu; }
 float float24(std::uint32_t data) noexcept { return std::bit_cast<float>(data << 8u); }
@@ -1284,7 +1286,7 @@ void flush() {
         set_color_mask((clear & 0x100u) != 0u, (clear & 0x200u) != 0u);
         // The alpha update clears the stencil too. To 0: the clear colour's
         // alpha is in the vertices, and the game only clears it to 0 so far.
-        const bool stencil = (clear & 0x200u) != 0u && !(g_stencil_ab && ((g_stats.frames / 600u) & 1u) != 0u);
+        const bool stencil = (clear & 0x200u) != 0u && stencil_mode() == 0u;
         set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
         if (stencil) set_stencil(GL_ALWAYS, 0u, 0xFFu, GL_REPLACE, GL_REPLACE, GL_REPLACE, 0xFFu);
         set_capability(GL_CULL_FACE, g_state.cull, false);
@@ -1305,10 +1307,17 @@ void flush() {
         // written through the alpha write mask. Lakeside marks the lake's
         // pixels 2 and draws the sky's reflection where it equals 2; without
         // the test the reflection covered the lower half of the screen.
-        const bool stencil = (cmd(0x24u) & 1u) != 0u && !(g_stencil_ab && ((g_stats.frames / 600u) & 1u) != 0u);
+        const std::uint32_t func = cmd(0xDCu), op = cmd(0xDDu);
+        bool stencil = (cmd(0x24u) & 1u) != 0u && stencil_mode() != 2u;
+        if (stencil && stencil_mode() == 1u) {
+            // Minimal (diagnostic): only draws that test the stencil or
+            // write a non-zero value to it.
+            const std::uint32_t ref = (func >> 8u) & (~cmd(0xE9u) & 0xFFu);
+            const auto marks = [ref](std::uint32_t o) { return (o == 2u && ref != 0u) || o == 3u || o == 4u; };
+            stencil = (func & 7u) != 1u || marks((op >> 8u) & 7u) || marks((op >> 16u) & 7u);
+        }
         set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
         if (stencil) {
-            const std::uint32_t func = cmd(0xDCu), op = cmd(0xDDu);
             set_stencil(compare(func), (func >> 8u) & 0xFFu, (func >> 16u) & 0xFFu, stencil_op(op), stencil_op(op >> 8u),
                         stencil_op(op >> 16u), ~cmd(0xE9u) & 0xFFu);
         }
