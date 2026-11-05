@@ -510,6 +510,8 @@ struct Texture {
     std::uint32_t address{}, bytes{};
     bool stale{true};  // VRAM texture: a block transfer may have rewritten it
     bool mipmapped{};  // uploaded with a generated mip chain
+    std::uint8_t min_alpha{255u};  // lowest texel alpha of the upload
+    std::uint32_t upload_mode{};   // g_probe_mode it was uploaded in
     GLint sampling[4]{-1, -1, -1, -1};
 };
 
@@ -553,6 +555,13 @@ template <typename T> using ScratchVector = std::vector<T, UninitAllocator<T>>;
 
 ScratchVector<std::uint8_t> g_batch;
 std::uint32_t g_batch_count{}, g_batch_vtype{};
+// Lowest alpha the batch's vertices (or the material) can give, 0-255: with
+// the bound texture's lowest alpha it tells when the alpha test cannot fail,
+// and the shader then needs no discard (which on the Vita's PowerVR GPU
+// turns off hidden surface removal: ~38 ms of GPU time a frame in a race).
+std::uint32_t g_batch_min_alpha{255u};
+std::uint32_t g_texture_min_alpha{255u};  // the texture bind_texture last bound
+bool g_keep_discard{std::getenv("PSPRECOMP_BURNOUT_KEEP_DISCARD") != nullptr};
 // Non-null: the batch vertices are read in place from the snapshot instead of
 // g_batch (PSP layout already fits, see BatchLayout).
 const std::uint8_t *g_batch_in_place{};
@@ -581,7 +590,7 @@ struct TargetUse {
     int width{};
 };
 struct GpuCounters {
-    std::uint64_t switches{}, draws{}, blended{}, discards{}, through{}, samples{}, textured{}, mipmapped{}, minmip{}, skinned{}, weights{}, copied{}, skin_calls{}, skin_hits{};
+    std::uint64_t switches{}, draws{}, blended{}, discards{}, discards_dropped{}, through{}, samples{}, textured{}, mipmapped{}, minmip{}, skinned{}, weights{}, copied{}, skin_calls{}, skin_hits{};
     double skin_ms{};
     std::unordered_map<std::uint32_t, TargetUse> targets;  // by target key
 } g_gpu;
@@ -589,18 +598,14 @@ struct GpuCounters {
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
 bool g_stencil_ab{};
-// GPU probe (diagnostic): every 600 frames the GL thread changes how it draws,
-// so one log tells what the GPU time depends on. 0 normal, 1 scissor cut to a
-// sixteenth of the area (fragment cost), 2 no alpha/colour test discard, 3 no
-// texturing. Variants met only in a probe mode are not remembered.
+// GPU probe (diagnostic): every 600 frames the textures are uploaded another
+// way, so one log tells what the GPU time depends on: 0 RGBA8 with mip chains
+// (normal), 1 CLUT textures as GXM P8 paletted textures (no mips), 2 RGBA8
+// without mips. (gl-64 probed 1 scissor 1/16, 2 no discard, 3 untextured.)
 bool g_gpu_probe{};
 std::atomic<std::uint32_t> g_probe_mode{0u};
 std::uint32_t probe_key(std::uint32_t key) noexcept {
-    switch (g_probe_mode.load(std::memory_order_relaxed)) {
-    case 2u: return key & ~((0x1Fu << 17u) | (0xFu << 23u));
-    case 3u: return key & ~(0x3Cu | (0x7Fu << 10u));
-    default: return key;
-    }
+    return key;
 }
 bool g_mipmaps{std::getenv("PSPRECOMP_BURNOUT_NO_MIPMAPS") == nullptr};
 // Stencil A/B diagnostic: 0 full, 1 minimal, 2 off, rotating every 600 frames.
@@ -742,7 +747,7 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
 
 enum class Op : std::uint32_t {
     Enable, Disable, BlendFunc, BlendEquation, DepthFunc, DepthMask, ColorMask, FrontFace, Scissor, Viewport,
-    UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, Uniform4, UniformMatrix, Draw, CreateTarget,
+    UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, TexImageP8, Uniform4, UniformMatrix, Draw, CreateTarget,
     Present, Capture, StencilFunc, StencilOp, StencilMask
 };
 
@@ -1019,17 +1024,20 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     // RAM are re-hashed once per frame.
     static const bool recheck_vram = std::getenv("PSPRECOMP_BURNOUT_VRAM_RECHECK") != nullptr;
     const bool in_vram = (address & 0x0F000000u) == 0x04000000u && !recheck_vram;
-    if ((in_vram ? texture.stale : texture.checked_frame != g_stats.frames) && source != nullptr) {
+    const std::uint32_t upload_mode = g_probe_mode.load(std::memory_order_relaxed);
+    const bool reformat = !fresh && texture.upload_mode != upload_mode;
+    if ((reformat || (in_vram ? texture.stale : texture.checked_frame != g_stats.frames)) && source != nullptr) {
         texture.checked_frame = g_stats.frames;
         texture.stale = false;
         // Every 64 frames (staggered) the whole texture is hashed anyway.
         const std::uint64_t probe = probe_hash(source, bytes);
-        const bool full = fresh || probe != texture.probe || ((g_stats.frames + texture.name) & 63u) == 0u;
+        const bool full = fresh || reformat || probe != texture.probe || ((g_stats.frames + texture.name) & 63u) == 0u;
         texture.probe = probe;
         if (full) g_stats.texture_bytes_hashed += bytes;
         const std::uint64_t hash = full ? fnv(source, bytes) : texture.hash;
-        if (fresh || hash != texture.hash) {
+        if (fresh || reformat || hash != texture.hash) {
             texture.hash = hash;
+            texture.upload_mode = upload_mode;
             std::vector<std::uint8_t> linear_bytes;
             const std::uint8_t *data = source;
             if (swizzled) {
@@ -1075,9 +1083,38 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             // the GPU builds the chain from level 0 instead. Without one a
             // distant road samples a 256-texel texture sparsely, which on the
             // SGX misses the texture cache on nearly every fetch.
-            texture.mipmapped = g_mipmaps && levels != 0u && width >= 8u && height >= 8u;
-            record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()), texture.mipmapped ? 1u : 0u});
-            g_frame.blobs.push_back(std::move(rgba));
+            texture.mipmapped = g_mipmaps && upload_mode == 0u && levels != 0u && width >= 8u && height >= 8u;
+            std::uint8_t min_alpha = 255u;
+            for (std::size_t i = 3u; i < rgba.size(); i += 4u) min_alpha = std::min(min_alpha, rgba[i]);
+            texture.min_alpha = min_alpha;
+            if (std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr) {
+                std::size_t clear = 0u;
+                for (std::size_t i = 3u; i < rgba.size(); i += 4u) clear += rgba[i] <= 16u ? 1u : 0u;
+                std::fprintf(stderr, "[texfmt] fmt %u clutfmt %u %ux%u levels %u swz %d minA %u clear %.3f addr %08X\n", format,
+                             cmd(0xC5u) & 3u, width, height, levels, swizzled ? 1 : 0, min_alpha,
+                             static_cast<double>(clear) / static_cast<double>(width * height), address);
+            }
+            if (upload_mode == 1u && (format == 4u || format == 5u)) {
+                // Indices as stored (one byte each) and the 256-entry palette.
+                std::vector<std::uint8_t> indices(static_cast<std::size_t>(width) * height);
+                for (std::uint32_t y = 0; y < height; ++y) {
+                    const std::uint8_t *row = data + y * row_bytes;
+                    for (std::uint32_t x = 0; x < width; ++x)
+                        indices[static_cast<std::size_t>(y) * width + x] =
+                            format == 5u ? row[x] : static_cast<std::uint8_t>((row[x / 2u] >> ((x & 1u) * 4u)) & 15u);
+                }
+                std::vector<std::uint8_t> palette(1024u);
+                for (std::uint32_t i = 0; i < 256u; ++i) {
+                    const auto c = clut_color(i);
+                    std::memcpy(&palette[i * 4u], c.data(), 4u);
+                }
+                record(Op::TexImageP8, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size())});
+                g_frame.blobs.push_back(std::move(indices));
+                g_frame.blobs.push_back(std::move(palette));
+            } else {
+                record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()), texture.mipmapped ? 1u : 0u});
+                g_frame.blobs.push_back(std::move(rgba));
+            }
             ++g_stats.texture_uploads;
         }
     }
@@ -1090,6 +1127,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
         min_filter = modes[min_mode - 4u];
     }
     set_sampling(texture.sampling, linear, clamp_u, clamp_v, min_filter);
+    g_texture_min_alpha = texture.min_alpha;
     return {1.0f, 1.0f, 0.0f, 0.0f};
 }
 
@@ -1379,10 +1417,48 @@ void flush() {
         variant &= ~0x3Cu;
     }
     if (fog) variant |= 1u << 9u;
-    if (alpha_enabled && (alpha_test & 7u) != 1u) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
+    bool alpha_testing = alpha_enabled && (alpha_test & 7u) != 1u;
+    if (alpha_testing && !g_keep_discard) {
+        // The lowest alpha a fragment can have (filtering and mip levels stay
+        // within the texels' range), less one for rounding.
+        const std::uint32_t tex_alpha = textured && (texfunc & 0x100u) != 0u ? g_texture_min_alpha : 255u;
+        const std::uint32_t func = texfunc & 7u;
+        std::uint32_t lowest = g_batch_min_alpha;
+        if (textured) lowest = func == 1u ? g_batch_min_alpha : func == 3u && (texfunc & 0x100u) != 0u ? tex_alpha
+                                                                                                     : g_batch_min_alpha * tex_alpha / 255u;
+        lowest = lowest == 0u ? 0u : lowest - 1u;
+        const std::uint32_t ref = (alpha_test >> 8u) & 0xFFu;
+        const std::uint32_t mask = (alpha_test >> 16u) & 0xFFu;
+        // GREATER / GEQUAL / NOTEQUAL pass for every value above the reference
+        // (only with a full mask: a partial one compares masked bits).
+        const std::uint32_t test = alpha_test & 7u;
+        if (mask == 0xFFu && ((test == 6u && lowest > ref) || (test == 7u && lowest >= ref) || (test == 3u && lowest > ref))) {
+            alpha_testing = false;
+            ++g_gpu.discards_dropped;
+        }
+    }
+    if (alpha_testing) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
+    static const bool atest_stats = std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr;
+    if (atest_stats && alpha_testing) {
+        static std::unordered_map<std::string, int> seen;
+        static std::uint64_t calls = 0u;
+        char key[160];
+        std::snprintf(key, sizeof(key), "func %u ref %u mask %02X tex %d tcc %d texfunc %u texmin %u vmin %u blend %d zwrite %u vtype %06X",
+                      alpha_test & 7u, (alpha_test >> 8u) & 0xFFu, (alpha_test >> 16u) & 0xFFu, textured ? 1 : 0,
+                      (texfunc & 0x100u) != 0u ? 1 : 0, texfunc & 7u, g_texture_min_alpha, g_batch_min_alpha, g_state.blend,
+                      (cmd(0xE7u) & 0xFFFFu) == 0u ? 1u : 0u, g_batch_vtype);
+        ++seen[key];
+        if (++calls % 20000u == 0u) {
+            std::vector<std::pair<int, std::string>> top;
+            for (const auto &[k, v] : seen) top.push_back({v, k});
+            std::sort(top.rbegin(), top.rend());
+            for (std::size_t i = 0; i < top.size() && i < 25u; ++i) std::fprintf(stderr, "[atest] %6d %s\n", top[i].first, top[i].second.c_str());
+            seen.clear();
+        }
+    }
     if (g_state.blend == 1) { ++g_gpu.blended; ++use.blended; }
     if (through) { ++g_gpu.through; ++use.through; }
-    if ((alpha_enabled && (alpha_test & 7u) != 1u) || color_function != 1u) ++g_gpu.discards;
+    if (alpha_testing || color_function != 1u) ++g_gpu.discards;
     if (color_function != 1u) variant |= 1u << 23u | color_function << 24u;
     if (blend_scaled) variant |= 1u << 21u;
     if (alpha_out) variant |= 1u << 22u;
@@ -2067,6 +2143,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     if (g_batch_count == 0u) {
         g_batch_vtype = vtype;
         g_layout = batch_layout(vtype);
+        g_batch_min_alpha = 255u;
     }
     if (lit) g_stats.lit_vertices += vertex_count;
     // Indexed batch: the PRIM's vertices are appended once and triangles index
@@ -2077,6 +2154,25 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         flush();
         g_batch_vtype = vtype;
         g_layout = batch_layout(vtype);
+        g_batch_min_alpha = 255u;
+    }
+    if (!g_keep_discard) {
+        // A lower bound of what the PSP takes as the colour's alpha: the
+        // vertex colours when there are any, and the material ambient alpha
+        // (unlit without colours, or lit) either way.
+        std::uint32_t lowest = cmd(0x58u) & 0xFFu;
+        const std::uint32_t col = (vtype >> 2u) & 7u;
+        if (col >= 5u && vertex_count != 0u) {
+            const std::uint8_t *at = raw + layout.col;
+            for (std::uint32_t i = 0; i < vertex_count && lowest != 0u; ++i, at += vertex_stride) {
+                std::uint32_t a;
+                if (col == 7u) a = at[3];
+                else if (col == 6u) a = (at[1] >> 4u) * 17u;
+                else a = (at[1] & 0x80u) != 0u ? 255u : 0u;
+                lowest = std::min(lowest, a);
+            }
+        }
+        g_batch_min_alpha = std::min(g_batch_min_alpha, lowest);
     }
     const BatchLayout &out = g_layout;
     const auto vertex = [&](std::uint32_t i) { return raw + static_cast<std::size_t>(i) * vertex_stride; };
@@ -2547,7 +2643,7 @@ void replay(const Frame &frame) {
         case Op::StencilOp: glStencilOp(op[0], op[1], op[2]); op += 3; break;
         case Op::StencilMask: glStencilMask(op[0]); op += 1; break;
         case Op::Scissor: {
-            const GLsizei cut = g_probe_mode.load(std::memory_order_relaxed) == 1u ? 4 : 1;
+            const GLsizei cut = 1;
             glScissor(static_cast<GLint>(op[0]) * g_bound_scale, static_cast<GLint>(op[1]) * g_bound_scale,
                       static_cast<GLsizei>(op[2]) * g_bound_scale / cut, static_cast<GLsizei>(op[3]) * g_bound_scale / cut);
         }
@@ -2570,6 +2666,14 @@ void replay(const Frame &frame) {
                          GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
             if (op[3] != 0u) glGenerateMipmap(GL_TEXTURE_2D);
             op += 4;
+            break;
+        case Op::TexImageP8:
+#if defined(__vita__)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_COLOR_INDEX8_EXT, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), 0,
+                         GL_COLOR_INDEX, GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
+            glColorTable(GL_TEXTURE_2D, GL_RGBA, 256, GL_RGBA, GL_UNSIGNED_BYTE, frame.blobs[op[2] + 1u].data());
+#endif
+            op += 3;
             break;
         case Op::Uniform4: set_slot(op[0], floats(op[2]), op[1] * 4u, false); op += 3; break;
         case Op::UniformMatrix: set_slot(op[0], floats(op[1]), 16u, true); op += 2; break;
@@ -2962,7 +3066,7 @@ void present(std::uint32_t address) {
     flush();
     phase = 11u;
     ++g_stats.frames;
-    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 4u), std::memory_order_relaxed);
+    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 3u), std::memory_order_relaxed);
     if (g_stats.frames <= 3u) {
         char line[64];
         std::snprintf(line, sizeof(line), "frame %llu", static_cast<unsigned long long>(g_stats.frames));
@@ -2975,7 +3079,7 @@ void present(std::uint32_t address) {
         static double last_busy = 0.0, last_present = 0.0;
         const double wall = host_now_ms();
         const double n = static_cast<double>(g_stats.frames - last.frames);
-        char line[384];
+        char line[512];
         std::snprintf(line, sizeof(line),
                       "frame %llu: %.1f ms/frame wall, decode %.1f, record %.1f, present %.1f, idle %.1f; %.0f PRIM, %.0f batches, %.0f vertices (%.0f lit), %llu texture uploads",
                       static_cast<unsigned long long>(g_stats.frames), (wall - last_wall) / n,
@@ -2989,12 +3093,12 @@ void present(std::uint32_t address) {
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       (g_gl_busy_ms.load() - last_busy) / n,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
-                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 4u) : -1);
+                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 3u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
-                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
-                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.through / n,
+                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
+                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.discards_dropped / n, g_gpu.through / n,
                       g_gpu.samples / n, g_gpu.textured / n, g_gpu.mipmapped / n, g_gpu.minmip / n, g_gpu.skinned / n, g_gpu.weights / n, g_gpu.skin_calls / n, g_gpu.skin_hits / n, g_gpu.skin_ms / n, g_gpu.copied / n / 1024.0);
         trace(line);
         std::vector<std::pair<std::uint32_t, TargetUse>> used(g_gpu.targets.begin(), g_gpu.targets.end());
