@@ -19,6 +19,11 @@ bool start(int core);
 // Runs `work` on the worker after everything posted before it, or at once
 // when the worker is not running.
 void post(std::function<void()> work);
+// Same, but the worker is only handed it (and woken) with the next post,
+// flush or drain: for the voice setters, many per grain. Emulation thread.
+void post_deferred(std::function<void()> work);
+// Hands the deferred work over now.
+void flush();
 // Waits until everything posted so far has run.
 void drain();
 // Waits only when more than `items` calls are still queued.

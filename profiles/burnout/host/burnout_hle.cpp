@@ -1829,7 +1829,7 @@ void install_audio(Runtime &rt) {
     // envelope heights the game reads after each grain need no wait.
     const auto sas_apply = [](std::function<void()> work) {
         if (sas_worker::active()) work();
-        sas_worker::post(std::move(work));
+        sas_worker::post_deferred(std::move(work));
     };
     // With sound off, init fails as it did while the import stubs were not
     // dispatched (the wrapper's own 0x80420000): the game then leaves its SAS

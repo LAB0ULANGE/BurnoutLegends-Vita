@@ -563,7 +563,9 @@ void push_job(Job job) {
             g_skip_frame = true;
         }
         // A skipped frame costs the worker little: no need to wait for it.
-        const std::uint32_t room = job.skip ? 4u : 2u;
+        // Three lists in flight: the worker's uneven frames (skinning, new
+        // textures) are absorbed instead of stopping the game.
+        const std::uint32_t room = job.skip ? 4u : 3u;
         g_jobs_cv.wait(lock, [room] { return g_queued_command_jobs < room; });
         gl::emulation_phase = outer;
         g_emulation_wait_ms += host_now_ms() - started;
@@ -837,6 +839,28 @@ struct CachedCall {
 std::unordered_map<CallKey, CachedCall, CallKeyHash> g_calls;
 std::uint64_t g_call_hits{}, g_call_walked{}, g_call_hit_words{};
 
+// memcmp(...) == 0 for the sub-list check: both sides are usually cold (the
+// sub-lists are scattered), so the lines a few iterations ahead are fetched
+// while these compare, and a difference is only looked for every 8 words.
+bool same_words(const std::uint8_t *live_bytes, const std::uint32_t *copy, std::uint32_t count) noexcept {
+    const auto *live = reinterpret_cast<const std::uint32_t *>(live_bytes);  // guest words are 4-byte aligned
+    for (std::uint32_t at = 0u; at < count && at < 32u; at += 8u) {
+        prefetch_line(live + at);
+        prefetch_line(copy + at);
+    }
+    std::uint32_t i = 0u;
+    for (; i + 8u <= count; i += 8u) {
+        prefetch_line(live + i + 32u);
+        prefetch_line(copy + i + 32u);
+        std::uint32_t diff = 0u;
+        for (std::uint32_t j = 0u; j < 8u; ++j) diff |= live[i + j] ^ copy[i + j];
+        if (diff != 0u) return false;
+    }
+    std::uint32_t diff = 0u;
+    for (; i < count; ++i) diff |= live[i] ^ copy[i];
+    return diff == 0u;
+}
+
 bool static_range(std::uint32_t address) noexcept { return address >= 0x08800000u && address < 0x09C00000u; }
 
 void forget_words(CachedCall &call) {
@@ -962,7 +986,7 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
         std::uint32_t ret = 0u;
         if (live != nullptr) std::memcpy(&ret, live + bytes, 4u);
         const double started = host_now_ms();
-        if (live != nullptr && (ret >> 24u) == 0x0Bu && std::memcmp(live, call.words->data(), bytes) == 0) {
+        if (live != nullptr && (ret >> 24u) == 0x0Bu && same_words(live, call.words->data(), bytes / 4u)) {
             forward_cached(call);
             g_cached_ms += host_now_ms() - started;
             base = call.exit_base;

@@ -9,6 +9,7 @@
 #include <bit>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <cmath>
@@ -1574,10 +1575,49 @@ std::string lower_known_vfpu_prefixes(std::string text, VfpuPrefixState &state) 
         return text;
     }
 
+    // VTFM/VHTFM rewrite the D prefix for their last lane through
+    // ctx.vfpu_ctrl[2]; with every prefix known, that rewrite and the final
+    // row's S/T prefixes become constants (and the store goes away).
+    if (std::getenv("PSPRECOMP_NO_CONST_VFPU_PREFIXES") == nullptr && state.control[0] && state.control[1] &&
+        state.control[2] && text.find("vfpu_final_row") != std::string::npos) {
+        const auto hex = [](std::uint32_t value) {
+            char buffer[16];
+            std::snprintf(buffer, sizeof(buffer), "0x%08Xu", value);
+            return std::string(buffer);
+        };
+        const std::string before = text;
+        const auto replace_once = [&](const std::string &from, const std::string &to) {
+            const auto at = text.find(from);
+            if (at == std::string::npos) return false;
+            text.replace(at, from.size(), to);
+            return true;
+        };
+        bool ok = replace_once("ctx.apply_vfpu_source_prefix_ct<4u, 0u>(vfpu_final_row);",
+                               "ctx.apply_vfpu_prefix_const<" + hex(*state.control[0]) + ", 4u>(vfpu_final_row);");
+        ok = ok && replace_once("ctx.apply_vfpu_source_prefix_ct<4u, 1u>(vfpu_target);",
+                                "ctx.apply_vfpu_prefix_const<" + hex(*state.control[1]) + ", 4u>(vfpu_target);");
+        ok = ok && replace_once("const std::uint32_t vfpu_destination_prefix = ctx.vfpu_ctrl[2];",
+                                "constexpr std::uint32_t vfpu_destination_prefix = " + hex(*state.control[2]) + ";");
+        ok = ok && replace_once("const std::uint32_t vfpu_last_lane = vfpu_side - 1u;",
+                                "constexpr std::uint32_t vfpu_last_lane = vfpu_side - 1u;");
+        ok = ok && replace_once("ctx.vfpu_ctrl[2] = ((vfpu_destination_prefix",
+                                "constexpr std::uint32_t vfpu_rewritten_d = ((vfpu_destination_prefix");
+        static const std::regex final_write(
+            R"(ctx\.write_vfpu_vector_with_destination_prefix_ct<([0-9]+)u, ([1-4])u>\(vfpu_result\);)");
+        std::smatch write_match;
+        ok = ok && std::regex_search(text, write_match, final_write);
+        if (ok) {
+            text = std::regex_replace(text, final_write,
+                                      "ctx.write_vfpu_vector_dprefix_const<$1u, $2u, vfpu_rewritten_d>(vfpu_result);");
+        } else {
+            text = before;
+        }
+    }
+
     static const std::regex raw_control_write(
         R"(vfpu_ctrl\[[0-2]u?\] *=[^=]|set_vfpu_scalar_bits\(|set_vfpu_scalar_bits_ct<1(28|29|30)u>)");
     static const std::regex consume(
-        R"(eat_vfpu_prefixes\(|write_vfpu_vector_with_destination_prefix|execute_vfpu_|write_vfpu_identity_matrix\()");
+        R"(eat_vfpu_prefixes\(|write_vfpu_vector_with_destination_prefix|write_vfpu_vector_dprefix_const|execute_vfpu_|write_vfpu_identity_matrix\()");
     std::ptrdiff_t last_raw_write = -1, last_consume = -1;
     for (auto it = std::sregex_iterator(text.begin(), text.end(), raw_control_write); it != std::sregex_iterator(); ++it)
         last_raw_write = it->position();
@@ -1617,6 +1657,41 @@ std::string lower_known_vfpu_prefixes(std::string text, VfpuPrefixState &state) 
         } else if (state.control[2] == 0u) {
             lowered = std::regex_replace(lowered, write_d,
                 "ctx.write_vfpu_vector_ct<$1u, $2u>($3); ctx.eat_vfpu_prefixes();");
+        }
+        // Prefixes known but not all default: the prefix logic itself becomes
+        // constants (the vpfx stores stay, and these consume them as before).
+        if (std::getenv("PSPRECOMP_NO_CONST_VFPU_PREFIXES") == nullptr && state.control[0] && state.control[1] &&
+            state.control[2]) {
+            const auto hex = [](std::uint32_t value) {
+                char buffer[16];
+                std::snprintf(buffer, sizeof(buffer), "0x%08Xu", value);
+                return std::string(buffer);
+            };
+            const std::string sp = hex(*state.control[0]), tp = hex(*state.control[1]), dp = hex(*state.control[2]);
+            static const std::regex compare3(
+                R"(ctx\.execute_vfpu_compare3\(([0-9]+)u, ([0-9]+)u, ([0-9]+)u, ([1-4])u, ([5-7])u\);)");
+            static const std::regex horizontal(
+                R"(ctx\.execute_vfpu_horizontal\(([0-9]+)u, ([0-9]+)u, ([1-4])u, (true|false)\);)");
+            static const std::regex cross_quat(
+                R"(ctx\.execute_vfpu_cross_quat\(([0-9]+)u, ([0-9]+)u, ([0-9]+)u, ([1-4])u\);)");
+            lowered = std::regex_replace(lowered, compare3,
+                "ctx.execute_vfpu_compare3_ct<$1u, $2u, $3u, $4u, $5u, " + sp + ", " + tp + ", " + dp + ">();");
+            lowered = std::regex_replace(lowered, horizontal,
+                "ctx.execute_vfpu_horizontal_ct<$1u, $2u, $3u, $4, " + sp + ", " + tp + ", " + dp + ">();");
+            lowered = std::regex_replace(lowered, cross_quat,
+                "ctx.execute_vfpu_cross_quat_ct<$1u, $2u, $3u, $4u, " + sp + ", " + tp + ", " + dp + ">();");
+            if (*state.control[0] != 0xE4u) {
+                lowered = std::regex_replace(lowered, read_s, "ctx.read_vfpu_vector_prefix_const<$1u, $2u, " + sp + ">(");
+                static const std::regex apply_s_any(R"(ctx\.apply_vfpu_source_prefix_ct<([1-4])u, 0u>\(([A-Za-z0-9_]+)\);)");
+                lowered = std::regex_replace(lowered, apply_s_any, "ctx.apply_vfpu_prefix_const<" + sp + ", $1u>($2);");
+            }
+            if (*state.control[1] != 0xE4u) {
+                lowered = std::regex_replace(lowered, read_t, "ctx.read_vfpu_vector_prefix_const<$1u, $2u, " + tp + ">(");
+                static const std::regex apply_t_any(R"(ctx\.apply_vfpu_source_prefix_ct<([1-4])u, 1u>\(([A-Za-z0-9_]+)\);)");
+                lowered = std::regex_replace(lowered, apply_t_any, "ctx.apply_vfpu_prefix_const<" + tp + ", $1u>($2);");
+            }
+            if (*state.control[2] != 0u)
+                lowered = std::regex_replace(lowered, write_d, "ctx.write_vfpu_vector_dprefix_const<$1u, $2u, " + dp + ">($3);");
         }
     }
 

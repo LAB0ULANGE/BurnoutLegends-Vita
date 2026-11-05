@@ -8,6 +8,7 @@
 #include <deque>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #if defined(__vita__)
 #include <psp2/kernel/cpu.h>
@@ -25,6 +26,9 @@ namespace {
 SyncMutex g_mutex{"sas_worker"};
 SyncCondition g_cv{"sas_worker", g_mutex};
 std::deque<std::function<void()>> g_queue;
+// Emulation thread: voice changes not handed over yet (post_deferred). They
+// join the queue with the next post, so a grain's setters cost one wake-up.
+std::vector<std::function<void()>> g_deferred;
 bool g_running_work{};  // the worker has taken work it has not finished
 std::atomic<bool> g_active{false};
 std::atomic<std::uint64_t> g_busy_us{0u};
@@ -79,13 +83,37 @@ bool start(int core) {
 
 bool active() noexcept { return g_active.load(std::memory_order_relaxed); }
 
+namespace {
+// Under the lock: the deferred work goes first, in order.
+void take_deferred_locked() {
+    for (auto &work : g_deferred) g_queue.push_back(std::move(work));
+    g_deferred.clear();
+}
+} // namespace
+
 void post(std::function<void()> work) {
     if (!active()) {
         work();
         return;
     }
     std::lock_guard lock(g_mutex);
+    take_deferred_locked();
     g_queue.push_back(std::move(work));
+    g_cv.notify_all();
+}
+
+void post_deferred(std::function<void()> work) {
+    if (!active()) {
+        work();
+        return;
+    }
+    g_deferred.push_back(std::move(work));
+}
+
+void flush() {
+    if (!active() || g_deferred.empty()) return;
+    std::lock_guard lock(g_mutex);
+    take_deferred_locked();
     g_cv.notify_all();
 }
 
@@ -95,7 +123,7 @@ void drain_if_behind(std::size_t items) {
     if (!active()) return;
     {
         std::lock_guard lock(g_mutex);
-        if (g_queue.size() <= items) return;
+        if (g_queue.size() + g_deferred.size() <= items) return;
     }
     drain();
 }
@@ -103,6 +131,8 @@ void drain_if_behind(std::size_t items) {
 void drain() {
     if (!active()) return;
     std::unique_lock lock(g_mutex);
+    take_deferred_locked();
+    if (!g_queue.empty()) g_cv.notify_all();
     if (g_queue.empty() && !g_running_work) return;
     // Work still queued or running: the emulation waits for it (traced).
     const double started = host_now_ms();
