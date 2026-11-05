@@ -30,8 +30,16 @@ void key_off(int voice);
 [[nodiscard]] std::uint32_t end_flags();  // bit per voice that is not playing
 [[nodiscard]] std::int32_t envelope_height(int voice);
 
-// Renders one grain of interleaved stereo samples.
+// Renders one grain of interleaved stereo samples (in state-only mode, only
+// advances the voices: `out` is left alone).
 void mix(std::int16_t *out);
+
+// For the calling thread: work on the shadow bank of voices and keep only
+// their state (envelope, sample position, end), or on the bank that is mixed
+// into sound. With a mixer thread, the emulation thread applies every call to
+// the shadow too, so it answers the game's end flags and envelope heights at
+// once instead of waiting for the mixer.
+void set_state_only(bool state_only);
 [[nodiscard]] std::uint32_t grain() noexcept;
 
 } // namespace burnout::sas

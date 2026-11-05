@@ -42,7 +42,13 @@ struct Voice {
     std::uint32_t noise_state{1u};
 };
 
-std::array<Voice, kVoices> g_voices;
+// Two banks of voices: the one mixed into sound, and a shadow the emulation
+// thread advances without making sound when a mixer thread renders the
+// first (see set_state_only). Each thread picks its bank.
+std::array<Voice, kVoices> g_audio_voices, g_shadow_voices;
+thread_local bool t_state_only{};
+thread_local std::array<Voice, kVoices> *t_voices{&g_audio_voices};
+#define g_voices (*t_voices)
 std::uint32_t g_grain{256u};
 std::vector<std::int32_t> g_mix;
 
@@ -88,7 +94,34 @@ bool decode_block(Voice &v) {
     return true;
 }
 
+// decode_block() without the samples: the block's flags only (end, loop).
+// The state-only bank needs no sound, and the decoder's history only feeds
+// the samples.
+bool skip_block(Voice &v) {
+    if (v.stream_end || v.end_after_block || v.vag == nullptr || (v.block + 1u) * 16u > v.size) return false;
+    const std::uint8_t flags = v.vag[v.block * 16u + 1u];
+    if (flags == 7u) return false;
+    if ((flags & 4u) != 0u) v.loop_block = static_cast<std::int32_t>(v.block);
+    v.sample_at = 0u;
+    v.sample_count = 28u;
+    ++v.block;
+    if ((flags & 1u) != 0u) {
+        if (v.loop && v.loop_block >= 0) v.block = static_cast<std::uint32_t>(v.loop_block);
+        else v.end_after_block = true;
+    }
+    return true;
+}
+
 std::int32_t next_sample(Voice &v) {
+    if (t_state_only) {
+        if (v.noise) return 0;
+        if (v.sample_at >= v.sample_count && !skip_block(v)) {
+            v.stream_end = true;
+            return 0;
+        }
+        ++v.sample_at;
+        return 0;
+    }
     if (v.noise) {
         v.noise_state = v.noise_state * 1103515245u + 12345u;
         return static_cast<std::int16_t>(v.noise_state >> 16u);
@@ -133,7 +166,8 @@ std::int32_t simple_rate(std::uint32_t n) {
 
 void init(std::uint32_t grain) {
     g_grain = std::clamp<std::uint32_t>(grain, 64u, 2048u);
-    g_voices = {};
+    g_audio_voices = {};
+    g_shadow_voices = {};
 }
 
 std::uint32_t grain() noexcept { return g_grain; }
@@ -439,9 +473,113 @@ void mix_voice(Voice &v, std::int32_t *mix, std::uint32_t grain) {
     v.fraction = fraction;
 }
 
+// mix_voice() without the sound: the same envelope, cursor and end of the
+// voice, step for step (the game reads them back after each grain).
+void advance_voice(Voice &v, std::uint32_t grain) {
+    Envelope e = v.envelope;
+    bool playing = v.playing;
+    const std::uint32_t pitch = v.pitch;
+    std::uint32_t fraction = v.fraction;
+    if (v.noise) {
+        // mix_voice_generic(): a noise voice never runs out of samples.
+        const bool ended = sample_ended(v);
+        bool settled = false;
+        for (std::uint32_t i = 0; i < grain; ++i) {
+            if (!settled) {
+                step_local(e, playing);
+                settled = e.state == Sustain && e.sustain_rate == 0;
+            }
+            fraction += pitch;
+            fraction &= 0xFFFu;  // the while loop of the mix, as one step
+            if (ended) {
+                playing = false;
+                e.state = Off;
+                e.height = 0;
+                break;
+            }
+            if (!playing) break;
+        }
+        v.envelope = e;
+        v.playing = playing;
+        v.fraction = fraction;
+        return;
+    }
+    std::uint32_t at = v.sample_at, count = v.sample_count;
+    bool stream_end = v.stream_end;
+    const auto fetch = [&] {
+        if (at >= count) {
+            if (!skip_block(v)) {
+                stream_end = true;
+                v.stream_end = true;
+                return;
+            }
+            at = 0u;
+            count = 28u;
+        }
+        ++at;
+    };
+    std::uint32_t i = 0;
+    bool done = false;
+    for (; i < grain; ++i) {
+        step_local(e, playing);
+        const bool settled = e.state == Sustain && e.sustain_rate == 0;
+        fraction += pitch;
+        while (fraction >= 0x1000u) {
+            fraction -= 0x1000u;
+            fetch();
+        }
+        if (stream_end && at >= count) {
+            playing = false;
+            e.state = Off;
+            e.height = 0;
+            done = true;
+            break;
+        }
+        if (!playing) {
+            done = true;
+            break;
+        }
+        if (settled) {
+            ++i;
+            break;
+        }
+    }
+    if (!done) {
+        for (; i < grain; ++i) {
+            fraction += pitch;
+            while (fraction >= 0x1000u) {
+                fraction -= 0x1000u;
+                fetch();
+            }
+            if (stream_end && at >= count) {
+                playing = false;
+                e.state = Off;
+                e.height = 0;
+                break;
+            }
+        }
+    }
+    v.sample_at = at;
+    v.sample_count = count;
+    v.stream_end = stream_end;
+    v.envelope = e;
+    v.playing = playing;
+    v.fraction = fraction;
+}
+
 } // namespace
 
+void set_state_only(bool state_only) {
+    t_state_only = state_only;
+    t_voices = state_only ? &g_shadow_voices : &g_audio_voices;
+}
+
 void mix(std::int16_t *out) {
+    if (t_state_only) {
+        for (Voice &v : g_voices)
+            if (v.playing) advance_voice(v, g_grain);
+        return;
+    }
     g_mix.assign(static_cast<std::size_t>(g_grain) * 2u, 0);
     std::int32_t *mix = g_mix.data();
     for (Voice &v : g_voices)

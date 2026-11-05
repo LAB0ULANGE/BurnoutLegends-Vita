@@ -456,7 +456,9 @@ void process_time(Runtime &rt) {
     while (k.next_vblank_us <= k.time_us) {
         ++k.vblanks;
         k.next_vblank_us += kVblankPeriodUs;
-        sas_worker::drain();
+        // The mixer thread may lag (the game reads the shadow voices); only
+        // a long queue makes the emulation wait.
+        sas_worker::drain_if_behind(256u);
         for (auto &[uid, thread] : k.threads) {
             (void)uid;
             if (thread.state == ThreadState::Waiting && thread.wait == WaitKind::Vblank &&
@@ -1822,6 +1824,13 @@ void install_audio(Runtime &rt) {
     reg_value(rt, lib, 0xB7E1D8E7u, 0u);
 
     constexpr const char *sas = "sceSasCore";
+    // With a mixer thread, each call also updates the shadow voices the
+    // emulation thread keeps (sas::set_state_only), so the end flags and
+    // envelope heights the game reads after each grain need no wait.
+    const auto sas_apply = [](std::function<void()> work) {
+        if (sas_worker::active()) work();
+        sas_worker::post(std::move(work));
+    };
     // With sound off, init fails as it did while the import stubs were not
     // dispatched (the wrapper's own 0x80420000): the game then leaves its SAS
     // voices alone, which saves it real CPU time and keeps the PC validation
@@ -1831,6 +1840,7 @@ void install_audio(Runtime &rt) {
         k.sas_grain = std::max<std::uint32_t>(arg(ctx, 1), 64u);
         sas_worker::drain();
         sas::init(k.sas_grain);
+        sas::set_state_only(sas_worker::active());
         ret(ctx, 0u);
     });
     reg(rt, sas, 0xA3589D81u, [](Runtime &r, AllegrexContext &ctx) {  // __sceSasCore(core, out)
@@ -1841,6 +1851,9 @@ void install_audio(Runtime &rt) {
             g_sas_out = arg(ctx, 1);
             ++g_sas_grains;
             if (sas_worker::active()) {
+                const double started = host_now_ms();
+                sas::mix(out);  // the shadow voices' state only
+                g_sas_ms += host_now_ms() - started;
                 sas_worker::post([out] { sas::mix(out); });
             } else {
                 const double started = host_now_ms();
@@ -1851,62 +1864,60 @@ void install_audio(Runtime &rt) {
         else r.memory().zero(arg(ctx, 1), k.sas_grain * 4u);
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x68A46B95u, [](Runtime &, AllegrexContext &ctx) {  // GetEndFlag
-        sas_worker::drain();
+    reg(rt, sas, 0x68A46B95u, [](Runtime &, AllegrexContext &ctx) {  // GetEndFlag (shadow with a mixer thread)
         ret(ctx, audio::enabled() ? sas::end_flags() : 0xFFFFFFFFu);
     });
     const auto voice = [](const AllegrexContext &ctx) { return static_cast<int>(arg(ctx, 1)); };
-    reg(rt, sas, 0x99944089u, [voice](Runtime &r, AllegrexContext &ctx) {  // SetVoice(core, voice, vag, size, loop)
+    reg(rt, sas, 0x99944089u, [voice, sas_apply](Runtime &r, AllegrexContext &ctx) {  // SetVoice(core, voice, vag, size, loop)
         workload::sas_set_voice(arg(ctx, 1), arg(ctx, 3), arg(ctx, 4) != 0u);
-        sas_worker::post([v = voice(ctx), vag = r.memory().raw_pointer(arg(ctx, 2), arg(ctx, 3)), size = arg(ctx, 3),
+        sas_apply([v = voice(ctx), vag = r.memory().raw_pointer(arg(ctx, 2), arg(ctx, 3)), size = arg(ctx, 3),
                           loop = arg(ctx, 4) != 0u] { sas::set_voice(v, vag, size, loop); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0xAD84D37Fu, [voice](Runtime &, AllegrexContext &ctx) {  // SetPitch
+    reg(rt, sas, 0xAD84D37Fu, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetPitch
         workload::sas_set_pitch(arg(ctx, 1), arg(ctx, 2));
-        sas_worker::post([v = voice(ctx), pitch = arg(ctx, 2)] { sas::set_pitch(v, pitch); });
+        sas_apply([v = voice(ctx), pitch = arg(ctx, 2)] { sas::set_pitch(v, pitch); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x76F01ACAu, [voice](Runtime &, AllegrexContext &ctx) {  // SetKeyOn
+    reg(rt, sas, 0x76F01ACAu, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetKeyOn
         workload::sas_key_on(arg(ctx, 1), k.time_us);
-        sas_worker::post([v = voice(ctx)] { sas::key_on(v); });
+        sas_apply([v = voice(ctx)] { sas::key_on(v); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0xA0CF2FA4u, [voice](Runtime &, AllegrexContext &ctx) {  // SetKeyOff
+    reg(rt, sas, 0xA0CF2FA4u, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetKeyOff
         workload::sas_key_off(arg(ctx, 1));
-        sas_worker::post([v = voice(ctx)] { sas::key_off(v); });
+        sas_apply([v = voice(ctx)] { sas::key_off(v); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x440CA7D8u, [voice](Runtime &, AllegrexContext &ctx) {  // SetVolume(core, voice, l, r, effect l, effect r)
-        sas_worker::post([v = voice(ctx), left = static_cast<std::int32_t>(arg(ctx, 2)),
+    reg(rt, sas, 0x440CA7D8u, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetVolume(core, voice, l, r, effect l, effect r)
+        sas_apply([v = voice(ctx), left = static_cast<std::int32_t>(arg(ctx, 2)),
                           right = static_cast<std::int32_t>(arg(ctx, 3))] { sas::set_volume(v, left, right); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0xB7660A23u, [voice](Runtime &, AllegrexContext &ctx) {  // SetNoise(core, voice, frequency)
-        sas_worker::post([v = voice(ctx), frequency = arg(ctx, 2)] { sas::set_noise(v, frequency); });
+    reg(rt, sas, 0xB7660A23u, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetNoise(core, voice, frequency)
+        sas_apply([v = voice(ctx), frequency = arg(ctx, 2)] { sas::set_noise(v, frequency); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x019B25EBu, [voice](Runtime &, AllegrexContext &ctx) {  // SetADSR(core, voice, flags, a, d, s, r)
-        sas_worker::post([v = voice(ctx), flags = arg(ctx, 2), a = static_cast<std::int32_t>(arg(ctx, 3)),
+    reg(rt, sas, 0x019B25EBu, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetADSR(core, voice, flags, a, d, s, r)
+        sas_apply([v = voice(ctx), flags = arg(ctx, 2), a = static_cast<std::int32_t>(arg(ctx, 3)),
                           d = static_cast<std::int32_t>(arg(ctx, 4)), sl = static_cast<std::int32_t>(arg(ctx, 5)),
                           rl = static_cast<std::int32_t>(arg(ctx, 6))] { sas::set_adsr(v, flags, a, d, sl, rl); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x9EC3676Au, [voice](Runtime &, AllegrexContext &ctx) {  // SetADSRmode(core, voice, flags, a, d, s, r)
-        sas_worker::post([v = voice(ctx), flags = arg(ctx, 2), a = arg(ctx, 3), d = arg(ctx, 4), sl = arg(ctx, 5),
+    reg(rt, sas, 0x9EC3676Au, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetADSRmode(core, voice, flags, a, d, s, r)
+        sas_apply([v = voice(ctx), flags = arg(ctx, 2), a = arg(ctx, 3), d = arg(ctx, 4), sl = arg(ctx, 5),
                           rl = arg(ctx, 6)] { sas::set_adsr_mode(v, flags, a, d, sl, rl); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x5F9529F6u, [voice](Runtime &, AllegrexContext &ctx) {  // SetSL(core, voice, level)
-        sas_worker::post([v = voice(ctx), level = static_cast<std::int32_t>(arg(ctx, 2))] { sas::set_sustain_level(v, level); });
+    reg(rt, sas, 0x5F9529F6u, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetSL(core, voice, level)
+        sas_apply([v = voice(ctx), level = static_cast<std::int32_t>(arg(ctx, 2))] { sas::set_sustain_level(v, level); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0xCBCD4F79u, [voice](Runtime &, AllegrexContext &ctx) {  // SetSimpleADSR(core, voice, env1, env2)
-        sas_worker::post([v = voice(ctx), env1 = arg(ctx, 2), env2 = arg(ctx, 3)] { sas::set_simple_adsr(v, env1, env2); });
+    reg(rt, sas, 0xCBCD4F79u, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // SetSimpleADSR(core, voice, env1, env2)
+        sas_apply([v = voice(ctx), env1 = arg(ctx, 2), env2 = arg(ctx, 3)] { sas::set_simple_adsr(v, env1, env2); });
         ret(ctx, 0u);
     });
-    reg(rt, sas, 0x74AE582Au, [voice](Runtime &, AllegrexContext &ctx) {  // GetEnvelopeHeight(core, voice)
-        sas_worker::drain();
+    reg(rt, sas, 0x74AE582Au, [voice, sas_apply](Runtime &, AllegrexContext &ctx) {  // GetEnvelopeHeight(core, voice)
         ret(ctx, audio::enabled() ? static_cast<std::uint32_t>(sas::envelope_height(voice(ctx))) : 0u);
     });
     // Reverb (RevVON, RevEVOL, RevType, RevParam): not modelled.

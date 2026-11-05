@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 
@@ -20,6 +21,8 @@ bool start(int core);
 void post(std::function<void()> work);
 // Waits until everything posted so far has run.
 void drain();
+// Waits only when more than `items` calls are still queued.
+void drain_if_behind(std::size_t items);
 
 // Host time the worker spent running work, in ms, since the last call.
 [[nodiscard]] double take_busy_ms();

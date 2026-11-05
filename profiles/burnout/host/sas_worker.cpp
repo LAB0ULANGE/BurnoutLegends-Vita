@@ -91,6 +91,15 @@ void post(std::function<void()> work) {
 
 std::atomic<std::uint64_t> g_wait_us{0u}, g_waits{0u};
 
+void drain_if_behind(std::size_t items) {
+    if (!active()) return;
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_queue.size() <= items) return;
+    }
+    drain();
+}
+
 void drain() {
     if (!active()) return;
     std::unique_lock lock(g_mutex);

@@ -583,6 +583,7 @@ struct GpuCounters {
 // Scale of each render target as created (decode thread): the screen-sized
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
+bool g_stencil_ab{};
 
 std::uint32_t cmd(std::uint32_t index) noexcept { return g_commands[index] & 0x00FFFFFFu; }
 float float24(std::uint32_t data) noexcept { return std::bit_cast<float>(data << 8u); }
@@ -1283,7 +1284,7 @@ void flush() {
         set_color_mask((clear & 0x100u) != 0u, (clear & 0x200u) != 0u);
         // The alpha update clears the stencil too. To 0: the clear colour's
         // alpha is in the vertices, and the game only clears it to 0 so far.
-        const bool stencil = (clear & 0x200u) != 0u;
+        const bool stencil = (clear & 0x200u) != 0u && !(g_stencil_ab && ((g_stats.frames / 600u) & 1u) != 0u);
         set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
         if (stencil) set_stencil(GL_ALWAYS, 0u, 0xFFu, GL_REPLACE, GL_REPLACE, GL_REPLACE, 0xFFu);
         set_capability(GL_CULL_FACE, g_state.cull, false);
@@ -1304,7 +1305,7 @@ void flush() {
         // written through the alpha write mask. Lakeside marks the lake's
         // pixels 2 and draws the sky's reflection where it equals 2; without
         // the test the reflection covered the lower half of the screen.
-        const bool stencil = (cmd(0x24u) & 1u) != 0u;
+        const bool stencil = (cmd(0x24u) & 1u) != 0u && !(g_stencil_ab && ((g_stats.frames / 600u) & 1u) != 0u);
         set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
         if (stencil) {
             const std::uint32_t func = cmd(0xDCu), op = cmd(0xDDu);
@@ -2576,6 +2577,7 @@ void flush_traces() {
 
 void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
+void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }

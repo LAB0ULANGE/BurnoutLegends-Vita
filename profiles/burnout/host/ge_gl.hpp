@@ -25,6 +25,8 @@ void set_render_scale(int scale);
 // Render targets narrower than the screen (the game's effect buffers) at 1x
 // whatever the render scale (before initialize).
 void set_offscreen_1x(bool enabled);
+// Diagnostic: the stencil test off every other 600 frames (GPU cost A/B).
+void set_stencil_ab(bool enabled);
 // Vita, before initialize: where compiled programs are kept (empty: none),
 // and whether vitaGL's pools use cached memory.
 void set_shader_cache(const std::string &directory);
