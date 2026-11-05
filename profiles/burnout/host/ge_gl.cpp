@@ -614,6 +614,8 @@ bool g_stencil_ab{};
 // (normal), 1 CLUT textures as GXM P8 paletted textures (no mips), 2 RGBA8
 // without mips. (gl-64 probed 1 scissor 1/16, 2 no discard, 3 untextured.)
 bool g_gpu_probe{};
+// Test F: deferred cut-outs (drawn after the opaque scenery) blend with a 0/1 alpha instead of discarding.
+bool g_blend_deferred_cutouts{std::getenv("PSPRECOMP_BURNOUT_BLEND_DEFERRED") != nullptr};
 // Test: cut-out draws (alpha-tested, not blended: trees, hedges, fences) are not drawn.
 bool g_no_cutouts{std::getenv("PSPRECOMP_BURNOUT_NO_CUTOUTS") != nullptr};
 bool g_draw_is_cutout{};
@@ -803,9 +805,22 @@ struct Frame {
 
 Frame g_frame;  // being recorded by the decode thread
 
+// Cut-outs after the opaque scenery (reorder test): an alpha-tested opaque
+// draw is recorded, with all its state, into g_deferred_ops, which joins the
+// frame at the next draw that cannot move ahead of it (blending, no depth
+// test, stencil, another target...). The opaque draws in between then reach
+// the GPU first, so the punch-through ones behind them are rejected early.
+bool g_reorder_cutouts{std::getenv("PSPRECOMP_BURNOUT_REORDER") != nullptr};
+bool g_recording_deferred{};
+std::vector<std::uint32_t> g_deferred_ops;
+std::vector<GLint *> g_deferred_sampling;  // sampler caches the deferred ops set
+GLuint g_deferred_target{};
+std::uint64_t g_deferred_draws{}, g_deferred_splices{};
+
 void record(Op op, std::initializer_list<std::uint32_t> args = {}) {
-    g_frame.ops.push_back(static_cast<std::uint32_t>(op));
-    g_frame.ops.insert(g_frame.ops.end(), args.begin(), args.end());
+    std::vector<std::uint32_t> &ops = g_recording_deferred ? g_deferred_ops : g_frame.ops;
+    ops.push_back(static_cast<std::uint32_t>(op));
+    ops.insert(ops.end(), args.begin(), args.end());
 }
 
 std::uint32_t record_data(const void *bytes, std::size_t size) {
@@ -909,6 +924,12 @@ void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v, 
     const GLint wanted[4]{min_filter != 0 ? min_filter : linear ? GL_LINEAR : GL_NEAREST, linear ? GL_LINEAR : GL_NEAREST,
                           clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT, clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT};
     static constexpr GLenum names[4]{GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T};
+    if (g_recording_deferred) {
+        // Replayed after draws recorded later: set every parameter, and the
+        // cache is forgotten when the deferred ops join the frame.
+        for (int i = 0; i < 4; ++i) current[i] = -1;
+        g_deferred_sampling.push_back(current);
+    }
     for (int i = 0; i < 4; ++i)
         if (current[i] != wanted[i]) {
             current[i] = wanted[i];
@@ -1159,7 +1180,14 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 g_frame.blobs.push_back(std::move(indices));
                 g_frame.blobs.push_back(std::move(palette));
             } else {
+                // Uploads stay in frame order (draws recorded later may use
+                // the texture before a deferred draw is replayed).
+                const bool deferred = g_recording_deferred;
+                g_recording_deferred = false;
+                if (deferred) record(Op::BindTexture, {texture.name});
                 record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()), texture.mipmapped ? 1u : 0u});
+                g_recording_deferred = deferred;
+                if (deferred) g_state.texture = ~0u;
                 g_frame.blobs.push_back(std::move(rgba));
             }
             ++g_stats.texture_uploads;
@@ -1307,6 +1335,30 @@ void upload_matrices() {
 std::uint32_t upload_vertex_state(bool through);
 void bind_vertices();
 
+// After the GL state changed behind the caches' back (deferred ops).
+void invalidate_record_caches() {
+    // The render target stays: deferred ops only join the frame while their
+    // target is still bound, and rebinding it would start a new GPU scene.
+    const GLuint framebuffer = g_state.framebuffer;
+    const int viewport_w = g_state.viewport_w, viewport_h = g_state.viewport_h;
+    forget_state();
+    g_state.framebuffer = framebuffer;
+    g_state.viewport_w = viewport_w;
+    g_state.viewport_h = viewport_h;
+    for (auto &uniform : g_uniforms) uniform.count = 0u;
+    g_lighting_dirty = true;
+}
+
+void splice_deferred() {
+    if (g_deferred_ops.empty()) return;
+    g_frame.ops.insert(g_frame.ops.end(), g_deferred_ops.begin(), g_deferred_ops.end());
+    g_deferred_ops.clear();
+    for (GLint *sampling : g_deferred_sampling) sampling[0] = sampling[1] = sampling[2] = sampling[3] = -1;
+    g_deferred_sampling.clear();
+    invalidate_record_caches();
+    ++g_deferred_splices;
+}
+
 void flush() {
     if (g_batch_runs.empty() || !g_drawing) {
         g_batch_indices.clear();
@@ -1331,6 +1383,51 @@ void flush() {
     use.width = target.width;
     ++use.draws;
     ++g_gpu.draws;
+    bool deferred_draw = false;
+    if (g_reorder_cutouts) {
+        // Depth-tested, depth-writing, unblended and unmasked: such draws
+        // commute (but for exact depth ties). Alpha-tested textured ones
+        // wait; anything else first lets the waiting ones through.
+        const bool clear = (cmd(0xD3u) & 1u) != 0u;
+        const std::uint32_t depth_func = cmd(0xDEu) & 7u;
+        // A stencil that always passes and is only replaced where the depth
+        // test passes ends up as the nearest draw's, in any order (the
+        // scenery's: always, keep on depth fail, replace).
+        const std::uint32_t stencil_ops = cmd(0xDDu);
+        const bool stencil_by_depth = (cmd(0xDCu) & 7u) == 1u && ((stencil_ops >> 8u) & 7u) == 0u &&
+                                      (((stencil_ops >> 16u) & 7u) == 0u || ((stencil_ops >> 16u) & 7u) == 2u);
+        const bool plain = !clear && (g_batch_vtype & 0x800000u) == 0u && (cmd(0x21u) & 1u) == 0u &&
+                           (cmd(0x23u) & 1u) != 0u && (cmd(0xE7u) & 1u) == 0u && depth_func >= 4u &&
+                           ((cmd(0x24u) & 1u) == 0u || stencil_by_depth) && (cmd(0x28u) & 1u) == 0u && (cmd(0xE8u) & 0xFFFFFFu) == 0u &&
+                           !((cmd(0x27u) & 1u) != 0u && (cmd(0xD8u) & 3u) != 1u);
+        const bool cutout = plain && (cmd(0x1Eu) & 1u) != 0u && (cmd(0x22u) & 1u) != 0u && (cmd(0xDBu) & 7u) != 1u;
+        static int debug_left = std::getenv("PSPRECOMP_BURNOUT_REORDER_DEBUG") != nullptr ? 40 : 0;
+        static unsigned debug_seen = 0u;
+        if (debug_left > 0 && (cmd(0x22u) & 1u) != 0u && (cmd(0xDBu) & 7u) != 1u && (cmd(0x1Eu) & 1u) != 0u && (++debug_seen % 997u) == 0u) {
+            --debug_left;
+            std::fprintf(stderr, "[reorder] clear %d through %d blend %u ztest %u zmask %06X zfunc %u stencil %u logic %u pmask %06X ctest %u/%u atest %06X sfunc %06X sop %06X\n",
+                         clear ? 1 : 0, (g_batch_vtype & 0x800000u) != 0u ? 1 : 0, cmd(0x21u) & 1u, cmd(0x23u) & 1u, cmd(0xE7u) & 0xFFFFFFu,
+                         depth_func, cmd(0x24u) & 1u, cmd(0x28u) & 1u, cmd(0xE8u) & 0xFFFFFFu, cmd(0x27u) & 1u, cmd(0xD8u) & 3u,
+                         cmd(0xDBu) & 0xFFFFFFu, cmd(0xDCu) & 0xFFFFFFu, cmd(0xDDu) & 0xFFFFFFu);
+        }
+        if (!plain || (!g_deferred_ops.empty() && g_deferred_target != target.framebuffer)) splice_deferred();
+        if (cutout) {
+            invalidate_record_caches();
+            g_recording_deferred = true;
+            g_deferred_target = target.framebuffer;
+            deferred_draw = true;
+            ++g_deferred_draws;
+        }
+    }
+    // A deferred draw's ops end here, whichever way flush returns.
+    struct DeferredScope {
+        bool active;
+        ~DeferredScope() {
+            if (!active) return;
+            g_recording_deferred = false;
+            invalidate_record_caches();
+        }
+    } deferred_scope{deferred_draw};
     if (g_state.framebuffer != target.framebuffer) {
         g_state.framebuffer = target.framebuffer;
         record(Op::BindFramebuffer, {target.framebuffer});
@@ -1488,7 +1585,8 @@ void flush() {
     if (alpha_testing) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
     g_draw_is_cutout = alpha_testing && textured && !clear_mode && g_state.blend == 0;
     if (alpha_testing && !clear_mode && g_state.blend == 0 && color_function == 1u &&
-        (g_alpha_blend_test || g_probe_mode.load(std::memory_order_relaxed) == 1u)) {
+        (g_alpha_blend_test || g_probe_mode.load(std::memory_order_relaxed) == 1u ||
+         (g_blend_deferred_cutouts && g_recording_deferred))) {
         variant |= 1u << 26u;
         set_capability(GL_BLEND, g_state.blend, true);
         set_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -2873,6 +2971,7 @@ void *gl_thread_entry(void *) {
 
 // Hands the recorded frame to the GL thread (at most two wait there).
 void submit_frame() {
+    splice_deferred();
     std::unique_lock lock(g_gl.mutex);
     g_gl.cv.wait(lock, [] { return g_gl.frames.size() < 2u; });
     // The next frame starts with the room this one needed, so recording it
@@ -2929,6 +3028,8 @@ void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
 void set_fragment_mediump(bool enabled) { g_fragment_mediump = enabled; }
+void set_reorder_cutouts(bool enabled) { g_reorder_cutouts = g_reorder_cutouts || enabled; }
+void set_blend_deferred_cutouts(bool enabled) { g_blend_deferred_cutouts = g_blend_deferred_cutouts || enabled; }
 void set_no_trees(bool enabled) { g_no_cutouts = g_no_cutouts || enabled; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
@@ -3171,6 +3272,7 @@ void present(std::uint32_t address) {
     g_sun_box.valid = false;
     g_sun_copy = UINT32_MAX;
     flush();
+    splice_deferred();
     phase = 11u;
     ++g_stats.frames;
     if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 2u), std::memory_order_relaxed);
@@ -3204,8 +3306,8 @@ void present(std::uint32_t address) {
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
-                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f as blending, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
-                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.discards_dropped / n, g_gpu.alpha_blended / n, g_gpu.through / n,
+                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f as blending, %.0f deferred in %.0f runs, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
+                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.discards_dropped / n, g_gpu.alpha_blended / n, static_cast<double>(g_deferred_draws) / n, static_cast<double>(g_deferred_splices) / n, g_gpu.through / n,
                       g_gpu.samples / n, g_gpu.textured / n, g_gpu.mipmapped / n, g_gpu.minmip / n, g_gpu.skinned / n, g_gpu.weights / n, g_gpu.skin_calls / n, g_gpu.skin_hits / n, g_gpu.skin_ms / n, g_gpu.copied / n / 1024.0);
         trace(line);
         std::vector<std::pair<std::uint32_t, TargetUse>> used(g_gpu.targets.begin(), g_gpu.targets.end());
@@ -3220,6 +3322,8 @@ void present(std::uint32_t address) {
         }
         trace(targets.c_str());
         g_gpu = GpuCounters{};
+        g_deferred_draws = 0u;
+        g_deferred_splices = 0u;
         last = g_stats;
         last_wall = wall;
         last_busy = g_gl_busy_ms.load();

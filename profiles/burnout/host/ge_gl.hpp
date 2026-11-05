@@ -31,6 +31,10 @@ void set_stencil_ab(bool enabled);
 void set_gpu_probe(bool enabled);
 // Foliage (cut-out, mostly green scenery textures: trees, bushes) is not drawn.
 void set_no_trees(bool enabled);
+// Test: alpha-tested opaque draws after the opaque ones (punch-through last).
+void set_reorder_cutouts(bool enabled);
+// Test: those deferred cut-outs blend with a 0/1 alpha instead of discarding.
+void set_blend_deferred_cutouts(bool enabled);
 // Test: variant fragment shaders declared at medium precision.
 void set_fragment_mediump(bool enabled);
 // Vita, before initialize: where compiled programs are kept (empty: none),

@@ -49,7 +49,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x2074] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x1c74] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -63,11 +63,13 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-69d-profil";
+constexpr const char *kBuild = "gl-70e-reorder";
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
-constexpr bool kSoundCore2 = false;  // test B: sound on core 2, the decode worker alone on core 1
+constexpr bool kReorder = true;  // E: alpha-tested opaque draws after the opaque scenery
+constexpr bool kBlendDeferred = false;  // F: those draws blend a 0/1 alpha instead of discarding
+constexpr bool kSoundCore2 = true;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
 constexpr bool kDiagnosticCaptures = false;  // true: frames to ux0:data/burnout-frames during play
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
@@ -327,6 +329,8 @@ int main() {
         burnout::gl::set_gpu_probe(kGpuProbe);
         burnout::gl::set_no_trees(kNoTrees);
         burnout::gl::set_fragment_mediump(kMediump);
+        burnout::gl::set_reorder_cutouts(kReorder);
+        burnout::gl::set_blend_deferred_cutouts(kBlendDeferred);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
         // Sound: the SAS voices and audio channels to a BGM port, mixed on
