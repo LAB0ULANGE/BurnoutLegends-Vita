@@ -19,6 +19,9 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #if defined(__vita__)
 #include <psp2/kernel/threadmgr.h>
@@ -1849,6 +1852,51 @@ const std::uint8_t *skin(const std::uint8_t *raw, std::uint32_t count, std::uint
     const float nrm_scale = nrm == 1u ? 1.0f / 127.0f : nrm == 2u ? 1.0f / 32767.0f : 1.0f;
     const std::uint32_t pos_format = std::max<std::uint32_t>(pos, 1u);
     g_skinned.resize(static_cast<std::size_t>(count) * to.stride);
+#if defined(__ARM_NEON)
+    // The Vita's VFP runs the scalar sums below as long chains of dependent
+    // multiply-adds (~1.7 us a vertex, 10 ms a race frame). NEON: blend the
+    // bone matrices by weight first (four rows of four lanes), then transform
+    // the position and normal once.
+    float32x4_t rows[8][4];
+    for (std::uint32_t b = 0; b < weights && b < 8u; ++b) {
+        const float *m = g_bones.data() + b * 12u;
+        for (std::uint32_t r = 0; r < 4u; ++r) {
+            const float row[4]{m[r * 3u], m[r * 3u + 1u], m[r * 3u + 2u], 0.0f};
+            rows[b][r] = vld1q_f32(row);
+        }
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint8_t *in = raw + static_cast<std::size_t>(i) * from.stride;
+        std::uint8_t *out = g_skinned.data() + static_cast<std::size_t>(i) * to.stride;
+        std::memcpy(out + to.tc, in + from.tc, sizes_tc[tc] * 2u);
+        std::memcpy(out + to.col, in + from.col, sizes_col[col]);
+        float32x4_t b0 = vdupq_n_f32(0.0f), b1 = b0, b2 = b0, b3 = b0;
+        for (std::uint32_t b = 0; b < weights && b < 8u; ++b) {
+            const float w = component(in, weight, b, false) * weight_scale;
+            if (w == 0.0f) continue;
+            b0 = vmlaq_n_f32(b0, rows[b][0], w);
+            b1 = vmlaq_n_f32(b1, rows[b][1], w);
+            b2 = vmlaq_n_f32(b2, rows[b][2], w);
+            b3 = vmlaq_n_f32(b3, rows[b][3], w);
+        }
+        const float px = component(in + from.pos, pos_format, 0u, true) * pos_scale;
+        const float py = component(in + from.pos, pos_format, 1u, true) * pos_scale;
+        const float pz = component(in + from.pos, pos_format, 2u, true) * pos_scale;
+        float32x4_t sp = vmlaq_n_f32(vmlaq_n_f32(vmlaq_n_f32(b3, b0, px), b1, py), b2, pz);
+        float result[4];
+        vst1q_f32(result, sp);
+        std::memcpy(out + to.pos, result, 12u);
+        if (nrm != 0u) {
+            const float nx = component(in + from.nrm, nrm, 0u, true) * nrm_scale;
+            const float ny = component(in + from.nrm, nrm, 1u, true) * nrm_scale;
+            const float nz = component(in + from.nrm, nrm, 2u, true) * nrm_scale;
+            const float32x4_t sn = vmlaq_n_f32(vmlaq_n_f32(vmulq_n_f32(b0, nx), b1, ny), b2, nz);
+            vst1q_f32(result, sn);
+            std::memcpy(out + to.nrm, result, 12u);
+        }
+    }
+    return g_skinned.data();
+#endif
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint8_t *in = raw + static_cast<std::size_t>(i) * from.stride;
         std::uint8_t *out = g_skinned.data() + static_cast<std::size_t>(i) * to.stride;
@@ -2709,7 +2757,9 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
         const std::uint32_t clut = (cmd(0xB0u) & 0xFFFFF0u) | ((cmd(0xB1u) << 8u) & 0x0F000000u);
         const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
         if (const std::uint8_t *p = guest_bytes(memory, clut, bytes, false)) std::memcpy(g_clut.data(), p, bytes);
-        g_clut_hash = fnv(g_clut.data(), g_clut.size());
+        // The loaded entries only (16-colour palettes are 32-64 bytes): the
+        // whole 1 KiB took ~1000 cycles a load on the Vita.
+        g_clut_hash = fnv(g_clut.data(), bytes, 0xCBF29CE484222325ull ^ bytes);
         break;
     }
     default: break;
