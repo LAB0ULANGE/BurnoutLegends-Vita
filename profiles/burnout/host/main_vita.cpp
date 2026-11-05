@@ -62,7 +62,8 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-54";
+constexpr const char *kBuild = "gl-55";
+constexpr bool kDiagnosticCaptures = false;  // true: frames to ux0:data/burnout-frames during play
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
 constexpr const char *kLog = "ux0:data/" BURNOUT_VITA_FILES ".log";
 burnout::boot_menu::Settings g_settings;
@@ -293,6 +294,11 @@ int main() {
         render.backend = burnout::render::Backend::OpenGL;
         if (scripted) {
             render.capture_vblanks = {2101u, 3001u};
+            render.capture_dir = "ux0:data/burnout-frames";
+        } else if (kDiagnosticCaptures) {
+            // Diagnostic build: a frame every 5 s of play, to see on the PC
+            // what the Vita shows (gl-55: the bluish lower half on Lakeside).
+            for (std::uint64_t vblank = 1500u; vblank < 40000u; vblank += 300u) render.capture_vblanks.insert(vblank);
             render.capture_dir = "ux0:data/burnout-frames";
         }
         render.frame_skip = g_settings.frame_skip;

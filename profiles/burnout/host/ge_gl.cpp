@@ -721,7 +721,7 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
 enum class Op : std::uint32_t {
     Enable, Disable, BlendFunc, BlendEquation, DepthFunc, DepthMask, ColorMask, FrontFace, Scissor, Viewport,
     UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, Uniform4, UniformMatrix, Draw, CreateTarget,
-    Present, Capture
+    Present, Capture, StencilFunc, StencilOp, StencilMask
 };
 
 // One vertex attribute of a Draw: an array in the batch, or a constant.
@@ -772,6 +772,8 @@ struct GlState {
     int blend{-1}, depth_test{-1}, cull{-1}, scissor_test{-1};
     GLenum blend_src{}, blend_dst{}, blend_equation{}, depth_func{}, front_face{};
     int depth_mask{-1}, color_mask{-1};
+    int stencil_test{-1};
+    std::uint32_t stencil_func[3]{~0u, ~0u, ~0u}, stencil_op[3]{~0u, ~0u, ~0u}, stencil_mask{~0u};
 } g_state;
 
 void forget_state() { g_state = GlState{}; }
@@ -804,6 +806,28 @@ void set_depth(GLenum func, bool write) {
         g_state.depth_mask = write ? 1 : 0;
         record(Op::DepthMask, {write ? 1u : 0u});
     }
+}
+
+void set_stencil(GLenum func, std::uint32_t ref, std::uint32_t mask, GLenum fail, GLenum depth_fail, GLenum pass,
+                 std::uint32_t write_mask) {
+    const std::uint32_t f[3]{func, ref, mask}, o[3]{fail, depth_fail, pass};
+    if (std::memcmp(f, g_state.stencil_func, sizeof(f)) != 0) {
+        std::memcpy(g_state.stencil_func, f, sizeof(f));
+        record(Op::StencilFunc, {func, ref, mask});
+    }
+    if (std::memcmp(o, g_state.stencil_op, sizeof(o)) != 0) {
+        std::memcpy(g_state.stencil_op, o, sizeof(o));
+        record(Op::StencilOp, {fail, depth_fail, pass});
+    }
+    if (g_state.stencil_mask != write_mask) {
+        g_state.stencil_mask = write_mask;
+        record(Op::StencilMask, {write_mask});
+    }
+}
+
+GLenum stencil_op(std::uint32_t op) noexcept {
+    static constexpr GLenum table[8]{GL_KEEP, GL_ZERO, GL_REPLACE, GL_INVERT, GL_INCR, GL_DECR, GL_KEEP, GL_KEEP};
+    return table[op & 7u];
 }
 
 void set_color_mask(bool rgb, bool alpha) {
@@ -967,7 +991,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     bind_texture_object(texture.name);
     // Only block transfers write VRAM (see invalidate_textures); textures in
     // RAM are re-hashed once per frame.
-    const bool in_vram = (address & 0x0F000000u) == 0x04000000u;
+    static const bool recheck_vram = std::getenv("PSPRECOMP_BURNOUT_VRAM_RECHECK") != nullptr;
+    const bool in_vram = (address & 0x0F000000u) == 0x04000000u && !recheck_vram;
     if ((in_vram ? texture.stale : texture.checked_frame != g_stats.frames) && source != nullptr) {
         texture.checked_frame = g_stats.frames;
         texture.stale = false;
@@ -1008,6 +1033,16 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                     default: break;  // DXT: not used by this game so far
                     }
                     std::memcpy(out, c.data(), 4u);
+                }
+            }
+            if (const char *dump = std::getenv("PSPRECOMP_BURNOUT_TEX_DUMP");
+                dump != nullptr && (address & 0x0FFFFFFFu) == std::strtoul(dump, nullptr, 16)) {
+                char name[96];
+                std::snprintf(name, sizeof(name), "tex_%08X_f%llu_%ux%u.rgba", address, static_cast<unsigned long long>(g_stats.frames),
+                              width, height);
+                if (std::FILE *file = std::fopen(name, "wb")) {
+                    std::fwrite(rgba.data(), 1u, rgba.size(), file);
+                    std::fclose(file);
                 }
             }
             record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size())});
@@ -1246,6 +1281,11 @@ void flush() {
         set_capability(GL_DEPTH_TEST, g_state.depth_test, true);
         set_depth(GL_ALWAYS, (clear & 0x400u) != 0u);
         set_color_mask((clear & 0x100u) != 0u, (clear & 0x200u) != 0u);
+        // The alpha update clears the stencil too. To 0: the clear colour's
+        // alpha is in the vertices, and the game only clears it to 0 so far.
+        const bool stencil = (clear & 0x200u) != 0u;
+        set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
+        if (stencil) set_stencil(GL_ALWAYS, 0u, 0xFFu, GL_REPLACE, GL_REPLACE, GL_REPLACE, 0xFFu);
         set_capability(GL_CULL_FACE, g_state.cull, false);
         uniform4(kBlendFix, 1.0f, 1.0f, 1.0f, 0.0f);
         uniform4(kAlphaOut, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -1260,6 +1300,17 @@ void flush() {
         set_depth((cmd(0x23u) & 1u) != 0u ? compare(cmd(0xDEu)) : GL_ALWAYS, (cmd(0xE7u) & 1u) == 0u);
         set_color_mask(true, true);
         if (is_sun_box_draw(textured)) set_color_mask(false, false);
+        // Stencil test: on the PSP the stencil is the frame buffer's alpha,
+        // written through the alpha write mask. Lakeside marks the lake's
+        // pixels 2 and draws the sky's reflection where it equals 2; without
+        // the test the reflection covered the lower half of the screen.
+        const bool stencil = (cmd(0x24u) & 1u) != 0u;
+        set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
+        if (stencil) {
+            const std::uint32_t func = cmd(0xDCu), op = cmd(0xDDu);
+            set_stencil(compare(func), (func >> 8u) & 0xFFu, (func >> 16u) & 0xFFu, stencil_op(op), stencil_op(op >> 8u),
+                        stencil_op(op >> 16u), ~cmd(0xE9u) & 0xFFu);
+        }
         static const bool no_cull = std::getenv("PSPRECOMP_BURNOUT_NOCULL") != nullptr;
         const bool cull = !no_cull && !through && (cmd(0x1Du) & 1u) != 0u;
         set_capability(GL_CULL_FACE, g_state.cull, cull);
@@ -1300,12 +1351,48 @@ void flush() {
             const char *v = std::getenv("PSPRECOMP_BURNOUT_TARGET_TRACE");
             return v != nullptr ? std::atol(v) : -1L;
         }();
+        // PSPRECOMP_BURNOUT_TARGET_SKIP=A-B leaves out that frame's draws A to B.
+        static std::uint64_t index_frame = ~0ull;
+        static std::uint32_t draw_index = 0u;
+        if (index_frame != g_stats.frames) {
+            index_frame = g_stats.frames;
+            draw_index = 0u;
+        }
+        const std::uint32_t index = draw_index++;
         if (trace_frame >= 0 && g_stats.frames == static_cast<std::uint64_t>(trace_frame)) {
             const std::uint32_t texture = (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u);
             const bool samples_target = textured && (texture & 0x0F000000u) == 0x04000000u && g_targets.count(target_key(texture)) != 0u;
-            std::fprintf(stderr, "[tt] target %06X n=%u through=%d masked=%d blend=%d sample=%s%06X clear=%d\n", target_key(address),
-                         g_batch_count, through ? 1 : 0, g_state.color_mask == 0 ? 1 : 0, g_state.blend == 1 ? 1 : 0,
-                         samples_target ? "T" : "-", samples_target ? target_key(texture) : 0u, clear_mode ? 1 : 0);
+            std::fprintf(stderr,
+                         "[tt] %u target %06X n=%u through=%d masked=%d blend=%d(%06X) sample=%s%06X tex=%08X clear=%d ztest=%d zf=%u zw=%d "
+                         "zscale=%g zoff=%g fog=%d tfunc=%05X alpha=%d/%06X cull=%d\n",
+                         index, target_key(address), g_batch_count, through ? 1 : 0, g_state.color_mask == 0 ? 1 : 0,
+                         g_state.blend == 1 ? 1 : 0, cmd(0xDFu) & 0xFFFFFFu, samples_target ? "T" : "-",
+                         samples_target ? target_key(texture) : 0u, textured ? texture : 0u, clear_mode ? 1 : 0,
+                         (cmd(0x23u) & 1u) != 0u ? 1 : 0, cmd(0xDEu) & 7u, (cmd(0xE7u) & 1u) == 0u ? 1 : 0, float24(cmd(0x44u)),
+                         float24(cmd(0x47u)), fog ? 1 : 0, texfunc & 0x1FFFFu, alpha_enabled ? 1 : 0, alpha_test & 0xFFFFFFu,
+                         (cmd(0x1Du) & 1u) != 0u ? 1 : 0);
+            std::fprintf(stderr, "[tt]    stencil test %u func %06X op %06X; alpha blend fix %06X/%06X; mask %06X/%06X; logic %u\n",
+                         cmd(0x24u) & 1u, cmd(0xDCu) & 0xFFFFFFu, cmd(0xDDu) & 0xFFFFFFu, cmd(0xE0u) & 0xFFFFFFu,
+                         cmd(0xE1u) & 0xFFFFFFu, cmd(0xE8u) & 0xFFFFFFu, cmd(0xE9u) & 0xFFFFFFu, cmd(0x28u) & 1u);
+            if (textured)
+                std::fprintf(stderr, "[tt]    texture bufw=%u size=%ux%u format=%u fb format=%u\n", cmd(0xA8u) & 0x7FFu,
+                             1u << (cmd(0xB8u) & 0xFu), 1u << ((cmd(0xB8u) >> 8u) & 0xFu), cmd(0xC3u) & 0xFu, cmd(0xD2u) & 3u);
+            static const std::pair<long, long> skip = [] {
+                const char *v = std::getenv("PSPRECOMP_BURNOUT_TARGET_SKIP");
+                long a = -1, b = -1;
+                if (v != nullptr && std::sscanf(v, "%ld-%ld", &a, &b) != 2) b = a;
+                return std::pair<long, long>{a, b};
+            }();
+            if (static_cast<long>(index) >= skip.first && static_cast<long>(index) <= skip.second) {
+                g_batch.clear();
+                g_batch_count = 0u;
+                g_batch_in_place = nullptr;
+                g_batch_indices.clear();
+                g_batch_runs.clear();
+                g_batch_index_total = 0u;
+                phase = outer_phase;
+                return;
+            }
         }
     }
     phase = 9u;
@@ -2025,17 +2112,16 @@ void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int heig
     glGenFramebuffers(1, &framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-#if defined(__vita__)
+    // Stencil too: the PSP keeps it in the frame buffer's alpha (see flush).
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depth);
-#else
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
-#endif
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClearDepth(0.0);
+    glClearStencil(0);
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE);
+    glStencilMask(0xFFu);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     if (framebuffer_id >= g_gl_framebuffers.size()) g_gl_framebuffers.resize(framebuffer_id + 1u, 0u);
     g_gl_framebuffers[framebuffer_id] = framebuffer;
 }
@@ -2246,6 +2332,7 @@ void present_target(GLuint texture_id, int width) {
     glViewport(0, 0, 960, 544);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -2318,6 +2405,9 @@ void replay(const Frame &frame) {
             break;
         }
         case Op::FrontFace: glFrontFace(op[0]); op += 1; break;
+        case Op::StencilFunc: glStencilFunc(op[0], static_cast<GLint>(op[1]), op[2]); op += 3; break;
+        case Op::StencilOp: glStencilOp(op[0], op[1], op[2]); op += 3; break;
+        case Op::StencilMask: glStencilMask(op[0]); op += 1; break;
         case Op::Scissor:
             glScissor(static_cast<GLint>(op[0]) * g_bound_scale, static_cast<GLint>(op[1]) * g_bound_scale,
                       static_cast<GLsizei>(op[2]) * g_bound_scale, static_cast<GLsizei>(op[3]) * g_bound_scale);
@@ -2791,6 +2881,8 @@ void present(std::uint32_t address) {
 
 void capture(std::uint32_t address, std::function<void(std::vector<std::uint8_t> &rgb)> done) {
     flush();
+    if (std::getenv("PSPRECOMP_BURNOUT_TARGET_TRACE") != nullptr)
+        std::fprintf(stderr, "[tt] capture after frame %llu\n", static_cast<unsigned long long>(g_stats.frames));
     const auto it = g_targets.find(target_key(address));
     record(Op::Capture, {it != g_targets.end() ? it->second.framebuffer : 0u,
                          it != g_targets.end() ? static_cast<std::uint32_t>(it->second.height) : 272u,
