@@ -63,7 +63,8 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-63";
+constexpr const char *kBuild = "gl-64-probe";
+constexpr bool kGpuProbe = true;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
 constexpr bool kDiagnosticCaptures = false;  // true: frames to ux0:data/burnout-frames during play
 constexpr const char *kReport = "ux0:data/" BURNOUT_VITA_FILES ".txt";
@@ -319,6 +320,7 @@ int main() {
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::render::configure(render);
         burnout::gl::set_stencil_ab(kStencilAB);
+        burnout::gl::set_gpu_probe(kGpuProbe);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");
         // Sound: the SAS voices and audio channels to a BGM port, mixed on

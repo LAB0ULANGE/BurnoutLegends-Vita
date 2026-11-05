@@ -589,6 +589,19 @@ struct GpuCounters {
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
 bool g_stencil_ab{};
+// GPU probe (diagnostic): every 600 frames the GL thread changes how it draws,
+// so one log tells what the GPU time depends on. 0 normal, 1 scissor cut to a
+// sixteenth of the area (fragment cost), 2 no alpha/colour test discard, 3 no
+// texturing. Variants met only in a probe mode are not remembered.
+bool g_gpu_probe{};
+std::atomic<std::uint32_t> g_probe_mode{0u};
+std::uint32_t probe_key(std::uint32_t key) noexcept {
+    switch (g_probe_mode.load(std::memory_order_relaxed)) {
+    case 2u: return key & ~((0x1Fu << 17u) | (0xFu << 23u));
+    case 3u: return key & ~(0x3Cu | (0x7Fu << 10u));
+    default: return key;
+    }
+}
 bool g_mipmaps{std::getenv("PSPRECOMP_BURNOUT_NO_MIPMAPS") == nullptr};
 // Stencil A/B diagnostic: 0 full, 1 minimal, 2 off, rotating every 600 frames.
 std::uint32_t stencil_mode() noexcept { return g_stencil_ab ? static_cast<std::uint32_t>((g_stats.frames / 600u) % 3u) : 0u; }
@@ -2316,7 +2329,7 @@ void use_program(std::uint32_t key) {
             }
         }
         it = g_variants.emplace(key, program).first;
-        remember_variant(key);
+        if (g_probe_mode.load(std::memory_order_relaxed) == 0u) remember_variant(key);
         char line[96];
         std::snprintf(line, sizeof(line), "program variant %06X (%u so far) in %.0f ms", static_cast<unsigned>(key),
                       static_cast<unsigned>(g_variants.size()), host_now_ms() - started);
@@ -2533,16 +2546,18 @@ void replay(const Frame &frame) {
         case Op::StencilFunc: glStencilFunc(op[0], static_cast<GLint>(op[1]), op[2]); op += 3; break;
         case Op::StencilOp: glStencilOp(op[0], op[1], op[2]); op += 3; break;
         case Op::StencilMask: glStencilMask(op[0]); op += 1; break;
-        case Op::Scissor:
+        case Op::Scissor: {
+            const GLsizei cut = g_probe_mode.load(std::memory_order_relaxed) == 1u ? 4 : 1;
             glScissor(static_cast<GLint>(op[0]) * g_bound_scale, static_cast<GLint>(op[1]) * g_bound_scale,
-                      static_cast<GLsizei>(op[2]) * g_bound_scale, static_cast<GLsizei>(op[3]) * g_bound_scale);
+                      static_cast<GLsizei>(op[2]) * g_bound_scale / cut, static_cast<GLsizei>(op[3]) * g_bound_scale / cut);
+        }
             op += 4;
             break;
         case Op::Viewport:
             glViewport(0, 0, static_cast<GLsizei>(op[0]) * g_bound_scale, static_cast<GLsizei>(op[1]) * g_bound_scale);
             op += 2;
             break;
-        case Op::UseProgram: use_program(op[0]); op += 1; break;
+        case Op::UseProgram: use_program(probe_key(op[0])); op += 1; break;
         case Op::BindFramebuffer:
             glBindFramebuffer(GL_FRAMEBUFFER, op[0] < g_gl_framebuffers.size() ? g_gl_framebuffers[op[0]] : 0u);
             g_bound_scale = op[0] < g_framebuffer_scales.size() ? g_framebuffer_scales[op[0]] : g_scale;
@@ -2703,6 +2718,7 @@ void flush_traces() {
 void set_render_scale(int scale) { g_scale = std::clamp(scale, 1, 4); }
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
+void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }
@@ -2946,6 +2962,7 @@ void present(std::uint32_t address) {
     flush();
     phase = 11u;
     ++g_stats.frames;
+    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 4u), std::memory_order_relaxed);
     if (g_stats.frames <= 3u) {
         char line[64];
         std::snprintf(line, sizeof(line), "frame %llu", static_cast<unsigned long long>(g_stats.frames));
@@ -2969,9 +2986,10 @@ void present(std::uint32_t address) {
                       static_cast<double>(g_stats.lit_vertices - last.lit_vertices) / n,
                       static_cast<unsigned long long>(g_stats.texture_uploads - last.texture_uploads));
         trace(line);
-        std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame",
+        std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       (g_gl_busy_ms.load() - last_busy) / n,
-                      static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0);
+                      static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
+                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 4u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
