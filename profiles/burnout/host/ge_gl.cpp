@@ -581,7 +581,7 @@ struct TargetUse {
     int width{};
 };
 struct GpuCounters {
-    std::uint64_t switches{}, draws{}, blended{}, discards{}, through{}, samples{}, textured{}, mipmapped{}, minmip{}, skinned{}, weights{}, copied{}, skin_calls{};
+    std::uint64_t switches{}, draws{}, blended{}, discards{}, through{}, samples{}, textured{}, mipmapped{}, minmip{}, skinned{}, weights{}, copied{}, skin_calls{}, skin_hits{};
     double skin_ms{};
     std::unordered_map<std::uint32_t, TargetUse> targets;  // by target key
 } g_gpu;
@@ -1922,6 +1922,47 @@ const std::uint8_t *skin(const std::uint8_t *raw, std::uint32_t count, std::uint
     return g_skinned.data();
 }
 
+// Skinned results by guest vertex address: the cars' bones (body damage)
+// rarely change, so a PRIM whose source vertices and bones are unchanged since
+// it was last skinned reuses the result. On the Vita the skinning itself ran
+// ~1.5 us a vertex (~10 ms a race frame on the worker).
+struct SkinEntry {
+    std::uint32_t vtype{}, count{};
+    std::uint64_t used_frame{};
+    std::vector<std::uint8_t> source;
+    std::array<float, 8 * 12> bones{};
+    std::vector<std::uint8_t> result;
+};
+std::unordered_map<std::uint64_t, SkinEntry> g_skin_cache;
+
+const std::uint8_t *skin_cached(const std::uint8_t *raw, std::uint32_t count, std::uint32_t vtype, const VertexLayout &from,
+                                const VertexLayout &to) {
+    const std::size_t source_bytes = static_cast<std::size_t>(count) * from.stride;
+    const std::uint32_t bone_floats = (((vtype >> 14u) & 7u) + 1u) * 12u;
+    const std::uint64_t key = (static_cast<std::uint64_t>(g_vertex_address) << 32u) ^ (static_cast<std::uint64_t>(count) << 8u) ^
+                              (static_cast<std::uint64_t>(g_bone_cursor) << 1u);
+    SkinEntry &entry = g_skin_cache[key];
+    const bool hit = entry.vtype == vtype && entry.count == count && entry.source.size() == source_bytes &&
+                     std::memcmp(entry.bones.data(), g_bones.data(), bone_floats * sizeof(float)) == 0 &&
+                     std::memcmp(entry.source.data(), raw, source_bytes) == 0;
+    entry.used_frame = g_stats.frames;
+    if (hit) {
+        ++g_gpu.skin_hits;
+        return entry.result.data();
+    }
+    const std::uint8_t *skinned = skin(raw, count, vtype, from, to);
+    entry.vtype = vtype;
+    entry.count = count;
+    entry.source.assign(raw, raw + source_bytes);
+    std::memcpy(entry.bones.data(), g_bones.data(), sizeof(entry.bones));
+    entry.result.assign(skinned, skinned + static_cast<std::size_t>(count) * to.stride);
+    // Forget what has not been drawn for a while.
+    if (g_skin_cache.size() > 512u)
+        for (auto it = g_skin_cache.begin(); it != g_skin_cache.end();)
+            it = g_stats.frames - it->second.used_frame > 120u ? g_skin_cache.erase(it) : std::next(it);
+    return entry.result.data();
+}
+
 bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     phase = 1u;
     const std::uint32_t primitive = (data >> 16u) & 7u;
@@ -2001,7 +2042,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         g_gpu.skinned += vertex_count;
         g_gpu.weights += static_cast<std::uint64_t>(vertex_count) * (((psp_vtype >> 14u) & 7u) + 1u);
         const double skin_started = host_now_ms();
-        raw = skin(raw, vertex_count, psp_vtype, psp_layout, skinned_layout);
+        raw = skin_cached(raw, vertex_count, psp_vtype, psp_layout, skinned_layout);
         g_gpu.skin_ms += host_now_ms() - skin_started;
         ++g_gpu.skin_calls;
         source_layout = &skinned_layout;
@@ -2934,9 +2975,9 @@ void present(std::uint32_t address) {
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
-                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.2f ms), %.0f KiB re-copied per frame",
+                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
                       g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.through / n,
-                      g_gpu.samples / n, g_gpu.textured / n, g_gpu.mipmapped / n, g_gpu.minmip / n, g_gpu.skinned / n, g_gpu.weights / n, g_gpu.skin_calls / n, g_gpu.skin_ms / n, g_gpu.copied / n / 1024.0);
+                      g_gpu.samples / n, g_gpu.textured / n, g_gpu.mipmapped / n, g_gpu.minmip / n, g_gpu.skinned / n, g_gpu.weights / n, g_gpu.skin_calls / n, g_gpu.skin_hits / n, g_gpu.skin_ms / n, g_gpu.copied / n / 1024.0);
         trace(line);
         std::vector<std::pair<std::uint32_t, TargetUse>> used(g_gpu.targets.begin(), g_gpu.targets.end());
         std::sort(used.begin(), used.end(), [](const auto &a, const auto &b) { return a.second.draws > b.second.draws; });
