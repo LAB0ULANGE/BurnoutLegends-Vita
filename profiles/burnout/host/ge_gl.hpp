@@ -33,6 +33,8 @@ void set_gpu_probe(bool enabled);
 void set_no_trees(bool enabled);
 // Test: alpha-tested opaque draws after the opaque ones (punch-through last).
 void set_reorder_cutouts(bool enabled);
+// Test: unlit cut-out PRIMs transformed to world space as decoded, so they merge into few draws.
+void set_merge_cutouts(bool enabled, bool all = false);
 // Test: those deferred cut-outs blend with a 0/1 alpha instead of discarding.
 void set_blend_deferred_cutouts(bool enabled);
 // Test: variant fragment shaders declared at medium precision.

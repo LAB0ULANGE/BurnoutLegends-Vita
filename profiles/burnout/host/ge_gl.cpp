@@ -528,6 +528,7 @@ struct Texture {
     std::uint8_t min_alpha{255u};  // lowest texel alpha of the upload
     std::uint32_t upload_mode{};   // g_probe_mode it was uploaded in
     bool foliage{};                // cut-out and mostly green (trees, bushes)
+    float clear{};                 // fraction of texels with alpha <= 16
     GLint sampling[4]{-1, -1, -1, -1};
 };
 
@@ -552,6 +553,7 @@ struct Program {
 
 std::array<std::uint32_t, 256> g_commands{};
 std::array<float, 12> g_world{}, g_view{}, g_texgen{};
+bool g_batch_world{};  // the pending batch's positions are in world space
 std::array<float, 16> g_projection{};
 std::uint32_t g_world_cursor{}, g_view_cursor{}, g_projection_cursor{}, g_texgen_cursor{};
 std::uint32_t g_vertex_address{}, g_index_address{};
@@ -615,9 +617,9 @@ struct GpuCounters {
 bool g_offscreen_1x{};
 bool g_stencil_ab{};
 // GPU probe (diagnostic): every 600 frames the alpha-tested textured draws
-// change, so one log tells what their GPU time depends on: 0 normal, 1 fast
-// alpha test (exact), 2 nearest filtering, 3 each drawn as two draws, 4 no
-// depth writes. (gl-64 probed scissor 1/16, no discard, untextured; gl-66
+// change, so one log tells what their GPU time depends on: 0 normal, 1 the
+// original alpha test (normal is the fast one), 2 nearest filtering, 3 each drawn as two draws, 4 no
+// depth writes, 5 cut-outs merged (world applied as decoded). (gl-64 probed scissor 1/16, no discard, untextured; gl-66
 // texture formats; gl-67 alpha test as blending.)
 bool g_gpu_probe{};
 // Test F: deferred cut-outs (drawn after the opaque scenery) blend with a 0/1 alpha instead of discarding.
@@ -625,7 +627,8 @@ bool g_blend_deferred_cutouts{std::getenv("PSPRECOMP_BURNOUT_BLEND_DEFERRED") !=
 // Test: cut-out draws (alpha-tested, not blended: trees, hedges, fences) are not drawn.
 bool g_no_cutouts{std::getenv("PSPRECOMP_BURNOUT_NO_CUTOUTS") != nullptr};
 bool g_draw_is_cutout{};
-bool g_texture_foliage{};  // the texture bind_texture last bound is foliage
+bool g_texture_foliage{};
+float g_texture_clear{};  // the texture bind_texture last bound is foliage
 // Cut-out textures not drawn (trees): guest addresses; PC: PSPRECOMP_BURNOUT_SKIP_TEX=a,b,...
 std::vector<std::uint32_t> g_skipped_cutouts = [] {
     std::vector<std::uint32_t> list;
@@ -642,12 +645,14 @@ std::vector<std::uint32_t> g_skipped_cutouts = [] {
 // Opaque alpha-tested draws as 0/1-alpha blending (no discard).
 bool g_alpha_blend_test{std::getenv("PSPRECOMP_BURNOUT_ALPHA_BLEND_TEST") != nullptr};
 std::atomic<std::uint32_t> g_probe_mode{0u};
+// The alpha test as one compare of the unrounded alpha, before fog (exact
+// for GREATER / GEQUAL; PC captures identical but 2 pixels off by one in green).
+bool g_fast_alpha_test{std::getenv("PSPRECOMP_BURNOUT_SLOW_ALPHA_TEST") == nullptr};
 std::uint32_t probe_key(std::uint32_t key) noexcept {
-    // Mode 1: exact fast alpha test for GREATER / GEQUAL (no ATBLEND).
+    // Probe mode 1: the original alpha test.
     const std::uint32_t func = key >> 18u & 7u;
-    if (g_probe_mode.load(std::memory_order_relaxed) == 1u && (key >> 17u & 1u) != 0u && (key >> 26u & 1u) == 0u &&
-        (func == 6u || func == 7u))
-        key |= 1u << 27u;
+    const bool fast = g_fast_alpha_test != (g_probe_mode.load(std::memory_order_relaxed) == 1u);
+    if (fast && (key >> 17u & 1u) != 0u && (key >> 26u & 1u) == 0u && (func == 6u || func == 7u)) key |= 1u << 27u;
     return key;
 }
 bool g_mipmaps{std::getenv("PSPRECOMP_BURNOUT_NO_MIPMAPS") == nullptr};
@@ -1167,6 +1172,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 const double opaque = static_cast<double>(std::max<std::size_t>(texels - clear, 1u));
                 const double r = static_cast<double>(sum[0]) / opaque, g = static_cast<double>(sum[1]) / opaque,
                              b = static_cast<double>(sum[2]) / opaque;
+                texture.clear = static_cast<float>(clear_fraction);
                 texture.foliage = (address & 0x0F000000u) == 0x04000000u && clear_fraction >= 0.05 && g >= b * 1.4 && r <= g * 1.25 && g < 200.0;
                 if (std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr)
                     std::fprintf(stderr, "[texfmt] fmt %u clutfmt %u %ux%u levels %u swz %d minA %u clear %.3f rgb %.0f %.0f %.0f foliage %d addr %08X\n",
@@ -1215,6 +1221,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     set_sampling(texture.sampling, linear, clamp_u, clamp_v, min_filter);
     g_texture_min_alpha = texture.min_alpha;
     g_texture_foliage = texture.foliage;
+    g_texture_clear = texture.clear;
     return {1.0f, 1.0f, 0.0f, 0.0f};
 }
 
@@ -1324,9 +1331,11 @@ void psp_matrix(const float *m, float *out) {
 void upload_matrices() {
     // PSP 4x3 matrices are row-vector (v * M); GL wants column-major M^T.
     float world[16]{}, view[16]{}, world_view[16]{};
+    static constexpr float kIdentity[12]{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+    const float *world_rows = g_batch_world ? kIdentity : g_world.data();
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 3; ++c) {
-            world[r * 4 + c] = g_world[r * 3 + c];
+            world[r * 4 + c] = world_rows[r * 3 + c];
             view[r * 4 + c] = g_view[r * 3 + c];
         }
     world[15] = view[15] = 1.0f;
@@ -2048,6 +2057,46 @@ void bind_vertices() {
     } else {
         source = record_data(g_batch.data(), bytes);
     }
+    static const bool merge_stats = std::getenv("PSPRECOMP_BURNOUT_MERGE_STATS") != nullptr;
+    if (merge_stats) {
+        // Diagnostic: how many cut-out draws directly follow a cut-out draw
+        // with the same program, texture and vertex type (mergeable but for
+        // the uniforms, i.e. the world matrix), and how many ops lie between.
+        static bool last_cutout = false;
+        static std::uint32_t last_program = 0, last_texture = 0, last_vtype = 0;
+        static std::size_t last_end = 0;
+        static double cutouts = 0, same = 0, same_tex = 0, between = 0, frames_at = 0, vertices = 0;
+        static double hist[5]{};
+        if (g_draw_is_cutout) {
+            const float c = g_texture_clear;
+            ++hist[c == 0.0f ? 0 : c < 0.01f ? 1 : c < 0.05f ? 2 : c < 0.2f ? 3 : 4];
+            ++cutouts;
+            vertices += g_batch_count;
+            if (last_cutout && last_texture == g_state.texture) {
+                ++same_tex;
+                if (last_program == g_state.program && last_vtype == g_batch_vtype) {
+                    ++same;
+                    between += static_cast<double>(g_frame.ops.size() - last_end);
+                }
+            }
+        }
+        last_cutout = g_draw_is_cutout;
+        last_program = g_state.program;
+        last_texture = g_state.texture;
+        last_vtype = g_batch_vtype;
+        last_end = g_frame.ops.size();
+        static std::uint64_t last_frame = 0;
+        if (g_stats.frames != last_frame && g_stats.frames % 300u == 0u) {
+            last_frame = g_stats.frames;
+            std::fprintf(stderr, "[merge] per frame: %.0f cut-out draws (%.0f vertices), %.0f follow one with the same texture, %.0f also same program and vtype (%.1f op words between)\n",
+                         cutouts / 300.0, vertices / 300.0, same_tex / 300.0, same / 300.0, same > 0 ? between / same : 0.0);
+            std::fprintf(stderr, "[merge] cut-out textures by clear texels: none %.0f, <1%% %.0f, <5%% %.0f, <20%% %.0f, more %.0f\n",
+                         hist[0] / 300.0, hist[1] / 300.0, hist[2] / 300.0, hist[3] / 300.0, hist[4] / 300.0);
+            for (double &h : hist) h = 0;
+            cutouts = same = same_tex = between = vertices = 0;
+            (void)frames_at;
+        }
+    }
     record(Op::Draw, {in_frame, source, static_cast<std::uint32_t>(bytes), g_layout.stride,
                       record_data(attribs.data(), sizeof(attribs)),
                       record_data(g_batch_runs.data(), g_batch_runs.size() * sizeof(std::uint32_t)),
@@ -2092,6 +2141,15 @@ const std::uint8_t *guest_bytes(psprecomp::GuestMemory &memory, std::uint32_t ad
 // matrix (4x3, row vector), done on the CPU. The result is a vertex type with
 // float position and normal and no weights; the world matrix follows as usual.
 std::array<float, 8 * 12> g_bones{};
+// Cut-out merging (test): unlit alpha-tested textured PRIMs get the world
+// matrix applied as they are decoded (float positions, world = identity in the
+// shader), so world matrix changes no longer end their batch and the trees,
+// fences and bushes go down in a few draws instead of ~150. On the Vita's GPU
+// every alpha-tested draw is a punch-through pass over the tiles it covers.
+bool g_merge_cutouts{std::getenv("PSPRECOMP_BURNOUT_MERGE_CUTOUTS") != nullptr};
+bool g_merge_all{std::getenv("PSPRECOMP_BURNOUT_MERGE_ALL") != nullptr};
+std::vector<std::uint8_t> g_world_vertices;
+std::uint64_t g_world_prims{};
 std::uint32_t g_bone_cursor{};
 ScratchVector<std::uint8_t> g_skinned;
 
@@ -2193,6 +2251,37 @@ const std::uint8_t *skin(const std::uint8_t *raw, std::uint32_t count, std::uint
         if (nrm != 0u) std::memcpy(out + to.nrm, sn, sizeof(sn));
     }
     return g_skinned.data();
+}
+
+const std::uint8_t *world_transform(const std::uint8_t *raw, std::uint32_t count, std::uint32_t vtype,
+                                    const VertexLayout &from, const VertexLayout &to) {
+    const std::uint32_t tc = vtype & 3u, col = (vtype >> 2u) & 7u, nrm = (vtype >> 5u) & 3u, pos = (vtype >> 7u) & 3u;
+    const float pos_scale = pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f;
+    const float nrm_scale = nrm == 1u ? 1.0f / 127.0f : nrm == 2u ? 1.0f / 32767.0f : 1.0f;
+    const std::uint32_t pos_format = std::max<std::uint32_t>(pos, 1u);
+    const float *m = g_world.data();
+    g_world_vertices.resize(static_cast<std::size_t>(count) * to.stride);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint8_t *in = raw + static_cast<std::size_t>(i) * from.stride;
+        std::uint8_t *out = g_world_vertices.data() + static_cast<std::size_t>(i) * to.stride;
+        std::memcpy(out + to.tc, in + from.tc, sizes_tc[tc] * 2u);
+        std::memcpy(out + to.col, in + from.col, sizes_col[col]);
+        const float px = component(in + from.pos, pos_format, 0u, true) * pos_scale;
+        const float py = component(in + from.pos, pos_format, 1u, true) * pos_scale;
+        const float pz = component(in + from.pos, pos_format, 2u, true) * pos_scale;
+        float sp[3];
+        for (std::uint32_t c = 0; c < 3u; ++c) sp[c] = px * m[c] + py * m[3u + c] + pz * m[6u + c] + m[9u + c];
+        std::memcpy(out + to.pos, sp, sizeof(sp));
+        if (nrm != 0u) {
+            const float nx = component(in + from.nrm, nrm, 0u, true) * nrm_scale;
+            const float ny = component(in + from.nrm, nrm, 1u, true) * nrm_scale;
+            const float nz = component(in + from.nrm, nrm, 2u, true) * nrm_scale;
+            float sn[3];
+            for (std::uint32_t c = 0; c < 3u; ++c) sn[c] = nx * m[c] + ny * m[3u + c] + nz * m[6u + c];
+            std::memcpy(out + to.nrm, sn, sizeof(sn));
+        }
+    }
+    return g_world_vertices.data();
 }
 
 // Skinned results by guest vertex address: the cars' bones (body damage)
@@ -2352,14 +2441,32 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         ++g_gpu.skin_calls;
         source_layout = &skinned_layout;
     }
+    const bool merging = g_merge_cutouts || (g_gpu_probe && g_probe_mode.load(std::memory_order_relaxed) == 5u);
+    // (merge_all: every unlit unblended PRIM, alpha-tested or not: fewer draws.)
+    const bool world_applied = merging && weights == 0u && !through && !lit &&
+                               (g_merge_all || ((cmd(0x1Eu) & 1u) != 0u && (cmd(0x22u) & 1u) != 0u && (cmd(0xDBu) & 7u) != 1u)) &&
+                               (cmd(0x21u) & 1u) == 0u && (cmd(0xD3u) & 1u) == 0u && (cmd(0xC0u) & 3u) == 0u;
+    static std::uint32_t world_from = UINT32_MAX;
+    static VertexLayout world_layout;
+    if (world_applied) {
+        vtype = skinned_vtype(psp_vtype);
+        if (world_from != psp_vtype) {
+            world_from = psp_vtype;
+            world_layout = vertex_layout(vtype);
+        }
+        raw = world_transform(raw, vertex_count, psp_vtype, psp_layout, world_layout);
+        source_layout = &world_layout;
+        ++g_world_prims;
+    }
     const VertexLayout &layout = *source_layout;
     const std::uint32_t vertex_stride = layout.stride;
 
-    if (!g_batch_runs.empty() && g_batch_vtype != vtype) flush();
+    if (!g_batch_runs.empty() && (g_batch_vtype != vtype || g_batch_world != world_applied)) flush();
     if (g_batch_count == 0u) {
         g_batch_vtype = vtype;
         g_layout = batch_layout(vtype);
         g_batch_min_alpha = 255u;
+        g_batch_world = world_applied;
     }
     if (lit) g_stats.lit_vertices += vertex_count;
     // Indexed batch: the PRIM's vertices are appended once and triangles index
@@ -2371,6 +2478,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         g_batch_vtype = vtype;
         g_layout = batch_layout(vtype);
         g_batch_min_alpha = 255u;
+        g_batch_world = world_applied;
     }
     if (!g_keep_discard) {
         // A lower bound of what the PSP takes as the colour's alpha: the
@@ -2395,7 +2503,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     // Vertices already in the batch layout, in a snapshot or in static guest
     // memory, are drawn where they are as long as they follow the batch's
     // previous ones. A batch that stops following goes on as a copy.
-    const bool placeable = weights == 0u && out.same_as_psp && !flat && primitive != 6u &&
+    const bool placeable = weights == 0u && !world_applied && out.same_as_psp && !flat && primitive != 6u &&
                            (g_snapshot != nullptr || static_vertices(g_vertex_address));
     const bool follows = g_batch_in_place != nullptr && raw == g_batch_in_place + static_cast<std::size_t>(g_batch_count) * vertex_stride;
     const bool in_place = placeable && (g_batch_count == 0u || follows);
@@ -3141,6 +3249,10 @@ void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
 void set_fragment_mediump(bool enabled) { g_fragment_mediump = enabled; }
+void set_merge_cutouts(bool enabled, bool all) {
+    g_merge_cutouts = g_merge_cutouts || enabled;
+    g_merge_all = g_merge_all || all;
+}
 void set_reorder_cutouts(bool enabled) { g_reorder_cutouts = g_reorder_cutouts || enabled; }
 void set_blend_deferred_cutouts(bool enabled) { g_blend_deferred_cutouts = g_blend_deferred_cutouts || enabled; }
 void set_no_trees(bool enabled) { g_no_cutouts = g_no_cutouts || enabled; }
@@ -3214,7 +3326,23 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
         default: return false;
         }
     };
-    if (!batch_neutral(op) && (matrix_changes() || g_commands[op] != word || op == 0xC4u || op == 0xEAu)) flush();
+    // (0x12 vertex type: decode_prim ends the batch if the type differs; 0x07/0x09 bounding box test and jump.)
+    const bool world_only = (op == 0x3Au || op == 0x3Bu || op == 0x12u || op == 0x07u || op == 0x09u) && g_batch_world && g_batch_count != 0u;
+    if (!world_only && !batch_neutral(op) && (matrix_changes() || g_commands[op] != word || op == 0xC4u || op == 0xEAu)) {
+        static const bool merge_stats = std::getenv("PSPRECOMP_BURNOUT_MERGE_STATS") != nullptr;
+        if (merge_stats && g_batch_world && g_batch_count != 0u) {
+            static std::array<std::uint64_t, 256> by_op{};
+            static std::uint64_t n = 0;
+            ++by_op[op];
+            if (++n % 20000u == 0u) {
+                std::string line = "[merge] world batches ended by:";
+                for (std::uint32_t i = 0; i < 256u; ++i)
+                    if (by_op[i] * 50u >= n) line += " " + std::to_string(i) + "=" + std::to_string(by_op[i] * 100u / n) + "%";
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
+        }
+        flush();
+    }
     if (g_commands[op] != word && ((op >= 0x18u && op <= 0x1Bu) || (op >= 0x53u && op <= 0x92u))) g_lighting_dirty = true;
     g_commands[op] = word;
     const auto address = [&]() { return ((base | data) + offset) & 0x0FFFFFFFu; };
@@ -3388,7 +3516,7 @@ void present(std::uint32_t address) {
     splice_deferred();
     phase = 11u;
     ++g_stats.frames;
-    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 5u), std::memory_order_relaxed);
+    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 6u), std::memory_order_relaxed);
     static const char *fixed_probe = std::getenv("PSPRECOMP_BURNOUT_PROBE_MODE");
     if (fixed_probe != nullptr) {
         g_gpu_probe = true;
@@ -3420,7 +3548,7 @@ void present(std::uint32_t address) {
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       (g_gl_busy_ms.load() - last_busy) / n,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
-                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 5u) : -1);
+                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),

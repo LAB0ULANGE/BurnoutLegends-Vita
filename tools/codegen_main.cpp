@@ -1420,7 +1420,18 @@ std::string lower_aot_memory_accesses(std::string text) {
     // Lower ordinary aligned byte/half/word accesses to that shared view.
     static const std::regex access_pattern(
         R"(rt\.memory\(\)\.aot_(load|store)(8|16|32|_quad)\()" );
-    return std::regex_replace(text, access_pattern, "aot_mem.aot_$1$2(");
+    text = std::regex_replace(text, access_pattern, "aot_mem.aot_$1$2(");
+    // Base register + constant offset: the page-table build translates the
+    // base once for every access off it (see AotFastView::based_pointer).
+    static const std::regex based_pattern(
+        R"(aot_mem\.aot_(load|store)(8|16|32)\((ctx\.gpr\[\d+\]) \+ static_cast<std::uint32_t>\((-?\d+)\))");
+    text = std::regex_replace(text, based_pattern, "aot_mem.aot_$1$2_at($3, $4");
+    static const std::regex quad_address(
+        R"(const std::uint32_t vfpu_address = (ctx\.gpr\[\d+\]) \+ static_cast<std::uint32_t>\((-?\d+)\);)");
+    text = std::regex_replace(text, quad_address,
+                              "const std::uint32_t vfpu_base = $1; constexpr std::int32_t vfpu_offset = $2;");
+    static const std::regex quad_access(R"(aot_mem\.aot_(load|store)_quad\(vfpu_address, )");
+    return std::regex_replace(text, quad_access, "aot_mem.aot_$1_quad_at(vfpu_base, vfpu_offset, ");
 }
 
 std::string lower_constant_fpr_accesses(std::string text) {

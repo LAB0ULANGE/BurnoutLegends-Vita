@@ -63,11 +63,13 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-71-probe";
-constexpr bool kGpuProbe = true;  // diagnostic: GPU probe modes, 600 frames each
+constexpr const char *kBuild = "gl-71";
+constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
 constexpr bool kReorder = false;  // E: alpha-tested opaque draws after the opaque scenery
+constexpr bool kMergeCutouts = false;  // cut-out PRIMs in world space, merged into few draws
+constexpr bool kMergeAll = false;  // ... and every unlit unblended PRIM
 constexpr bool kBlendDeferred = false;  // F: those draws blend a 0/1 alpha instead of discarding
 constexpr bool kSoundCore2 = true;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
@@ -330,6 +332,7 @@ int main() {
         burnout::gl::set_no_trees(kNoTrees);
         burnout::gl::set_fragment_mediump(kMediump);
         burnout::gl::set_reorder_cutouts(kReorder);
+        burnout::gl::set_merge_cutouts(kMergeCutouts || kMergeAll, kMergeAll);
         burnout::gl::set_blend_deferred_cutouts(kBlendDeferred);
         std::fprintf(stderr, "[vita] renderer ready, running the game\n");
         if (!burnout::render::active()) throw std::runtime_error("OpenGL initialisation failed (see the log)");

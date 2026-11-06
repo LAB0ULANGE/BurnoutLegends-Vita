@@ -464,3 +464,27 @@ const std::vector<std::uint8_t> &GuestMemory::bytes() const noexcept { return by
 const std::vector<std::uint8_t> &GuestMemory::vram_bytes() const noexcept { return vram_; }
 
 } // namespace psprecomp
+
+#if defined(PSPRECOMP_AOT_PAGE_TABLE) && defined(PSPRECOMP_AOT_CHECK_BASED)
+#include <atomic>
+namespace psprecomp {
+namespace {
+std::atomic<std::uint64_t> g_based_checks{0u}, g_based_mismatches{0u};
+struct BasedReport {
+    ~BasedReport() {
+        std::fprintf(stderr, "[memory] based accesses %llu, mismatches %llu\n",
+                     static_cast<unsigned long long>(g_based_checks.load()),
+                     static_cast<unsigned long long>(g_based_mismatches.load()));
+    }
+} g_based_report;
+} // namespace
+void GuestMemory::AotFastView::check_based(std::uint32_t base, std::int32_t offset) const noexcept {
+    g_based_checks.fetch_add(1u, std::memory_order_relaxed);
+    const std::uint32_t address = base + static_cast<std::uint32_t>(offset);
+    if (reinterpret_cast<std::uint8_t *>(pages_[base >> 21u].offset + base) + offset != page_pointer(address)) {
+        if (g_based_mismatches.fetch_add(1u, std::memory_order_relaxed) < 20u)
+            std::fprintf(stderr, "[memory] based access mismatch: base %08X offset %d\n", base, offset);
+    }
+}
+} // namespace psprecomp
+#endif

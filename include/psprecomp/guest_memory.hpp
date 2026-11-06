@@ -1,4 +1,7 @@
 #pragma once
+#if !defined(__vita__) && !defined(PSPRECOMP_AOT_CHECK_BASED)
+#define PSPRECOMP_AOT_CHECK_BASED 1  // TEMP check run
+#endif
 
 #include <bit>
 #include <cstddef>
@@ -70,6 +73,14 @@ public:
     // GuestMemory and preserve the original validation/watch behavior.
     class AotFastView {
     public:
+        // Distinct types for the generated code's word accesses and for the
+        // page table: with strict aliasing GCC then knows a guest word store
+        // changes neither the CPU context (guest registers stay in host
+        // registers across it) nor the page table (one translation serves
+        // every access off a base register). Byte, half and quad accesses
+        // stay char-based (they alias everything, guest words included).
+        struct GuestWord { std::uint32_t value; };
+        struct PageEntry { std::uintptr_t offset; };
 #if defined(PSPRECOMP_AOT_PAGE_TABLE)
         // Page-table build: every canonical 2 MiB page maps to host memory
         // (RAM, the 2 MiB VRAM for each VRAM mirror, or a scratch page for
@@ -81,7 +92,7 @@ public:
         // of the 32-bit space (mirrors included), so the host pointer is
         // entry + address: a shift, a table load and the access itself.
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t *page_pointer(std::uint32_t address) const noexcept {
-            return reinterpret_cast<std::uint8_t *>(pages_[address >> 21u] + address);
+            return reinterpret_cast<std::uint8_t *>(pages_[address >> 21u].offset + address);
         }
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
             return *page_pointer(address);
@@ -90,7 +101,7 @@ public:
             return GuestMemory::read_le16(page_pointer(address));
         }
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32(std::uint32_t address) const {
-            return GuestMemory::read_le32(page_pointer(address));
+            return reinterpret_cast<const GuestWord *>(page_pointer(address))->value;
         }
         PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) const {
             *page_pointer(address) = value;
@@ -99,13 +110,15 @@ public:
             GuestMemory::write_le16(page_pointer(address), value);
         }
         PSPRECOMP_MEMORY_FAST_PATH void aot_store32(std::uint32_t address, std::uint32_t value) const {
-            GuestMemory::write_le32(page_pointer(address), value);
+            reinterpret_cast<GuestWord *>(page_pointer(address))->value = value;
         }
         PSPRECOMP_MEMORY_FAST_PATH void aot_load_quad(std::uint32_t address, float *value) const {
-            std::memcpy(value, page_pointer(address), 16u);
+            const GuestWord *words = reinterpret_cast<const GuestWord *>(page_pointer(address));
+            for (std::uint32_t i = 0; i < 4u; ++i) value[i] = std::bit_cast<float>(words[i].value);
         }
         PSPRECOMP_MEMORY_FAST_PATH void aot_store_quad(std::uint32_t address, const float *value) const {
-            std::memcpy(page_pointer(address), value, 16u);
+            GuestWord *words = reinterpret_cast<GuestWord *>(page_pointer(address));
+            for (std::uint32_t i = 0; i < 4u; ++i) words[i].value = std::bit_cast<std::uint32_t>(value[i]);
         }
 #else
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
@@ -185,6 +198,75 @@ public:
         }
 #endif
 
+        // Base register + constant offset (the MIPS addressing mode). In the
+        // page-table build the base alone is translated, so accesses at
+        // several offsets of one base register share the translation (one
+        // host load or store each). Host memory is contiguous across every
+        // RAM page of one mirror, so this matches page_pointer(base + offset)
+        // unless the offset crosses out of the region the base is in.
+#if defined(PSPRECOMP_AOT_PAGE_TABLE)
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t *based_pointer(std::uint32_t base, std::int32_t offset) const noexcept {
+#if defined(PSPRECOMP_AOT_CHECK_BASED)
+            check_based(base, offset);
+#endif
+            return reinterpret_cast<std::uint8_t *>(pages_[base >> 21u].offset + base) + offset;
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8_at(std::uint32_t base, std::int32_t offset) const {
+            return *based_pointer(base, offset);
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint16_t aot_load16_at(std::uint32_t base, std::int32_t offset) const {
+            return GuestMemory::read_le16(based_pointer(base, offset));
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32_at(std::uint32_t base, std::int32_t offset) const {
+            return reinterpret_cast<const GuestWord *>(based_pointer(base, offset))->value;
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store8_at(std::uint32_t base, std::int32_t offset, std::uint8_t value) const {
+            *based_pointer(base, offset) = value;
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store16_at(std::uint32_t base, std::int32_t offset, std::uint16_t value) const {
+            GuestMemory::write_le16(based_pointer(base, offset), value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store32_at(std::uint32_t base, std::int32_t offset, std::uint32_t value) const {
+            reinterpret_cast<GuestWord *>(based_pointer(base, offset))->value = value;
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_load_quad_at(std::uint32_t base, std::int32_t offset, float *value) const {
+            const GuestWord *words = reinterpret_cast<const GuestWord *>(based_pointer(base, offset));
+            for (std::uint32_t i = 0; i < 4u; ++i) value[i] = std::bit_cast<float>(words[i].value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store_quad_at(std::uint32_t base, std::int32_t offset, const float *value) const {
+            GuestWord *words = reinterpret_cast<GuestWord *>(based_pointer(base, offset));
+            for (std::uint32_t i = 0; i < 4u; ++i) words[i].value = std::bit_cast<std::uint32_t>(value[i]);
+        }
+#if defined(PSPRECOMP_AOT_CHECK_BASED)
+        void check_based(std::uint32_t base, std::int32_t offset) const noexcept;
+#endif
+#else
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8_at(std::uint32_t base, std::int32_t offset) const {
+            return aot_load8(base + static_cast<std::uint32_t>(offset));
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint16_t aot_load16_at(std::uint32_t base, std::int32_t offset) const {
+            return aot_load16(base + static_cast<std::uint32_t>(offset));
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32_at(std::uint32_t base, std::int32_t offset) const {
+            return aot_load32(base + static_cast<std::uint32_t>(offset));
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store8_at(std::uint32_t base, std::int32_t offset, std::uint8_t value) const {
+            aot_store8(base + static_cast<std::uint32_t>(offset), value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store16_at(std::uint32_t base, std::int32_t offset, std::uint16_t value) const {
+            aot_store16(base + static_cast<std::uint32_t>(offset), value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store32_at(std::uint32_t base, std::int32_t offset, std::uint32_t value) const {
+            aot_store32(base + static_cast<std::uint32_t>(offset), value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_load_quad_at(std::uint32_t base, std::int32_t offset, float *value) const {
+            aot_load_quad(base + static_cast<std::uint32_t>(offset), value);
+        }
+        PSPRECOMP_MEMORY_FAST_PATH void aot_store_quad_at(std::uint32_t base, std::int32_t offset, const float *value) const {
+            aot_store_quad(base + static_cast<std::uint32_t>(offset), value);
+        }
+#endif
+
     private:
         friend class GuestMemory;
         AotFastView(GuestMemory *owner, std::uint8_t *ram_data,
@@ -192,7 +274,7 @@ public:
                     std::uint32_t limit32, bool write_watch, const std::uintptr_t *pages) noexcept
             : owner_(owner), ram_data_(ram_data), ram_limit8_(limit8),
               ram_limit16_(limit16), ram_limit32_(limit32),
-              write_watch_enabled_(write_watch), pages_(pages) {}
+              write_watch_enabled_(write_watch), pages_(reinterpret_cast<const PageEntry *>(pages)) {}
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static
 #if !defined(PSPRECOMP_COUNT_MIRROR_ACCESSES)
             constexpr
@@ -211,7 +293,7 @@ public:
         std::uint32_t ram_limit16_{};
         std::uint32_t ram_limit32_{};
         bool write_watch_enabled_{};
-        const std::uintptr_t *pages_{};
+        const PageEntry *pages_{};
     };
 
     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH AotFastView aot_fast_view() noexcept {
