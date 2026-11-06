@@ -524,6 +524,8 @@ void main() {
 struct RenderTarget {
     GLuint framebuffer{}, texture{}, depth{};
     int width{}, height{};
+    bool dynamic{};  // screen-sized, drawn at the dynamic resolution
+    int draw_q{};    // eighths it was last drawn at
     GLint sampling[4]{-1, -1, -1, -1};
 };
 
@@ -602,7 +604,7 @@ bool g_lighting_dirty{true};  // a lighting or material command changed since th
 bool g_drawing{true};         // false while a frame is skipped
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
-Program g_uber, g_present;  // GL thread
+Program g_uber, g_present, g_present_sharp;  // GL thread (sharp: enlarged pictures)
 #if defined(__vita__)
 GLuint g_vertex_buffer{}, g_index_buffer{};  // wrap per-draw scratch memory (vglBufferData)
 #endif
@@ -624,6 +626,12 @@ struct GpuCounters {
 // Scale of each render target as created (decode thread): the screen-sized
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
+// Dynamic resolution (decode thread): the screen-sized targets are allocated
+// at the render scale and drawn at g_dynamic_q eighths, lowered while the GPU
+// makes the GL thread wait at present, raised again once it no longer does.
+bool g_dynamic_resolution{std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_RES") != nullptr};
+int g_dynamic_min{12};
+int g_dynamic_q{0};  // 0 until the first frame: the render scale
 bool g_stencil_ab{};
 // GPU probe (diagnostic): every 600 frames the alpha-tested textured draws
 // change, so one log tells what their GPU time depends on: 0 normal, 1 the
@@ -986,11 +994,13 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     target.framebuffer = g_next_framebuffer_id++;
     // Screen-sized targets (the frame buffers) at the render scale; narrower
     // ones are the game's effect buffers, which offscreen_1x keeps at 1x.
-    const int scale = g_offscreen_1x && target.width < 480 ? 4 : g_scale;
+    const int scale = g_offscreen_1x && target.width < 480 ? 8 : g_scale;
+    target.dynamic = g_dynamic_resolution && target.width >= 480;
+    target.draw_q = scale;
     record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
                               static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(scale)});
     char line[96];
-    std::snprintf(line, sizeof(line), "render target %06X: %dx%d at x%g", key, target.width, target.height, scale / 4.0);
+    std::snprintf(line, sizeof(line), "render target %06X: %dx%d at x%g", key, target.width, target.height, scale / 8.0);
     trace(line);
     // The GL thread binds and clears it, and sets its sampling.
     forget_state();
@@ -1083,8 +1093,10 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             ++g_gpu.targets[target_key(address)].sampled;
             bind_texture_object(it->second.texture);
             set_sampling(it->second.sampling, linear, true, true);
-            return {static_cast<float>(width) / static_cast<float>(it->second.width),
-                    -static_cast<float>(height) / static_cast<float>(it->second.height), 0.0f, 1.0f};
+            // A target drawn below its allocated size fills the lower-left part.
+            const float f = it->second.dynamic ? static_cast<float>(it->second.draw_q) / static_cast<float>(g_scale) : 1.0f;
+            return {static_cast<float>(width) / static_cast<float>(it->second.width) * f,
+                    -static_cast<float>(height) / static_cast<float>(it->second.height) * f, 0.0f, f};
         }
     }
 
@@ -1466,9 +1478,17 @@ void flush() {
             invalidate_record_caches();
         }
     } deferred_scope{deferred_draw};
+    const int frame_q = g_dynamic_q != 0 ? g_dynamic_q : g_scale;
+    if (target.dynamic && target.draw_q != frame_q) {
+        // Drawn at this frame's resolution: bound again, viewport and scissor recorded again.
+        target.draw_q = frame_q;
+        g_state.framebuffer = ~0u;
+        g_state.viewport_w = g_state.viewport_h = -1;
+        g_state.scissor[0] = -1;
+    }
     if (g_state.framebuffer != target.framebuffer) {
         g_state.framebuffer = target.framebuffer;
-        record(Op::BindFramebuffer, {target.framebuffer});
+        record(Op::BindFramebuffer, {target.framebuffer, target.dynamic ? static_cast<std::uint32_t>(target.draw_q) : 0u});
         ++use.binds;
         ++g_gpu.switches;
     }
@@ -2711,14 +2731,62 @@ struct GlThread {
 
 std::vector<GLuint> g_gl_textures, g_gl_framebuffers;  // GL names by id (GL thread)
 // Render targets are drawn at this multiple of the PSP resolution, in
-// quarters (4 = 1x, 6 = 1.5x, 7 = 1.75x, 8 = 2x). Only the GL thread applies it: targets,
+// eighths (8 = 1x, 12 = 1.5x, 14 = 1.75x, 16 = 2x). Only the GL thread applies it: targets,
 // viewports and scissors are recorded in PSP pixels and the shader works in
 // normalized coordinates.
-int g_scale{4};
-int scaled(int value, int scale) noexcept { return value * scale / 4; }
+int g_scale{8};
+int scaled(int value, int scale) noexcept { return value * scale / 8; }
 // Present: sharpen the picture as it is enlarged to the screen (below 2x).
 bool g_present_sharpen{std::getenv("PSPRECOMP_BURNOUT_SHARPEN") != nullptr};
 std::atomic<double> g_gl_busy_ms{0.0}, g_gl_present_ms{0.0};
+
+// Once per frame, as its present is recorded: the next frame's resolution.
+void update_dynamic_resolution() {
+    if (!g_dynamic_resolution) return;
+    static double last_present = 0.0, smooth = 0.0;
+    static int calm = 0, hold = 0, ceiling = 0, ceiling_frames = 0;
+    static std::uint64_t at_level[33]{};
+    static std::uint64_t frames = 0;
+    if (g_dynamic_q == 0) g_dynamic_q = ceiling = g_scale;
+    const double total = g_gl_present_ms.load();
+    const double wait = total - last_present;
+    last_present = total;
+    smooth = smooth * 0.75 + wait * 0.25;
+    ++at_level[g_dynamic_q];
+    ++frames;
+    if (ceiling_frames > 0 && --ceiling_frames == 0) ceiling = g_scale;
+    static const bool test = std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_TEST") != nullptr;
+    if (test) {
+        // PC check: every level in turn, 60 frames each.
+        g_dynamic_q = g_scale - static_cast<int>((frames / 60u) % static_cast<std::uint64_t>(g_scale - g_dynamic_min + 1));
+    } else if (hold > 0) {
+        --hold;
+    } else if (smooth > 2.0 && g_dynamic_q > g_dynamic_min) {
+        // The GPU is late: one step down, and that level stays out of reach
+        // for ~10 s so the picture does not pump between two sizes.
+        ceiling = g_dynamic_q - 1;
+        ceiling_frames = 300;
+        --g_dynamic_q;
+        hold = 6;
+        calm = 0;
+    } else if (smooth < 0.6) {
+        if (++calm >= 45 && g_dynamic_q < ceiling) {
+            ++g_dynamic_q;
+            calm = 0;
+            hold = 6;
+        }
+    } else {
+        calm = 0;
+    }
+    if (frames % 300u == 0u) {
+        std::string line = "dynamic resolution: now " + std::to_string(480 * g_dynamic_q / 8) + "x" + std::to_string(272 * g_dynamic_q / 8) +
+                           ", frames by width:";
+        for (int q = g_scale; q >= g_dynamic_min; --q)
+            if (at_level[q] != 0u) line += " " + std::to_string(480 * q / 8) + ":" + std::to_string(at_level[q]);
+        trace(line.c_str());
+        for (auto &n : at_level) n = 0u;
+    }
+}
 // GL thread breakdown (gl-74): draws issued, the vertex/index preparation
 // (index expansion and copies to GPU memory) and the draws past the budget.
 std::atomic<double> g_gl_upload_ms{0.0}, g_gl_draw_ms{0.0};
@@ -2734,8 +2802,9 @@ GLuint gl_texture(GLuint id) {
 
 // GL thread: scale of each framebuffer id, and of the one bound (scissor and
 // viewport are recorded in PSP pixels).
-std::vector<int> g_framebuffer_scales;  // in quarters, as g_scale
-int g_bound_scale{4};
+std::vector<int> g_framebuffer_scales;  // allocated, in eighths as g_scale
+std::vector<int> g_framebuffer_drawn;   // drawn at (dynamic resolution), 0: allocated
+int g_bound_scale{8};
 
 void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int height) {
     const GLuint texture = gl_texture(texture_id);
@@ -3084,7 +3153,7 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
 }
 
-void present_target(GLuint texture_id, int width) {
+void present_target(GLuint texture_id, int width, float fraction) {
 #if defined(__vita__)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, 960, 544);
@@ -3095,13 +3164,15 @@ void present_target(GLuint texture_id, int width) {
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     if (texture_id != 0u) {
-        const float u = 480.0f / static_cast<float>(width);
-        const float quad[16]{-1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, u, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
-        glUseProgram(g_present.id);
+        const float u = 480.0f / static_cast<float>(width) * fraction, v = fraction;
+        const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
+        // Sharpened only when the picture is enlarged.
+        const Program &present = fraction * static_cast<float>(g_scale) < 15.5f && g_present_sharp.id != 0u ? g_present_sharp : g_present;
+        glUseProgram(present.id);
         g_bound = nullptr;
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gl_texture(texture_id));
-        glUniform1i(g_present.texture, 0);
+        glUniform1i(present.texture, 0);
         glDisableVertexAttribArray(2);
         glDisableVertexAttribArray(3);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -3116,6 +3187,7 @@ void present_target(GLuint texture_id, int width) {
 #else
     (void)texture_id;
     (void)width;
+    (void)fraction;
 #endif
 }
 
@@ -3124,18 +3196,19 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
     if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_gl_framebuffers[framebuffer_id]);
         // The visible 480x272 at the render scale, averaged back to PSP size.
-        const int scale = framebuffer_id < g_framebuffer_scales.size() ? g_framebuffer_scales[framebuffer_id] : g_scale;
-        // (scale in quarters: each PSP pixel is the box [x * s / 4, (x + 1) * s / 4).)
+        int scale = framebuffer_id < g_framebuffer_scales.size() ? g_framebuffer_scales[framebuffer_id] : g_scale;
+        if (framebuffer_id < g_framebuffer_drawn.size() && g_framebuffer_drawn[framebuffer_id] != 0) scale = g_framebuffer_drawn[framebuffer_id];
+        // (scale in eighths: each PSP pixel is the box [x * s / 8, (x + 1) * s / 8).)
         const auto s = static_cast<std::uint32_t>(scale);
-        const std::uint32_t w = 480u * s / 4u, h = 272u * s / 4u;
+        const std::uint32_t w = 480u * s / 8u, h = 272u * s / 8u;
         std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4u);
         glReadPixels(0, scaled(height - 272, scale), static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE,
                      rgba.data());
         rgb.resize(480u * 272u * 3u);
         for (std::uint32_t y = 0; y < 272u; ++y) {
-            const std::uint32_t fy = 271u - y, y0 = fy * s / 4u, y1 = (fy + 1u) * s / 4u;
+            const std::uint32_t fy = 271u - y, y0 = fy * s / 8u, y1 = (fy + 1u) * s / 8u;
             for (std::uint32_t x = 0; x < 480u; ++x) {
-                const std::uint32_t x0 = x * s / 4u, x1 = (x + 1u) * s / 4u;
+                const std::uint32_t x0 = x * s / 8u, x1 = (x + 1u) * s / 8u;
                 for (int c = 0; c < 3; ++c) {
                     std::uint32_t sum = 0u;
                     for (std::uint32_t sy = y0; sy < y1; ++sy)
@@ -3197,8 +3270,11 @@ void replay(const Frame &frame) {
         case Op::UseProgram: use_program(probe_key(op[0])); op += 1; break;
         case Op::BindFramebuffer:
             glBindFramebuffer(GL_FRAMEBUFFER, op[0] < g_gl_framebuffers.size() ? g_gl_framebuffers[op[0]] : 0u);
-            g_bound_scale = op[0] < g_framebuffer_scales.size() ? g_framebuffer_scales[op[0]] : g_scale;
-            op += 1;
+            g_bound_scale = op[1] != 0u ? static_cast<int>(op[1])
+                            : op[0] < g_framebuffer_scales.size() ? g_framebuffer_scales[op[0]] : g_scale;
+            if (op[0] >= g_framebuffer_drawn.size()) g_framebuffer_drawn.resize(op[0] + 1u, 0);
+            g_framebuffer_drawn[op[0]] = static_cast<int>(op[1]);
+            op += 2;
             break;
         case Op::BindTexture:
             g_gl_bound_texture = gl_texture(op[0]);
@@ -3243,10 +3319,10 @@ void replay(const Frame &frame) {
         case Op::Present: {
             g_gl_frame_draws = 0u;
             const double started = host_now_ms();
-            present_target(op[0], static_cast<int>(op[1]));
+            present_target(op[0], static_cast<int>(op[1]), static_cast<float>(op[2]) / static_cast<float>(g_scale));
             g_fragment_stats_flush = true;
             g_gl_present_ms.store(g_gl_present_ms.load() + host_now_ms() - started);
-            op += 2;
+            op += 3;
             break;
         }
         case Op::Capture: capture_target(op[0], static_cast<int>(op[1]), frame.captures[op[2]]); op += 3; break;
@@ -3261,15 +3337,14 @@ void gl_thread_main() {
         if (ok) trace("compiling the draw shaders");
         ok = ok && link(g_uber, kVertexShader, kFragmentShader, false, error);
         if (ok) trace("compiling the present shaders");
-        std::string present_defines = "#define SHARPEN 0\n";
-        if (g_present_sharpen && g_scale < 8) {
+        ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error, "#define SHARPEN 0\n");
+        if (ok && g_present_sharpen && (g_scale < 16 || g_dynamic_resolution)) {
             // The display target is 512x272 PSP pixels at the render scale.
             char text[160];
             std::snprintf(text, sizeof(text), "#define SHARPEN 1\n#define TEXEL_X %.8f\n#define TEXEL_Y %.8f\n#define STRENGTH 0.5\n",
-                          4.0 / (512.0 * g_scale), 4.0 / (272.0 * g_scale));
-            present_defines = text;
+                          8.0 / (512.0 * g_scale), 8.0 / (272.0 * g_scale));
+            ok = link(g_present_sharp, kPresentVertexShader, kPresentFragmentShader, true, error, text);
         }
-        ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error, present_defines);
         if (ok) {
             trace("compiling the known program variants");
             for (const std::uint32_t key : kKnownVariants) use_program(key);
@@ -3383,7 +3458,11 @@ void flush_traces() {
     std::fflush(stderr);
 }
 
-void set_render_scale(float scale) { g_scale = std::clamp(static_cast<int>(std::lround(scale * 4.0f)), 4, 16); }
+void set_render_scale(float scale) { g_scale = std::clamp(static_cast<int>(std::lround(scale * 8.0f)), 8, 32); }
+void set_dynamic_resolution(bool enabled, float min_scale) {
+    g_dynamic_resolution = g_dynamic_resolution || enabled;
+    g_dynamic_min = std::clamp(static_cast<int>(std::lround(min_scale * 8.0f)), 8, 32);
+}
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
@@ -3736,7 +3815,9 @@ void present(std::uint32_t address) {
         return;  // skipped frame: the screen keeps the previous one
     }
     record(Op::Present, {it != g_targets.end() ? it->second.texture : 0u,
-                         it != g_targets.end() ? static_cast<std::uint32_t>(it->second.width) : 0u});
+                         it != g_targets.end() ? static_cast<std::uint32_t>(it->second.width) : 0u,
+                         it != g_targets.end() ? static_cast<std::uint32_t>(it->second.draw_q) : static_cast<std::uint32_t>(g_scale)});
+    update_dynamic_resolution();
     forget_state();
     submit_frame();
     phase = 0u;

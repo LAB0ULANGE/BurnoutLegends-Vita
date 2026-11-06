@@ -99,6 +99,8 @@ BenchResult run_benchmark(const BenchOptions &options) {
         const std::uint64_t vblank = vblank_count();
         if (opened.insert(key).second && options.trace_files)
             std::cerr << "[file] vblank=" << vblank << " " << path << "\n";
+        // Every track's data as it loads: the log's per-track sections.
+        if (key.find(marker) != std::string::npos) std::cerr << "[track] vblank " << vblank << ": " << path << "\n";
         if (race_vblank == 0u && key.find(marker) != std::string::npos) {
             race_vblank = vblank;
             std::cerr << "[bench] race data first opened at vblank " << vblank << ": " << path << "\n";

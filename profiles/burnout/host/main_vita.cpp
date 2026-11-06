@@ -63,7 +63,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-75";
+constexpr const char *kBuild = "gl-76";
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
@@ -73,7 +73,8 @@ constexpr bool kMergeAll = false;  // ... and every unlit unblended PRIM
 constexpr bool kCutoutPrepass = false;  // gl-72: cut-outs depth-only with discard, then colour at EQUAL depth
 constexpr unsigned kDrawBudget = 0;  // gl-74 test: draws past this per frame dropped (0: none)
 constexpr int kForceScale = 0;  // test builds: 4 = 840x476, 3 = 720x408, 1 = 480x272 without the menu (0: settings)
-constexpr bool kSharpen = false;  // sharpen the enlarged picture (render scale below 2)
+constexpr bool kSharpen = true;  // sharpen the enlarged picture (render scale below 2)
+constexpr bool kDynamicRes = true;  // 960x544 lowered towards 720x408 while the GPU is late
 constexpr bool kBlendDeferred = false;  // F: those draws blend a 0/1 alpha instead of discarding
 constexpr bool kSoundCore2 = true;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
@@ -336,6 +337,7 @@ int main() {
         std::fprintf(stderr, "[vita] render scale %g\n", static_cast<double>(render.render_scale));
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::gl::set_present_sharpen(kSharpen);
+        burnout::gl::set_dynamic_resolution(kDynamicRes, 1.5f);
         burnout::render::configure(render);
         burnout::gl::set_stencil_ab(kStencilAB);
         burnout::gl::set_gpu_probe(kGpuProbe);
