@@ -633,6 +633,7 @@ bool g_offscreen_1x{};
 bool g_dynamic_resolution{std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_RES") != nullptr};
 int g_dynamic_min{12};
 int g_dynamic_q{0};  // 0 until the first frame: the render scale
+int g_dynamic_pin{0};  // test: this level always (no recreation), 0: by GPU load
 bool g_stencil_ab{};
 // GPU probe (diagnostic): every 600 frames the alpha-tested textured draws
 // change, so one log tells what their GPU time depends on: 0 normal, 1 the
@@ -1003,8 +1004,8 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     target.framebuffer = g_next_framebuffer_id++;
     // Screen-sized targets (the frame buffers) at the render scale; narrower
     // ones are the game's effect buffers, which offscreen_1x keeps at 1x.
-    const int scale = g_offscreen_1x && target.width < 480 ? 8 : g_scale;
     target.dynamic = g_dynamic_resolution && target.width >= 480;
+    const int scale = g_offscreen_1x && target.width < 480 ? 8 : target.dynamic && g_dynamic_q != 0 ? g_dynamic_q : g_scale;
     target.draw_q = scale;
     record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
                               static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(scale)});
@@ -2808,7 +2809,7 @@ void update_dynamic_resolution() {
     static int calm = 0, hold = 0, ceiling = 0, ceiling_frames = 0;
     static std::uint64_t at_level[33]{};
     static std::uint64_t frames = 0;
-    if (g_dynamic_q == 0) g_dynamic_q = ceiling = g_scale;
+    if (g_dynamic_q == 0) g_dynamic_q = ceiling = g_dynamic_pin != 0 ? g_dynamic_pin : g_scale;
     const double total = g_gl_present_ms.load();
     const double wait = total - last_present;
     last_present = total;
@@ -2817,7 +2818,9 @@ void update_dynamic_resolution() {
     ++frames;
     if (ceiling_frames > 0 && --ceiling_frames == 0) ceiling = g_scale;
     static const bool test = std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_TEST") != nullptr;
-    if (test) {
+    if (g_dynamic_pin != 0) {
+        g_dynamic_q = g_dynamic_pin;
+    } else if (test) {
         // PC check: every level in turn, 60 frames each.
         g_dynamic_q = g_scale - static_cast<int>((frames / 60u) % static_cast<std::uint64_t>(g_scale - g_dynamic_min + 1));
     } else if (hold > 0) {
@@ -2846,6 +2849,8 @@ void update_dynamic_resolution() {
             if (at_level[q] != 0u) line += " " + std::to_string(480 * q / 8) + ":" + std::to_string(at_level[q]);
         trace(line.c_str());
         for (auto &n : at_level) n = 0u;
+        const std::string memory = memory_report();
+        if (!memory.empty()) trace(memory.c_str());
     }
 }
 // GL thread breakdown (gl-74): draws issued, the vertex/index preparation
@@ -3538,9 +3543,13 @@ void flush_traces() {
 }
 
 void set_render_scale(float scale) { g_scale = std::clamp(static_cast<int>(std::lround(scale * 8.0f)), 8, 32); }
-void set_dynamic_resolution(bool enabled, float min_scale) {
+void set_dynamic_resolution(bool enabled, float min_scale, float pinned) {
     g_dynamic_resolution = g_dynamic_resolution || enabled;
     g_dynamic_min = std::clamp(static_cast<int>(std::lround(min_scale * 8.0f)), 8, 32);
+    if (pinned > 0.0f) {
+        g_dynamic_pin = std::clamp(static_cast<int>(std::lround(pinned * 8.0f)), 8, 32);
+        g_dynamic_q = g_dynamic_pin;
+    }
 }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
 void set_thin_foliage(bool enabled, float near_distance, float far_distance) {

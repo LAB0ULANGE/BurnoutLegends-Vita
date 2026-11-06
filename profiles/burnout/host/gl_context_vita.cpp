@@ -49,4 +49,12 @@ bool create_context(std::string &error) {
 
 void swap_buffers() { vglSwapBuffers(GL_FALSE); }
 
+std::string memory_report() {
+    char text[160];
+    std::snprintf(text, sizeof(text), "vitaGL free: cdram %u KiB, ram %u KiB, phycont %u KiB",
+                  static_cast<unsigned>(vglMemFree(VGL_MEM_VRAM) / 1024u), static_cast<unsigned>(vglMemFree(VGL_MEM_RAM) / 1024u),
+                  static_cast<unsigned>(vglMemFree(VGL_MEM_PHYCONT) / 1024u));
+    return text;
+}
+
 } // namespace burnout::gl

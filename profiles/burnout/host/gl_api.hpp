@@ -93,5 +93,7 @@ namespace burnout::gl {
 bool create_context(std::string &error);
 // Shows the default framebuffer (Vita only; no-op on Windows).
 void swap_buffers();
+// Free memory of the GL pools, for the log (empty where unknown).
+std::string memory_report();
 
 } // namespace burnout::gl

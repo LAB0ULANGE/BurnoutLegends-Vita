@@ -41,4 +41,6 @@ bool create_context(std::string &error) {
 
 void swap_buffers() {}
 
+std::string memory_report() { return {}; }
+
 } // namespace burnout::gl
