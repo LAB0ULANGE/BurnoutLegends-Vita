@@ -438,6 +438,11 @@ void main() {
     c.rgb = min(c.rgb * 2.0, 1.0);
 #endif
 #endif
+#if ATFAST
+    // floor(a * 255 + 0.5) > r  <=>  a * 255 >= r + 0.5 (GREATER);
+    // >= r  <=>  a * 255 >= r - 0.5 (GEQUAL); u_alpha.w holds that bound.
+    if (c.a * 255.0 < u_alpha.w) discard;
+#endif
 #if FOG
     c.rgb = mix(u_fogcolor.rgb, c.rgb, v_fog);
 #endif
@@ -451,7 +456,7 @@ void main() {
     if (equal_rgb) discard;
 #endif
 #endif
-#if ATEST
+#if ATEST && !ATFAST
     float a = floor(c.a * 255.0 + 0.5);
     float r = u_alpha.y;
 #if ATFUNC == 0
@@ -609,10 +614,11 @@ struct GpuCounters {
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
 bool g_stencil_ab{};
-// GPU probe (diagnostic): every 600 frames the textures are uploaded another
-// way, so one log tells what the GPU time depends on: 0 RGBA8 with mip chains
-// (normal), 1 CLUT textures as GXM P8 paletted textures (no mips), 2 RGBA8
-// without mips. (gl-64 probed 1 scissor 1/16, 2 no discard, 3 untextured.)
+// GPU probe (diagnostic): every 600 frames the alpha-tested textured draws
+// change, so one log tells what their GPU time depends on: 0 normal, 1 fast
+// alpha test (exact), 2 nearest filtering, 3 each drawn as two draws, 4 no
+// depth writes. (gl-64 probed scissor 1/16, no discard, untextured; gl-66
+// texture formats; gl-67 alpha test as blending.)
 bool g_gpu_probe{};
 // Test F: deferred cut-outs (drawn after the opaque scenery) blend with a 0/1 alpha instead of discarding.
 bool g_blend_deferred_cutouts{std::getenv("PSPRECOMP_BURNOUT_BLEND_DEFERRED") != nullptr};
@@ -637,6 +643,11 @@ std::vector<std::uint32_t> g_skipped_cutouts = [] {
 bool g_alpha_blend_test{std::getenv("PSPRECOMP_BURNOUT_ALPHA_BLEND_TEST") != nullptr};
 std::atomic<std::uint32_t> g_probe_mode{0u};
 std::uint32_t probe_key(std::uint32_t key) noexcept {
+    // Mode 1: exact fast alpha test for GREATER / GEQUAL (no ATBLEND).
+    const std::uint32_t func = key >> 18u & 7u;
+    if (g_probe_mode.load(std::memory_order_relaxed) == 1u && (key >> 17u & 1u) != 0u && (key >> 26u & 1u) == 0u &&
+        (func == 6u || func == 7u))
+        key |= 1u << 27u;
     return key;
 }
 bool g_mipmaps{std::getenv("PSPRECOMP_BURNOUT_NO_MIPMAPS") == nullptr};
@@ -1469,8 +1480,10 @@ void flush() {
                 static_cast<float>((env >> 16u) & 0xFFu) / 255.0f, 1.0f);
     const std::uint32_t alpha_test = cmd(0xDBu);
     const bool alpha_enabled = !clear_mode && (cmd(0x22u) & 1u) != 0u;
-    uniform4(kAlpha, static_cast<float>(alpha_test & 7u), static_cast<float>((alpha_test >> 8u) & 0xFFu),
-                alpha_enabled ? 1.0f : 0.0f, 0.0f);
+    // w: the bound of the fast alpha test (ATFAST), alpha * 255 against it.
+    const float alpha_ref = static_cast<float>((alpha_test >> 8u) & 0xFFu);
+    uniform4(kAlpha, static_cast<float>(alpha_test & 7u), alpha_ref, alpha_enabled ? 1.0f : 0.0f,
+             (alpha_test & 7u) == 7u ? alpha_ref - 0.5f : alpha_ref + 0.5f);
     // Colour test: the sun flare's black quad (alpha only) is drawn with
     // "not equal to black", so on the PSP none of it lands.
     const std::uint32_t color_function = !clear_mode && (cmd(0x27u) & 1u) != 0u ? cmd(0xD8u) & 3u : 1u;
@@ -1585,7 +1598,7 @@ void flush() {
     if (alpha_testing) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
     g_draw_is_cutout = alpha_testing && textured && !clear_mode && g_state.blend == 0;
     if (alpha_testing && !clear_mode && g_state.blend == 0 && color_function == 1u &&
-        (g_alpha_blend_test || g_probe_mode.load(std::memory_order_relaxed) == 1u ||
+        (g_alpha_blend_test ||
          (g_blend_deferred_cutouts && g_recording_deferred))) {
         variant |= 1u << 26u;
         set_capability(GL_BLEND, g_state.blend, true);
@@ -2592,7 +2605,8 @@ std::string variant_defines(std::uint32_t key) {
         {"COLFMT", bits(6, 3)},     {"FOG", bits(9, 1)},     {"TEXTURED", bits(10, 1)}, {"TEXFUNC", bits(11, 3)},
         {"TCC", bits(14, 1)},       {"DOUBLE", bits(15, 1)}, {"PROJECTIVE", bits(16, 1)}, {"ATEST", bits(17, 1)},
         {"ATFUNC", bits(18, 3)},    {"BLENDFIX", bits(21, 1)}, {"ALPHAOUT", bits(22, 1)}, {"CTEST", bits(23, 1)},
-        {"CTFUNC", bits(24, 2)},    {"ATBLEND", bits(26, 1)}};
+        {"CTFUNC", bits(24, 2)},    {"ATBLEND", bits(26, 1)},
+        {"ATFAST", bits(27, 1)}};
     std::string text;
     for (const auto &[name, value] : defines) text += "#define " + std::string(name) + " " + std::to_string(value) + "\n";
     return text;
@@ -2611,7 +2625,14 @@ void remember_variant(std::uint32_t key) {
     }
 }
 
+std::uint32_t g_current_key{};
+// GL thread state the probe modes change around a draw.
+bool g_gl_depth_mask{true};
+GLuint g_gl_bound_texture{};
+std::unordered_map<GLuint, std::array<GLint, 2>> g_gl_filters;
+bool g_fragment_stats_flush{};
 void use_program(std::uint32_t key) {
+    g_current_key = key;
     static const bool uber_only = std::getenv("PSPRECOMP_BURNOUT_UBER") != nullptr;
     auto it = g_variants.find(key);
     if (it == g_variants.end()) {
@@ -2760,6 +2781,81 @@ void draw(const Frame &frame, const std::uint32_t *a) {
         }
     }
     sync_uniforms();
+    if (g_gpu_probe && (g_current_key >> 17u & 1u) != 0u && (g_current_key >> 10u & 1u) != 0u) {
+        // Alpha-tested textured draws: 2 nearest filtering, 3 drawn as two
+        // halves (twice the draws, same pixels), 4 no depth writes.
+        const std::uint32_t mode = g_probe_mode.load(std::memory_order_relaxed);
+        if (mode == 2u) {
+            const auto it = g_gl_filters.find(g_gl_bound_texture);
+            const std::array<GLint, 2> filters =
+                it != g_gl_filters.end() ? it->second : std::array<GLint, 2>{GL_NEAREST_MIPMAP_LINEAR, GL_LINEAR};
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filters[0]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filters[1]);
+            return;
+        }
+        if (mode == 3u && index_count >= 6u) {
+            const std::uint32_t first = index_count / 6u * 3u;
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(first), GL_UNSIGNED_SHORT, indices);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count - first), GL_UNSIGNED_SHORT,
+                           reinterpret_cast<const void *>(reinterpret_cast<std::uintptr_t>(indices) + first * 2u));
+            return;
+        }
+        if (mode == 4u && g_gl_depth_mask) {
+            glDepthMask(GL_FALSE);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+            glDepthMask(GL_TRUE);
+            return;
+        }
+    }
+#if !defined(__vita__)
+    // Diagnostic (PC): fragment shader invocations per kind of draw, i.e. the
+    // fragment work a tile GPU without early rejection would do.
+    static const bool fragment_stats = std::getenv("PSPRECOMP_BURNOUT_FRAG_STATS") != nullptr;
+    if (fragment_stats) {
+        static std::vector<GLuint> pool;
+        static std::vector<std::uint32_t> kinds;
+        static std::size_t used = 0;
+        static double totals[4]{}, draws[4]{};
+        static std::uint32_t frames = 0;
+        if (used == pool.size()) {
+            pool.resize(pool.size() + 64u);
+            glGenQueries(64, pool.data() + used);
+            kinds.resize(pool.size());
+        }
+        const bool atest = (g_current_key >> 17u & 1u) != 0u;
+        const bool textured = (g_current_key >> 10u & 1u) != 0u;
+        kinds[used] = atest ? (textured ? 0u : 1u) : (textured ? 2u : 3u);
+        glBeginQuery(0x82F4 /* GL_FRAGMENT_SHADER_INVOCATIONS_ARB */, pool[used]);
+        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+        glEndQuery(0x82F4);
+        ++used;
+        if (used >= 4096u || g_fragment_stats_flush) {
+            for (std::size_t i = 0; i < used; ++i) {
+                unsigned long long value = 0;
+                glGetQueryObjectui64v(pool[i], 0x8866 /* GL_QUERY_RESULT */, &value);
+                totals[kinds[i]] += static_cast<double>(value);
+                draws[kinds[i]] += 1.0;
+            }
+            used = 0;
+        }
+        if (g_fragment_stats_flush) {
+            g_fragment_stats_flush = false;
+            if (++frames % 300u == 0u) {
+                const double px = 1024.0 * 544.0 * 300.0;
+                std::fprintf(stderr,
+                             "[frag] per frame, in screens of 1024x544: alpha-tested textured %.2f (%.0f draws), alpha-tested "
+                             "untextured %.2f (%.0f), textured %.2f (%.0f), untextured %.2f (%.0f)\n",
+                             totals[0] / px, draws[0] / 300.0, totals[1] / px, draws[1] / 300.0, totals[2] / px,
+                             draws[2] / 300.0, totals[3] / px, draws[3] / 300.0);
+                for (int i = 0; i < 4; ++i) totals[i] = draws[i] = 0.0;
+            }
+        }
+        return;
+    }
+#endif
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
 }
 
@@ -2834,7 +2930,11 @@ void replay(const Frame &frame) {
         case Op::BlendFunc: glBlendFunc(op[0], op[1]); op += 2; break;
         case Op::BlendEquation: glBlendEquation(op[0]); op += 1; break;
         case Op::DepthFunc: glDepthFunc(op[0]); op += 1; break;
-        case Op::DepthMask: glDepthMask(op[0] != 0u ? GL_TRUE : GL_FALSE); op += 1; break;
+        case Op::DepthMask:
+            g_gl_depth_mask = op[0] != 0u;
+            glDepthMask(op[0] != 0u ? GL_TRUE : GL_FALSE);
+            op += 1;
+            break;
         case Op::ColorMask: {
             const GLboolean rgb = op[0] != 0u ? GL_TRUE : GL_FALSE;
             glColorMask(rgb, rgb, rgb, op[1] != 0u ? GL_TRUE : GL_FALSE);
@@ -2862,8 +2962,20 @@ void replay(const Frame &frame) {
             g_bound_scale = op[0] < g_framebuffer_scales.size() ? g_framebuffer_scales[op[0]] : g_scale;
             op += 1;
             break;
-        case Op::BindTexture: glBindTexture(GL_TEXTURE_2D, gl_texture(op[0])); op += 1; break;
-        case Op::TexParameter: glTexParameteri(GL_TEXTURE_2D, op[0], static_cast<GLint>(op[1])); op += 2; break;
+        case Op::BindTexture:
+            g_gl_bound_texture = gl_texture(op[0]);
+            glBindTexture(GL_TEXTURE_2D, g_gl_bound_texture);
+            op += 1;
+            break;
+        case Op::TexParameter:
+            if (g_gpu_probe) {
+                auto &filters = g_gl_filters[g_gl_bound_texture];
+                if (op[0] == GL_TEXTURE_MIN_FILTER) filters[0] = static_cast<GLint>(op[1]);
+                if (op[0] == GL_TEXTURE_MAG_FILTER) filters[1] = static_cast<GLint>(op[1]);
+            }
+            glTexParameteri(GL_TEXTURE_2D, op[0], static_cast<GLint>(op[1]));
+            op += 2;
+            break;
         case Op::TexImage:
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), 0, GL_RGBA,
                          GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
@@ -2893,6 +3005,7 @@ void replay(const Frame &frame) {
         case Op::Present: {
             const double started = host_now_ms();
             present_target(op[0], static_cast<int>(op[1]));
+            g_fragment_stats_flush = true;
             g_gl_present_ms.store(g_gl_present_ms.load() + host_now_ms() - started);
             op += 2;
             break;
@@ -3275,7 +3388,12 @@ void present(std::uint32_t address) {
     splice_deferred();
     phase = 11u;
     ++g_stats.frames;
-    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 2u), std::memory_order_relaxed);
+    if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 5u), std::memory_order_relaxed);
+    static const char *fixed_probe = std::getenv("PSPRECOMP_BURNOUT_PROBE_MODE");
+    if (fixed_probe != nullptr) {
+        g_gpu_probe = true;
+        g_probe_mode.store(static_cast<std::uint32_t>(std::atoi(fixed_probe)), std::memory_order_relaxed);
+    }
     if (g_stats.frames <= 3u) {
         char line[64];
         std::snprintf(line, sizeof(line), "frame %llu", static_cast<unsigned long long>(g_stats.frames));
@@ -3302,7 +3420,7 @@ void present(std::uint32_t address) {
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       (g_gl_busy_ms.load() - last_busy) / n,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
-                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 2u) : -1);
+                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 5u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),

@@ -75,7 +75,7 @@ using GLsizeiptr = std::ptrdiff_t;
     X(GLenum, glCheckFramebufferStatus, (GLenum target))                                                 \
     X(void, glBlendEquation, (GLenum mode))                                                              \
     X(void, glActiveTexture, (GLenum texture))                                                           \
-    X(void, glGenerateMipmap, (GLenum target))
+    X(void, glGenerateMipmap, (GLenum target))                                                               X(void, glGenQueries, (GLsizei n, GLuint *ids))                                                          X(void, glBeginQuery, (GLenum target, GLuint id))                                                        X(void, glEndQuery, (GLenum target))                                                                     X(void, glGetQueryObjectui64v, (GLuint id, GLenum name, unsigned long long *value))
 
 #define BURNOUT_GL_DECLARE(ret, name, args) \
     using PFN_##name = ret(APIENTRY *) args; \
