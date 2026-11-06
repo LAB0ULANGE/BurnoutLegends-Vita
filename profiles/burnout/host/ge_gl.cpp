@@ -527,6 +527,10 @@ struct RenderTarget {
     int width{}, height{};
     bool dynamic{};  // screen-sized, drawn at the dynamic resolution
     int draw_q{};    // eighths it was last drawn at
+    // Dynamic: one framebuffer and texture per level (g_scale, g_scale - 2, ...),
+    // all created with the target and never recreated (a recreated target is
+    // as slow as a full-size one on the Vita).
+    GLuint level_framebuffer[4]{}, level_texture[4]{};
     GLint sampling[4]{-1, -1, -1, -1};
 };
 
@@ -1005,10 +1009,26 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     // Screen-sized targets (the frame buffers) at the render scale; narrower
     // ones are the game's effect buffers, which offscreen_1x keeps at 1x.
     target.dynamic = g_dynamic_resolution && target.width >= 480;
-    const int scale = g_offscreen_1x && target.width < 480 ? 8 : target.dynamic && g_dynamic_q != 0 ? g_dynamic_q : g_scale;
+    int scale = g_offscreen_1x && target.width < 480 ? 8 : g_scale;
+    if (target.dynamic) {
+        const int current = g_dynamic_q != 0 ? g_dynamic_q : g_scale;
+        for (int i = 0; i < 4 && g_scale - 2 * i >= g_dynamic_min; ++i) {
+            const int q = g_scale - 2 * i;
+            target.level_framebuffer[i] = i == 0 ? target.framebuffer : g_next_framebuffer_id++;
+            target.level_texture[i] = i == 0 ? target.texture : g_next_texture_id++;
+            record(Op::CreateTarget, {target.level_framebuffer[i], target.level_texture[i], static_cast<std::uint32_t>(target.width),
+                                      static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(q)});
+            if (q == current) {
+                target.framebuffer = target.level_framebuffer[i];
+                target.texture = target.level_texture[i];
+                scale = q;
+            }
+        }
+    } else {
+        record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
+                                  static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(scale)});
+    }
     target.draw_q = scale;
-    record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
-                              static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(scale)});
     char line[96];
     std::snprintf(line, sizeof(line), "render target %06X: %dx%d at x%g", key, target.width, target.height, scale / 8.0);
     trace(line);
@@ -1490,12 +1510,14 @@ void flush() {
     } deferred_scope{deferred_draw};
     const int frame_q = g_dynamic_q != 0 ? g_dynamic_q : g_scale;
     if (target.dynamic && target.draw_q != frame_q) {
-        // Recreated at this frame's resolution (on the Vita's GPU a smaller
-        // part of a large target costs as much as the whole of it), then
-        // bound again with its viewport and scissor.
+        // Drawn into this level's framebuffer from now on (sampled before
+        // that, the previous level's texture is still the one used), bound
+        // with its viewport and scissor.
+        const int level = std::clamp((g_scale - frame_q) / 2, 0, 3);
+        target.framebuffer = target.level_framebuffer[level];
+        target.texture = target.level_texture[level];
         target.draw_q = frame_q;
-        record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
-                                  static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(frame_q)});
+        for (GLint &value : target.sampling) value = -1;
         g_state.framebuffer = ~0u;
         g_state.viewport_w = g_state.viewport_h = -1;
         g_state.scissor[0] = -1;
@@ -2822,20 +2844,20 @@ void update_dynamic_resolution() {
         g_dynamic_q = g_dynamic_pin;
     } else if (test) {
         // PC check: every level in turn, 60 frames each.
-        g_dynamic_q = g_scale - static_cast<int>((frames / 60u) % static_cast<std::uint64_t>(g_scale - g_dynamic_min + 1));
+        g_dynamic_q = g_scale - 2 * static_cast<int>((frames / 60u) % static_cast<std::uint64_t>((g_scale - g_dynamic_min) / 2 + 1));
     } else if (hold > 0) {
         --hold;
-    } else if (smooth > 2.0 && g_dynamic_q > g_dynamic_min) {
+    } else if (smooth > 2.0 && g_dynamic_q - 2 >= g_dynamic_min) {
         // The GPU is late: one step down, and that level stays out of reach
         // for ~10 s so the picture does not pump between two sizes.
-        ceiling = g_dynamic_q - 1;
+        ceiling = g_dynamic_q - 2;
         ceiling_frames = 300;
-        --g_dynamic_q;
+        g_dynamic_q -= 2;
         hold = 6;
         calm = 0;
     } else if (smooth < 0.6) {
-        if (++calm >= 45 && g_dynamic_q < ceiling) {
-            ++g_dynamic_q;
+        if (++calm >= 45 && g_dynamic_q + 2 <= ceiling) {
+            g_dynamic_q += 2;
             calm = 0;
             hold = 6;
         }
