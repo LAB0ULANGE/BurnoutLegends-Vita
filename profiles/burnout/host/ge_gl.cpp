@@ -2708,6 +2708,12 @@ std::vector<GLuint> g_gl_textures, g_gl_framebuffers;  // GL names by id (GL thr
 int g_scale{2};
 int halves(int value, int scale) noexcept { return value * scale / 2; }
 std::atomic<double> g_gl_busy_ms{0.0}, g_gl_present_ms{0.0};
+// GL thread breakdown (gl-74): draws issued, the vertex/index preparation
+// (index expansion and copies to GPU memory) and the draws past the budget.
+std::atomic<double> g_gl_upload_ms{0.0}, g_gl_draw_ms{0.0};
+std::atomic<std::uint64_t> g_gl_draws{0u}, g_gl_budget_dropped{0u};
+std::uint32_t g_draw_budget{[] { const char *v = std::getenv("PSPRECOMP_BURNOUT_DRAW_BUDGET"); return v != nullptr ? static_cast<std::uint32_t>(std::atoi(v)) : 0u; }()};  // test: draws past this in a frame are not drawn (0: all)
+std::uint32_t g_gl_frame_draws{};
 
 GLuint gl_texture(GLuint id) {
     if (id >= g_gl_textures.size()) g_gl_textures.resize(id + 1u, 0u);
@@ -2905,7 +2911,19 @@ void expand_indices(std::uint16_t *out, const std::uint32_t *runs, std::uint32_t
     }
 }
 
+void draw_body(const Frame &frame, const std::uint32_t *a, double started);
 void draw(const Frame &frame, const std::uint32_t *a) {
+    if (g_draw_budget != 0u && g_gl_frame_draws >= g_draw_budget) {
+        g_gl_budget_dropped.store(g_gl_budget_dropped.load() + 1u);
+        return;
+    }
+    ++g_gl_frame_draws;
+    g_gl_draws.store(g_gl_draws.load() + 1u);
+    const double started = host_now_ms();
+    draw_body(frame, a, started);
+    g_gl_draw_ms.store(g_gl_draw_ms.load() + host_now_ms() - started);
+}
+void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
     const std::uint32_t in_frame = a[0], source = a[1], bytes = a[2], stride = a[3], attribs_at = a[4];
     const std::uint32_t runs_at = a[5], run_words = a[6], explicit_at = a[7], index_count = a[8];
     const std::uint8_t *vertices = frame.data.data() + source;
@@ -2945,6 +2963,7 @@ void draw(const Frame &frame, const std::uint32_t *a) {
 #else
     (void)bytes;
 #endif
+    g_gl_upload_ms.store(g_gl_upload_ms.load() + host_now_ms() - started);
     for (GLuint i = 0; i < 4u; ++i) {
         const AttribSetup &setup = attribs[i];
         if (setup.size == 0) {
@@ -3211,6 +3230,7 @@ void replay(const Frame &frame) {
             break;
         }
         case Op::Present: {
+            g_gl_frame_draws = 0u;
             const double started = host_now_ms();
             present_target(op[0], static_cast<int>(op[1]));
             g_fragment_stats_flush = true;
@@ -3357,6 +3377,7 @@ void set_reorder_cutouts(bool enabled) { g_reorder_cutouts = g_reorder_cutouts |
 void set_blend_deferred_cutouts(bool enabled) { g_blend_deferred_cutouts = g_blend_deferred_cutouts || enabled; }
 void set_no_trees(bool enabled) { g_no_cutouts = g_no_cutouts || enabled; }
 void set_cutout_prepass(bool enabled) { g_cutout_prepass = g_cutout_prepass || enabled; }
+void set_draw_budget(unsigned budget) { g_draw_budget = budget; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }
@@ -3646,8 +3667,20 @@ void present(std::uint32_t address) {
                       static_cast<double>(g_stats.lit_vertices - last.lit_vertices) / n,
                       static_cast<unsigned long long>(g_stats.texture_uploads - last.texture_uploads));
         trace(line);
+        static double last_upload = 0.0, last_draw = 0.0;
+        static std::uint64_t last_draws = 0u, last_dropped = 0u;
+        const double busy = (g_gl_busy_ms.load() - last_busy) / n, present = (g_gl_present_ms.load() - last_present) / n;
+        const double upload = (g_gl_upload_ms.load() - last_upload) / n, draws_ms = (g_gl_draw_ms.load() - last_draw) / n;
+        std::snprintf(line, sizeof(line), "  GL thread: %.0f draws/frame (%.0f past budget %u), present %.1f, vertex+index upload %.1f, draw calls and state %.1f, other ops %.1f ms/frame",
+                      static_cast<double>(g_gl_draws.load() - last_draws) / n, static_cast<double>(g_gl_budget_dropped.load() - last_dropped) / n,
+                      g_draw_budget, present, upload, draws_ms - upload, busy - present - draws_ms);
+        trace(line);
+        last_upload = g_gl_upload_ms.load();
+        last_draw = g_gl_draw_ms.load();
+        last_draws = g_gl_draws.load();
+        last_dropped = g_gl_budget_dropped.load();
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
-                      (g_gl_busy_ms.load() - last_busy) / n,
+                      busy,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
                       g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
         trace(line);
