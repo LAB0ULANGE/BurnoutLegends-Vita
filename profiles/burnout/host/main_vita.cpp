@@ -71,6 +71,7 @@ constexpr bool kReorder = false;  // E: alpha-tested opaque draws after the opaq
 constexpr bool kMergeCutouts = false;  // cut-out PRIMs in world space, merged into few draws
 constexpr bool kMergeAll = false;  // ... and every unlit unblended PRIM
 constexpr bool kCutoutPrepass = false;  // gl-72: cut-outs depth-only with discard, then colour at EQUAL depth
+constexpr int kForceScale = 0;  // test builds: 3 = 720x408, 1 = 480x272 without the menu (0: settings)
 constexpr bool kBlendDeferred = false;  // F: those draws blend a 0/1 alpha instead of discarding
 constexpr bool kSoundCore2 = true;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
@@ -259,6 +260,7 @@ int main() {
     const std::string label = std::string(BURNOUT_VITA_LABEL).empty() ? std::string(kBuild)
                                                                       : std::string(kBuild) + " " + BURNOUT_VITA_LABEL;
     g_settings = burnout::boot_menu::run(kRoot, label);
+    if (kForceScale != 0) g_settings.render_scale = kForceScale;
     if (kSoundCore2) g_settings.sound_core1 = false;  // test: SAS mixer and audio beside the GL thread
     std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, shader cache %d\n", kBuild,
                  g_settings.auto_race ? "scripted test race" : "free play", g_settings.render_scale, g_settings.sound ? 1 : 0,
