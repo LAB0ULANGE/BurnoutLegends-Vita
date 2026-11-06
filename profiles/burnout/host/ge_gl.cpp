@@ -800,8 +800,17 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
 enum class Op : std::uint32_t {
     Enable, Disable, BlendFunc, BlendEquation, DepthFunc, DepthMask, ColorMask, FrontFace, Scissor, Viewport,
     UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, TexImageP8, Uniform4, UniformMatrix, Draw, CreateTarget,
-    Present, Capture, StencilFunc, StencilOp, StencilMask
+    Present, Capture, StencilFunc, StencilOp, StencilMask, Prepass
 };
+
+// Cut-out depth prepass (gl-72): an opaque alpha-tested textured draw that
+// writes depth is drawn twice: first depth only, with the alpha test's
+// discard, then in colour without discard where the depth is EQUAL. On the
+// Vita's PowerVR the costly punch-through pass then writes no colour, and the
+// colour pass gets hidden surface removal back.
+bool g_cutout_prepass{std::getenv("PSPRECOMP_BURNOUT_PREPASS") != nullptr};
+bool g_prepass_eligible{};  // decode thread: the draw being recorded qualifies
+std::uint64_t g_prepassed{};  // decode thread: such draws, for the gpu line
 
 // One vertex attribute of a Draw: an array in the batch, or a constant.
 struct AttribSetup {
@@ -1606,10 +1615,23 @@ void flush() {
     }
     if (alpha_testing) variant |= 1u << 17u | (alpha_test & 7u) << 18u;
     g_draw_is_cutout = alpha_testing && textured && !clear_mode && g_state.blend == 0;
+    g_prepass_eligible = false;
+    if (g_cutout_prepass && g_draw_is_cutout && !through) {
+        // Depth tested and written, full colour mask, no logic op or colour
+        // test, and a stencil that a second pass leaves as it is (always,
+        // replaced or kept where the depth test passes).
+        const std::uint32_t stencil_ops = cmd(0xDDu);
+        const bool stencil_ok = (cmd(0x24u) & 1u) == 0u ||
+                                ((cmd(0xDCu) & 7u) == 1u && ((stencil_ops >> 8u) & 7u) == 0u &&
+                                 (((stencil_ops >> 16u) & 7u) == 0u || ((stencil_ops >> 16u) & 7u) == 2u));
+        g_prepass_eligible = (cmd(0x23u) & 1u) != 0u && (cmd(0xE7u) & 1u) == 0u && (cmd(0xE8u) & 0xFFFFFFu) == 0u &&
+                             (cmd(0x28u) & 1u) == 0u && color_function == 1u && stencil_ok && g_state.color_mask != 0;
+    }
     if (alpha_testing && !clear_mode && g_state.blend == 0 && color_function == 1u &&
         (g_alpha_blend_test ||
          (g_blend_deferred_cutouts && g_recording_deferred))) {
         variant |= 1u << 26u;
+        g_prepass_eligible = false;
         set_capability(GL_BLEND, g_state.blend, true);
         set_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         set_blend_equation(GL_FUNC_ADD);
@@ -2096,6 +2118,10 @@ void bind_vertices() {
             cutouts = same = same_tex = between = vertices = 0;
             (void)frames_at;
         }
+    }
+    if (g_prepass_eligible) {
+        record(Op::Prepass, {1u});
+        ++g_prepassed;
     }
     record(Op::Draw, {in_frame, source, static_cast<std::uint32_t>(bytes), g_layout.stride,
                       record_data(attribs.data(), sizeof(attribs)),
@@ -2773,6 +2799,9 @@ void remember_variant(std::uint32_t key) {
 std::uint32_t g_current_key{};
 // GL thread state the probe modes change around a draw.
 bool g_gl_depth_mask{true};
+GLenum g_gl_depth_func{GL_LESS};
+GLboolean g_gl_color_rgb{GL_TRUE}, g_gl_color_alpha{GL_TRUE};
+bool g_prepass_next{};  // the next Draw is a cut-out drawn with a depth prepass
 GLuint g_gl_bound_texture{};
 std::unordered_map<GLuint, std::array<GLint, 2>> g_gl_filters;
 bool g_fragment_stats_flush{};
@@ -2926,6 +2955,25 @@ void draw(const Frame &frame, const std::uint32_t *a) {
         }
     }
     sync_uniforms();
+    if (g_prepass_next) {
+        g_prepass_next = false;
+        // Depth only, with the alpha test's discard...
+        const std::uint32_t key = g_current_key;
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+        glColorMask(g_gl_color_rgb, g_gl_color_rgb, g_gl_color_rgb, g_gl_color_alpha);
+        // ...then the colour where that depth is (same vertex shader: the
+        // same depths), by the variant without the alpha test.
+        glDepthFunc(GL_EQUAL);
+        glDepthMask(GL_FALSE);
+        use_program(key & ~(1u << 17u | 7u << 18u | 1u << 27u));
+        sync_uniforms();
+        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+        glDepthFunc(g_gl_depth_func);
+        glDepthMask(g_gl_depth_mask ? GL_TRUE : GL_FALSE);
+        use_program(key);
+        return;
+    }
     if (g_gpu_probe && (g_current_key >> 17u & 1u) != 0u && (g_current_key >> 10u & 1u) != 0u) {
         // Alpha-tested textured draws: 2 nearest filtering, 3 drawn as two
         // halves (twice the draws, same pixels), 4 no depth writes.
@@ -3074,7 +3122,12 @@ void replay(const Frame &frame) {
         case Op::Disable: glDisable(op[0]); op += 1; break;
         case Op::BlendFunc: glBlendFunc(op[0], op[1]); op += 2; break;
         case Op::BlendEquation: glBlendEquation(op[0]); op += 1; break;
-        case Op::DepthFunc: glDepthFunc(op[0]); op += 1; break;
+        case Op::DepthFunc:
+            g_gl_depth_func = op[0];
+            glDepthFunc(op[0]);
+            op += 1;
+            break;
+        case Op::Prepass: g_prepass_next = op[0] != 0u; op += 1; break;
         case Op::DepthMask:
             g_gl_depth_mask = op[0] != 0u;
             glDepthMask(op[0] != 0u ? GL_TRUE : GL_FALSE);
@@ -3082,7 +3135,9 @@ void replay(const Frame &frame) {
             break;
         case Op::ColorMask: {
             const GLboolean rgb = op[0] != 0u ? GL_TRUE : GL_FALSE;
-            glColorMask(rgb, rgb, rgb, op[1] != 0u ? GL_TRUE : GL_FALSE);
+            g_gl_color_rgb = rgb;
+            g_gl_color_alpha = op[1] != 0u ? GL_TRUE : GL_FALSE;
+            glColorMask(rgb, rgb, rgb, g_gl_color_alpha);
             op += 2;
             break;
         }
@@ -3293,6 +3348,7 @@ void set_merge_cutouts(bool enabled, bool all) {
 void set_reorder_cutouts(bool enabled) { g_reorder_cutouts = g_reorder_cutouts || enabled; }
 void set_blend_deferred_cutouts(bool enabled) { g_blend_deferred_cutouts = g_blend_deferred_cutouts || enabled; }
 void set_no_trees(bool enabled) { g_no_cutouts = g_no_cutouts || enabled; }
+void set_cutout_prepass(bool enabled) { g_cutout_prepass = g_cutout_prepass || enabled; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }
@@ -3589,8 +3645,8 @@ void present(std::uint32_t address) {
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
-                      "gpu: %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f as blending, %.0f deferred in %.0f runs, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
-                      g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.discards_dropped / n, g_gpu.alpha_blended / n, static_cast<double>(g_deferred_draws) / n, static_cast<double>(g_deferred_splices) / n, g_gpu.through / n,
+                      "gpu: %.0f prepassed, %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f as blending, %.0f deferred in %.0f runs, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
+                      static_cast<double>(g_prepassed) / n, g_gpu.switches / n, g_gpu.draws / n, g_gpu.blended / n, g_gpu.discards / n, g_gpu.discards_dropped / n, g_gpu.alpha_blended / n, static_cast<double>(g_deferred_draws) / n, static_cast<double>(g_deferred_splices) / n, g_gpu.through / n,
                       g_gpu.samples / n, g_gpu.textured / n, g_gpu.mipmapped / n, g_gpu.minmip / n, g_gpu.skinned / n, g_gpu.weights / n, g_gpu.skin_calls / n, g_gpu.skin_hits / n, g_gpu.skin_ms / n, g_gpu.copied / n / 1024.0);
         trace(line);
         std::vector<std::pair<std::uint32_t, TargetUse>> used(g_gpu.targets.begin(), g_gpu.targets.end());
@@ -3605,6 +3661,7 @@ void present(std::uint32_t address) {
         }
         trace(targets.c_str());
         g_gpu = GpuCounters{};
+        g_prepassed = 0u;
         g_deferred_draws = 0u;
         g_deferred_splices = 0u;
         last = g_stats;

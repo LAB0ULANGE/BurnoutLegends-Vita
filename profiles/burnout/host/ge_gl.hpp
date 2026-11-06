@@ -31,6 +31,8 @@ void set_stencil_ab(bool enabled);
 void set_gpu_probe(bool enabled);
 // Foliage (cut-out, mostly green scenery textures: trees, bushes) is not drawn.
 void set_no_trees(bool enabled);
+// gl-72: cut-outs drawn depth-only with discard, then in colour at EQUAL depth without it.
+void set_cutout_prepass(bool enabled);
 // Test: alpha-tested opaque draws after the opaque ones (punch-through last).
 void set_reorder_cutouts(bool enabled);
 // Test: unlit cut-out PRIMs transformed to world space as decoded, so they merge into few draws.
