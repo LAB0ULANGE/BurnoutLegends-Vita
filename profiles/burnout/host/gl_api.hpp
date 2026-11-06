@@ -66,6 +66,8 @@ using GLsizeiptr = std::ptrdiff_t;
     X(void, glEnableVertexAttribArray, (GLuint index))                                                   \
     X(void, glDisableVertexAttribArray, (GLuint index))                                                  \
     X(void, glGenFramebuffers, (GLsizei n, GLuint *framebuffers))                                        \
+    X(void, glDeleteFramebuffers, (GLsizei n, const GLuint *framebuffers))                               \
+    X(void, glDeleteRenderbuffers, (GLsizei n, const GLuint *renderbuffers))                             \
     X(void, glBindFramebuffer, (GLenum target, GLuint framebuffer))                                      \
     X(void, glFramebufferTexture2D, (GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)) \
     X(void, glGenRenderbuffers, (GLsizei n, GLuint *renderbuffers))                                      \

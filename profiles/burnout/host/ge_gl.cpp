@@ -1102,10 +1102,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             ++g_gpu.targets[target_key(address)].sampled;
             bind_texture_object(it->second.texture);
             set_sampling(it->second.sampling, linear, true, true);
-            // A target drawn below its allocated size fills the lower-left part.
-            const float f = it->second.dynamic ? static_cast<float>(it->second.draw_q) / static_cast<float>(g_scale) : 1.0f;
-            return {static_cast<float>(width) / static_cast<float>(it->second.width) * f,
-                    -static_cast<float>(height) / static_cast<float>(it->second.height) * f, 0.0f, f};
+            return {static_cast<float>(width) / static_cast<float>(it->second.width),
+                    -static_cast<float>(height) / static_cast<float>(it->second.height), 0.0f, 1.0f};
         }
     }
 
@@ -1491,8 +1489,12 @@ void flush() {
     } deferred_scope{deferred_draw};
     const int frame_q = g_dynamic_q != 0 ? g_dynamic_q : g_scale;
     if (target.dynamic && target.draw_q != frame_q) {
-        // Drawn at this frame's resolution: bound again, viewport and scissor recorded again.
+        // Recreated at this frame's resolution (on the Vita's GPU a smaller
+        // part of a large target costs as much as the whole of it), then
+        // bound again with its viewport and scissor.
         target.draw_q = frame_q;
+        record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
+                                  static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(frame_q)});
         g_state.framebuffer = ~0u;
         g_state.viewport_w = g_state.viewport_h = -1;
         g_state.scissor[0] = -1;
@@ -2865,7 +2867,23 @@ std::vector<int> g_framebuffer_scales;  // allocated, in eighths as g_scale
 std::vector<int> g_framebuffer_drawn;   // drawn at (dynamic resolution), 0: allocated
 int g_bound_scale{8};
 
+std::vector<GLuint> g_gl_depths;  // depth/stencil renderbuffer by framebuffer id
+
 void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int height) {
+    if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
+        // Recreated at another size (dynamic resolution): the old objects go.
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &g_gl_framebuffers[framebuffer_id]);
+        g_gl_framebuffers[framebuffer_id] = 0u;
+        if (framebuffer_id < g_gl_depths.size() && g_gl_depths[framebuffer_id] != 0u) {
+            glDeleteRenderbuffers(1, &g_gl_depths[framebuffer_id]);
+            g_gl_depths[framebuffer_id] = 0u;
+        }
+        if (texture_id < g_gl_textures.size() && g_gl_textures[texture_id] != 0u) {
+            glDeleteTextures(1, &g_gl_textures[texture_id]);
+            g_gl_textures[texture_id] = 0u;
+        }
+    }
     const GLuint texture = gl_texture(texture_id);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -2892,6 +2910,8 @@ void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int heig
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     if (framebuffer_id >= g_gl_framebuffers.size()) g_gl_framebuffers.resize(framebuffer_id + 1u, 0u);
     g_gl_framebuffers[framebuffer_id] = framebuffer;
+    if (framebuffer_id >= g_gl_depths.size()) g_gl_depths.resize(framebuffer_id + 1u, 0u);
+    g_gl_depths[framebuffer_id] = depth;
 }
 
 // Latest value of each uniform slot, versioned so a program only uploads what
@@ -3223,7 +3243,7 @@ void present_target(GLuint texture_id, int width, float fraction) {
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     if (texture_id != 0u) {
-        const float u = 480.0f / static_cast<float>(width) * fraction, v = fraction;
+        const float u = 480.0f / static_cast<float>(width), v = 1.0f;
         const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
         // Sharpened only when the picture is enlarged.
         const Program &present = fraction * static_cast<float>(g_scale) < 15.5f && g_present_sharp.id != 0u ? g_present_sharp : g_present;
