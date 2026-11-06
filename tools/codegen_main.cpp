@@ -1662,6 +1662,11 @@ std::string lower_known_vfpu_prefixes(std::string text, VfpuPrefixState &state) 
             lowered = std::regex_replace(lowered, write_d, "ctx.write_vfpu_vector_ct<$1u, $2u>($3);");
             lowered = std::regex_replace(lowered, helper_ct, "ctx.execute_vfpu_$1_ct<$2, true>();");
             lowered = std::regex_replace(lowered, lane_helper_ct, "ctx.execute_vfpu_$1_ct<$2, true>();");
+            static const std::regex vcmp_ct(R"(ctx\.execute_vfpu_vcmp_ct<([0-9]+u, [0-9]+u, [1-4]u, [0-9]+u)>\(\);)");
+            static const std::regex vcmov_ct(
+                R"(ctx\.execute_vfpu_vcmov_ct<([0-9]+u, [0-9]+u, [1-4]u, [0-7]u, (?:true|false))>\(\);)");
+            lowered = std::regex_replace(lowered, vcmp_ct, "ctx.execute_vfpu_vcmp_ct<$1, true>();");
+            lowered = std::regex_replace(lowered, vcmov_ct, "ctx.execute_vfpu_vcmov_ct<$1, true>();");
             lowered = std::regex_replace(lowered, destination_prefix_read,
                                          "constexpr std::uint32_t vfpu_destination_prefix = 0u;");
             lowered = std::regex_replace(lowered, eat, "");

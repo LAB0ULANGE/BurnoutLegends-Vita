@@ -1308,15 +1308,22 @@ struct alignas(16) AllegrexContext {
         write_vfpu_vector_dprefix_const<DestinationRegister, Length, destination_prefix>(result);
     }
 
+    // DefaultPrefixes: the code generator knows S/T/D are at their defaults,
+    // so no prefix is read and none needs resetting afterwards.
     template <std::uint32_t SourceRegister, std::uint32_t TargetRegister,
-              std::uint32_t Length, std::uint32_t Condition>
+              std::uint32_t Length, std::uint32_t Condition, bool DefaultPrefixes = false>
     PSPRECOMP_CONTEXT_FORCEINLINE void execute_vfpu_vcmp_ct() noexcept {
         static_assert(Length >= 1u && Length <= 4u);
         static_assert(Condition < 16u);
         float source[4]{};
         float target[4]{};
-        read_vfpu_vector_with_source_prefix_ct<SourceRegister, Length, 0u>(source);
-        read_vfpu_vector_with_source_prefix_ct<TargetRegister, Length, 1u>(target);
+        if constexpr (DefaultPrefixes) {
+            read_vfpu_vector_ct<SourceRegister, Length>(source);
+            read_vfpu_vector_ct<TargetRegister, Length>(target);
+        } else {
+            read_vfpu_vector_with_source_prefix_ct<SourceRegister, Length, 0u>(source);
+            read_vfpu_vector_with_source_prefix_ct<TargetRegister, Length, 1u>(target);
+        }
 
         auto compare_lane = [](float sv, float tv) -> bool {
             if constexpr (Condition == 0u) return false;
@@ -1355,7 +1362,7 @@ struct alignas(16) AllegrexContext {
         const std::uint32_t update = lane_bits | (static_cast<std::uint32_t>(any) << 4u) |
             (static_cast<std::uint32_t>(all) << 5u);
         vfpu_ctrl[3] = (vfpu_ctrl[3] & ~affected) | (update & affected);
-        eat_vfpu_prefixes();
+        if constexpr (!DefaultPrefixes) eat_vfpu_prefixes();
     }
 
     void execute_vfpu_vcmp(std::uint32_t source_register, std::uint32_t target_register,
@@ -1407,15 +1414,20 @@ struct alignas(16) AllegrexContext {
     }
 
     template <std::uint32_t DestinationRegister, std::uint32_t SourceRegister,
-              std::uint32_t Length, std::uint32_t ConditionIndex, bool MoveIfFalse>
+              std::uint32_t Length, std::uint32_t ConditionIndex, bool MoveIfFalse, bool DefaultPrefixes = false>
     PSPRECOMP_CONTEXT_FORCEINLINE void execute_vfpu_vcmov_ct() noexcept {
         static_assert(Length >= 1u && Length <= 4u);
         static_assert(ConditionIndex < 8u);
         float source[4]{};
         float destination[4]{};
-        read_vfpu_vector_with_source_prefix_ct<SourceRegister, Length, 0u>(source);
-        read_vfpu_vector_ct<DestinationRegister, Length>(destination);
-        apply_vfpu_source_prefix_ct<Length, 1u>(destination);
+        if constexpr (DefaultPrefixes) {
+            read_vfpu_vector_ct<SourceRegister, Length>(source);
+            read_vfpu_vector_ct<DestinationRegister, Length>(destination);
+        } else {
+            read_vfpu_vector_with_source_prefix_ct<SourceRegister, Length, 0u>(source);
+            read_vfpu_vector_ct<DestinationRegister, Length>(destination);
+            apply_vfpu_source_prefix_ct<Length, 1u>(destination);
+        }
 
         const std::uint32_t condition_code = vfpu_ctrl[3];
         if constexpr (ConditionIndex < 6u) {
@@ -1436,7 +1448,8 @@ struct alignas(16) AllegrexContext {
             if constexpr (Length >= 4u)
                 if ((((condition_code >> 3u) & 1u) != 0u) == want) destination[3] = source[3];
         }
-        write_vfpu_vector_with_destination_prefix_ct<DestinationRegister, Length>(destination);
+        if constexpr (DefaultPrefixes) write_vfpu_vector_ct<DestinationRegister, Length>(destination);
+        else write_vfpu_vector_with_destination_prefix_ct<DestinationRegister, Length>(destination);
     }
 
     void execute_vfpu_vcmov(std::uint32_t destination_register, std::uint32_t source_register,
