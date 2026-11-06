@@ -22,6 +22,8 @@ namespace burnout::gl {
 bool initialize(std::string &error);
 // Internal resolution as a multiple of the PSP's 480x272 (before initialize).
 void set_render_scale(float scale);
+// Vita: sharpen the picture as it is enlarged to the screen (render scale below 2).
+void set_present_sharpen(bool enabled);
 // Render targets narrower than the screen (the game's effect buffers) at 1x
 // whatever the render scale (before initialize).
 void set_offscreen_1x(bool enabled);

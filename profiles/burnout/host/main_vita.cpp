@@ -72,7 +72,8 @@ constexpr bool kMergeCutouts = false;  // cut-out PRIMs in world space, merged i
 constexpr bool kMergeAll = false;  // ... and every unlit unblended PRIM
 constexpr bool kCutoutPrepass = false;  // gl-72: cut-outs depth-only with discard, then colour at EQUAL depth
 constexpr unsigned kDrawBudget = 0;  // gl-74 test: draws past this per frame dropped (0: none)
-constexpr int kForceScale = 0;  // test builds: 3 = 720x408, 1 = 480x272 without the menu (0: settings)
+constexpr int kForceScale = 0;  // test builds: 4 = 840x476, 3 = 720x408, 1 = 480x272 without the menu (0: settings)
+constexpr bool kSharpen = false;  // sharpen the enlarged picture (render scale below 2)
 constexpr bool kBlendDeferred = false;  // F: those draws blend a 0/1 alpha instead of discarding
 constexpr bool kSoundCore2 = true;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
@@ -324,7 +325,7 @@ int main() {
         render.skip_when_behind = g_settings.skip_when_behind;
         render.offscreen_1x = g_settings.offscreen_1x;
         render.cache_sublists = g_settings.cache_sublists;
-        render.render_scale = g_settings.render_scale == 3 ? 1.5f : static_cast<float>(g_settings.render_scale);  // 2 = 960x544, 3 = 720x408, 1 = 480x272
+        render.render_scale = g_settings.render_scale == 3 ? 1.5f : g_settings.render_scale == 4 ? 1.75f : static_cast<float>(g_settings.render_scale);  // 2 = 960x544, 4 = 840x476, 3 = 720x408, 1 = 480x272
         if (g_settings.shader_cache) {
             const std::string cache = std::string(kRoot) + "shader_cache";
             sceIoMkdir(cache.c_str(), 0777);
@@ -334,6 +335,7 @@ int main() {
         render.variant_list = std::string(kRoot) + "shader_variants.txt";
         std::fprintf(stderr, "[vita] render scale %g\n", static_cast<double>(render.render_scale));
         std::fprintf(stderr, "[vita] starting the renderer\n");
+        burnout::gl::set_present_sharpen(kSharpen);
         burnout::render::configure(render);
         burnout::gl::set_stencil_ab(kStencilAB);
         burnout::gl::set_gpu_probe(kGpuProbe);

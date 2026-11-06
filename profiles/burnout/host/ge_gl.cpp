@@ -506,7 +506,16 @@ const char *kPresentFragmentShader = R"(
 uniform sampler2D u_texture;
 varying vec2 v_texcoord;
 void main() {
+#if SHARPEN
+    // Unsharp mask against the four neighbouring texels: the picture keeps
+    // its edges as it is enlarged to the screen.
+    vec3 c = texture2D(u_texture, v_texcoord).rgb;
+    vec3 n = texture2D(u_texture, v_texcoord + vec2(TEXEL_X, 0.0)).rgb + texture2D(u_texture, v_texcoord - vec2(TEXEL_X, 0.0)).rgb +
+             texture2D(u_texture, v_texcoord + vec2(0.0, TEXEL_Y)).rgb + texture2D(u_texture, v_texcoord - vec2(0.0, TEXEL_Y)).rgb;
+    gl_FragColor = vec4(clamp(c + STRENGTH * (c - 0.25 * n), 0.0, 1.0), 1.0);
+#else
     gl_FragColor = vec4(texture2D(u_texture, v_texcoord).rgb, 1.0);
+#endif
 }
 )";
 
@@ -977,11 +986,11 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     target.framebuffer = g_next_framebuffer_id++;
     // Screen-sized targets (the frame buffers) at the render scale; narrower
     // ones are the game's effect buffers, which offscreen_1x keeps at 1x.
-    const int scale = g_offscreen_1x && target.width < 480 ? 2 : g_scale;
+    const int scale = g_offscreen_1x && target.width < 480 ? 4 : g_scale;
     record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
                               static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(scale)});
     char line[96];
-    std::snprintf(line, sizeof(line), "render target %06X: %dx%d at x%g", key, target.width, target.height, scale / 2.0);
+    std::snprintf(line, sizeof(line), "render target %06X: %dx%d at x%g", key, target.width, target.height, scale / 4.0);
     trace(line);
     // The GL thread binds and clears it, and sets its sampling.
     forget_state();
@@ -2701,12 +2710,14 @@ struct GlThread {
 } g_gl;
 
 std::vector<GLuint> g_gl_textures, g_gl_framebuffers;  // GL names by id (GL thread)
-// Render targets are drawn at this multiple of the PSP resolution, in halves
-// (2 = 1x, 3 = 1.5x, 4 = 2x). Only the GL thread applies it: targets,
+// Render targets are drawn at this multiple of the PSP resolution, in
+// quarters (4 = 1x, 6 = 1.5x, 7 = 1.75x, 8 = 2x). Only the GL thread applies it: targets,
 // viewports and scissors are recorded in PSP pixels and the shader works in
 // normalized coordinates.
-int g_scale{2};
-int halves(int value, int scale) noexcept { return value * scale / 2; }
+int g_scale{4};
+int scaled(int value, int scale) noexcept { return value * scale / 4; }
+// Present: sharpen the picture as it is enlarged to the screen (below 2x).
+bool g_present_sharpen{std::getenv("PSPRECOMP_BURNOUT_SHARPEN") != nullptr};
 std::atomic<double> g_gl_busy_ms{0.0}, g_gl_present_ms{0.0};
 // GL thread breakdown (gl-74): draws issued, the vertex/index preparation
 // (index expansion and copies to GPU memory) and the draws past the budget.
@@ -2723,8 +2734,8 @@ GLuint gl_texture(GLuint id) {
 
 // GL thread: scale of each framebuffer id, and of the one bound (scissor and
 // viewport are recorded in PSP pixels).
-std::vector<int> g_framebuffer_scales;  // in halves, as g_scale
-int g_bound_scale{2};
+std::vector<int> g_framebuffer_scales;  // in quarters, as g_scale
+int g_bound_scale{4};
 
 void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int height) {
     const GLuint texture = gl_texture(texture_id);
@@ -3114,17 +3125,17 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
         glBindFramebuffer(GL_FRAMEBUFFER, g_gl_framebuffers[framebuffer_id]);
         // The visible 480x272 at the render scale, averaged back to PSP size.
         const int scale = framebuffer_id < g_framebuffer_scales.size() ? g_framebuffer_scales[framebuffer_id] : g_scale;
-        // (scale in halves: each PSP pixel is the box [x * s / 2, (x + 1) * s / 2).)
+        // (scale in quarters: each PSP pixel is the box [x * s / 4, (x + 1) * s / 4).)
         const auto s = static_cast<std::uint32_t>(scale);
-        const std::uint32_t w = 480u * s / 2u, h = 272u * s / 2u;
+        const std::uint32_t w = 480u * s / 4u, h = 272u * s / 4u;
         std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4u);
-        glReadPixels(0, halves(height - 272, scale), static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE,
+        glReadPixels(0, scaled(height - 272, scale), static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE,
                      rgba.data());
         rgb.resize(480u * 272u * 3u);
         for (std::uint32_t y = 0; y < 272u; ++y) {
-            const std::uint32_t fy = 271u - y, y0 = fy * s / 2u, y1 = (fy + 1u) * s / 2u;
+            const std::uint32_t fy = 271u - y, y0 = fy * s / 4u, y1 = (fy + 1u) * s / 4u;
             for (std::uint32_t x = 0; x < 480u; ++x) {
-                const std::uint32_t x0 = x * s / 2u, x1 = (x + 1u) * s / 2u;
+                const std::uint32_t x0 = x * s / 4u, x1 = (x + 1u) * s / 4u;
                 for (int c = 0; c < 3; ++c) {
                     std::uint32_t sum = 0u;
                     for (std::uint32_t sy = y0; sy < y1; ++sy)
@@ -3173,14 +3184,14 @@ void replay(const Frame &frame) {
         case Op::Scissor: {
             const GLsizei cut = 1;
             const int x = static_cast<int>(op[0]), y = static_cast<int>(op[1]);
-            const int x0 = halves(x, g_bound_scale), y0 = halves(y, g_bound_scale);
-            glScissor(x0, y0, (halves(x + static_cast<int>(op[2]), g_bound_scale) - x0) / cut,
-                      (halves(y + static_cast<int>(op[3]), g_bound_scale) - y0) / cut);
+            const int x0 = scaled(x, g_bound_scale), y0 = scaled(y, g_bound_scale);
+            glScissor(x0, y0, (scaled(x + static_cast<int>(op[2]), g_bound_scale) - x0) / cut,
+                      (scaled(y + static_cast<int>(op[3]), g_bound_scale) - y0) / cut);
         }
             op += 4;
             break;
         case Op::Viewport:
-            glViewport(0, 0, halves(static_cast<int>(op[0]), g_bound_scale), halves(static_cast<int>(op[1]), g_bound_scale));
+            glViewport(0, 0, scaled(static_cast<int>(op[0]), g_bound_scale), scaled(static_cast<int>(op[1]), g_bound_scale));
             op += 2;
             break;
         case Op::UseProgram: use_program(probe_key(op[0])); op += 1; break;
@@ -3222,7 +3233,7 @@ void replay(const Frame &frame) {
         case Op::Draw: draw(frame, op); op += 9; break;
         case Op::CreateTarget: {
             const int scale = static_cast<int>(op[4]);
-            create_target(op[0], op[1], halves(static_cast<int>(op[2]), scale), halves(static_cast<int>(op[3]), scale));
+            create_target(op[0], op[1], scaled(static_cast<int>(op[2]), scale), scaled(static_cast<int>(op[3]), scale));
             if (op[0] >= g_framebuffer_scales.size()) g_framebuffer_scales.resize(op[0] + 1u, g_scale);
             g_framebuffer_scales[op[0]] = scale;
             g_bound_scale = scale;  // create_target leaves it bound
@@ -3250,7 +3261,15 @@ void gl_thread_main() {
         if (ok) trace("compiling the draw shaders");
         ok = ok && link(g_uber, kVertexShader, kFragmentShader, false, error);
         if (ok) trace("compiling the present shaders");
-        ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error);
+        std::string present_defines = "#define SHARPEN 0\n";
+        if (g_present_sharpen && g_scale < 8) {
+            // The display target is 512x272 PSP pixels at the render scale.
+            char text[160];
+            std::snprintf(text, sizeof(text), "#define SHARPEN 1\n#define TEXEL_X %.8f\n#define TEXEL_Y %.8f\n#define STRENGTH 0.5\n",
+                          4.0 / (512.0 * g_scale), 4.0 / (272.0 * g_scale));
+            present_defines = text;
+        }
+        ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error, present_defines);
         if (ok) {
             trace("compiling the known program variants");
             for (const std::uint32_t key : kKnownVariants) use_program(key);
@@ -3364,7 +3383,8 @@ void flush_traces() {
     std::fflush(stderr);
 }
 
-void set_render_scale(float scale) { g_scale = std::clamp(static_cast<int>(std::lround(scale * 2.0f)), 2, 8); }
+void set_render_scale(float scale) { g_scale = std::clamp(static_cast<int>(std::lround(scale * 4.0f)), 4, 16); }
+void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
