@@ -2261,6 +2261,43 @@ const std::uint8_t *world_transform(const std::uint8_t *raw, std::uint32_t count
     const std::uint32_t pos_format = std::max<std::uint32_t>(pos, 1u);
     const float *m = g_world.data();
     g_world_vertices.resize(static_cast<std::size_t>(count) * to.stride);
+#if defined(__ARM_NEON)
+    // NEON: the rows as vectors, one multiply-add per row (the scalar chain
+    // below runs as dependent VFP multiply-adds on the Vita).
+    const float row0[4]{m[0], m[1], m[2], 0.0f}, row1[4]{m[3], m[4], m[5], 0.0f}, row2[4]{m[6], m[7], m[8], 0.0f},
+        row3[4]{m[9], m[10], m[11], 0.0f};
+    const float32x4_t r0 = vld1q_f32(row0), r1 = vld1q_f32(row1), r2 = vld1q_f32(row2), r3 = vld1q_f32(row3);
+    const std::size_t tc_bytes = sizes_tc[tc] * 2u, col_bytes = sizes_col[col];
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint8_t *in = raw + static_cast<std::size_t>(i) * from.stride;
+        std::uint8_t *out = g_world_vertices.data() + static_cast<std::size_t>(i) * to.stride;
+        std::memcpy(out + to.tc, in + from.tc, tc_bytes);
+        std::memcpy(out + to.col, in + from.col, col_bytes);
+        float px, py, pz;
+        if (pos_format == 2u) {
+            std::int16_t v[3];
+            std::memcpy(v, in + from.pos, sizeof(v));
+            px = static_cast<float>(v[0]) * pos_scale;
+            py = static_cast<float>(v[1]) * pos_scale;
+            pz = static_cast<float>(v[2]) * pos_scale;
+        } else {
+            px = component(in + from.pos, pos_format, 0u, true) * pos_scale;
+            py = component(in + from.pos, pos_format, 1u, true) * pos_scale;
+            pz = component(in + from.pos, pos_format, 2u, true) * pos_scale;
+        }
+        float result[4];
+        vst1q_f32(result, vmlaq_n_f32(vmlaq_n_f32(vmlaq_n_f32(r3, r0, px), r1, py), r2, pz));
+        std::memcpy(out + to.pos, result, 12u);
+        if (nrm != 0u) {
+            const float nx = component(in + from.nrm, nrm, 0u, true) * nrm_scale;
+            const float ny = component(in + from.nrm, nrm, 1u, true) * nrm_scale;
+            const float nz = component(in + from.nrm, nrm, 2u, true) * nrm_scale;
+            vst1q_f32(result, vmlaq_n_f32(vmlaq_n_f32(vmulq_n_f32(r0, nx), r1, ny), r2, nz));
+            std::memcpy(out + to.nrm, result, 12u);
+        }
+    }
+    return g_world_vertices.data();
+#endif
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint8_t *in = raw + static_cast<std::size_t>(i) * from.stride;
         std::uint8_t *out = g_world_vertices.data() + static_cast<std::size_t>(i) * to.stride;
