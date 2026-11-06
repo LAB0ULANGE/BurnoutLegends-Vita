@@ -9,6 +9,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace psprecomp {
@@ -79,8 +80,15 @@ public:
         // registers across it) nor the page table (one translation serves
         // every access off a base register). Byte, half and quad accesses
         // stay char-based (they alias everything, guest words included).
-        struct GuestWord { std::uint32_t value; };
-        struct PageEntry { std::uintptr_t offset; };
+        // (A struct around a uint32_t is not enough: GCC gives the member
+        // access the alias set of uint32_t, the type of the guest registers.
+        // The word is a 32-bit integer type distinct from uint32_t, the page
+        // entry a pointer, neither of which the CPU context holds.)
+        using GuestScalar = std::conditional_t<sizeof(unsigned long) == 4u && !std::is_same_v<std::uint32_t, unsigned long>,
+                                               unsigned long, std::uint32_t>;
+        struct GuestWord { GuestScalar value; };
+        struct PageEntry { std::uint8_t *offset; };
+        static_assert(sizeof(GuestWord) == 4u && sizeof(PageEntry) == sizeof(std::uintptr_t));
 #if defined(PSPRECOMP_AOT_PAGE_TABLE)
         // Page-table build: every canonical 2 MiB page maps to host memory
         // (RAM, the 2 MiB VRAM for each VRAM mirror, or a scratch page for
@@ -92,7 +100,7 @@ public:
         // of the 32-bit space (mirrors included), so the host pointer is
         // entry + address: a shift, a table load and the access itself.
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t *page_pointer(std::uint32_t address) const noexcept {
-            return reinterpret_cast<std::uint8_t *>(pages_[address >> 21u].offset + address);
+            return pages_[address >> 21u].offset + address;
         }
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
             return *page_pointer(address);
@@ -209,7 +217,7 @@ public:
 #if defined(PSPRECOMP_AOT_CHECK_BASED)
             check_based(base, offset);
 #endif
-            return reinterpret_cast<std::uint8_t *>(pages_[base >> 21u].offset + base) + offset;
+            return pages_[base >> 21u].offset + base + offset;
         }
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8_at(std::uint32_t base, std::int32_t offset) const {
             return *based_pointer(base, offset);

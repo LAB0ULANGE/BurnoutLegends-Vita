@@ -481,7 +481,7 @@ struct BasedReport {
 void GuestMemory::AotFastView::check_based(std::uint32_t base, std::int32_t offset) const noexcept {
     g_based_checks.fetch_add(1u, std::memory_order_relaxed);
     const std::uint32_t address = base + static_cast<std::uint32_t>(offset);
-    if (reinterpret_cast<std::uint8_t *>(pages_[base >> 21u].offset + base) + offset != page_pointer(address)) {
+    if (pages_[base >> 21u].offset + base + offset != page_pointer(address)) {
         if (g_based_mismatches.fetch_add(1u, std::memory_order_relaxed) < 20u)
             std::fprintf(stderr, "[memory] based access mismatch: base %08X offset %d\n", base, offset);
     }
