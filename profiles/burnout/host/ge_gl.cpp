@@ -2849,8 +2849,6 @@ void update_dynamic_resolution() {
             if (at_level[q] != 0u) line += " " + std::to_string(480 * q / 8) + ":" + std::to_string(at_level[q]);
         trace(line.c_str());
         for (auto &n : at_level) n = 0u;
-        const std::string memory = memory_report();
-        if (!memory.empty()) trace(memory.c_str());
     }
 }
 // GL thread breakdown (gl-74): draws issued, the vertex/index preparation
@@ -3406,6 +3404,14 @@ void replay(const Frame &frame) {
             present_target(op[0], static_cast<int>(op[1]), static_cast<float>(op[2]) / static_cast<float>(g_scale));
             g_fragment_stats_flush = true;
             g_gl_present_ms.store(g_gl_present_ms.load() + host_now_ms() - started);
+            {
+                // vitaGL's pools may only be walked from the GL thread.
+                static std::uint32_t presents = 0u;
+                if (++presents % 300u == 0u) {
+                    const std::string memory = memory_report();
+                    if (!memory.empty()) trace(memory.c_str());
+                }
+            }
             op += 3;
             break;
         }
