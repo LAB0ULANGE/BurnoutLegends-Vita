@@ -243,11 +243,15 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
 
 int main() {
 #if defined(BURNOUT_VITA_GL)
-    // Keep the previous session's log next to the new one.
-    std::remove((std::string(kLog) + ".prev").c_str());
-    std::rename(kLog, (std::string(kLog) + ".prev").c_str());
-#endif
+    // One log per build (ux0:data/burnout-gl-71m.log...), so several test
+    // builds run in a row keep their logs; the previous session's is kept.
+    const std::string log = std::string("ux0:data/burnout-") + kBuild + ".log";
+    std::remove((log + ".prev").c_str());
+    std::rename(log.c_str(), (log + ".prev").c_str());
+    std::freopen(log.c_str(), "w", stderr);
+#else
     std::freopen(kLog, "w", stderr);
+#endif
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     show_status(0xFF804000u);  // blue: running
 #if defined(BURNOUT_VITA_GL)
