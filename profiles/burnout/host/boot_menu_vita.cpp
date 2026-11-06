@@ -101,7 +101,7 @@ Settings load(const std::string &root) {
         while (std::fscanf(file, "%63s %d", key, &value) == 2) {
             const std::string name = key;
             if (name == "auto_race") settings.auto_race = value != 0;
-            else if (name == "render_scale") settings.render_scale = value == 1 ? 1 : 2;
+            else if (name == "render_scale") settings.render_scale = value == 1 || value == 3 ? value : 2;
             else if (name == "sound") settings.sound = value != 0;
             else if (name == "frame_skip") settings.frame_skip = value != 0;
             else if (name == "async_ge_v2") settings.async_ge = value != 0;
@@ -161,7 +161,7 @@ Settings run(const std::string &root, const std::string &build) {
 
     // Each value is the index of the choice shown.
     int mode = flag(settings.auto_race);
-    int resolution = settings.render_scale == 1 ? 1 : 0;
+    int resolution = settings.render_scale == 1 ? 2 : settings.render_scale == 3 ? 1 : 0;
     int sound = flag(!settings.sound);
     int skip = flag(!settings.frame_skip);
     int shaders = flag(settings.shader_cache);
@@ -172,7 +172,7 @@ Settings run(const std::string &root, const std::string &build) {
     int start = 0;
     const std::vector<Item> items = {
         {"Mode", {"Jeu libre", "Course test auto"}, &mode, "Course test: menus joues seuls jusqu'a une course."},
-        {"Resolution", {"960x544 (Vita)", "480x272 (PSP)"}, &resolution, "480x272: soulage le GPU, image plus floue."},
+        {"Resolution", {"960x544 (Vita)", "720x408", "480x272 (PSP)"}, &resolution, "Plus bas: soulage le GPU, image plus floue."},
         {"Son/musique", {"Oui", "Non"}, &sound, "Sans le son, le jeu tourne un peu plus vite."},
         {"Saut d'images", {"Oui", "Non"}, &skip, "Saute une image si le rendu prend du retard."},
         {"Attendre GPU", {"Non (vitesse)", "Oui"}, &behind, "Non: le jeu garde sa vitesse, des images sautent."},
@@ -230,7 +230,7 @@ Settings run(const std::string &root, const std::string &build) {
     }
 
     settings.auto_race = mode == 1;
-    settings.render_scale = resolution == 1 ? 1 : 2;
+    settings.render_scale = resolution == 2 ? 1 : resolution == 1 ? 3 : 2;
     settings.sound = sound == 0;
     settings.frame_skip = skip == 0;
     settings.shader_cache = shaders == 1;

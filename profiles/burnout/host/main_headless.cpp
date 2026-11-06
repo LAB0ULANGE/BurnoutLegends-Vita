@@ -88,7 +88,7 @@ Cli parse(int argc, char **argv) {
             std::string error;
             burnout::audio::start(0, value(), error);
         }
-        else if (key == "--scale") cli.render.render_scale = std::stoi(value());  // internal resolution x480x272
+        else if (key == "--scale") cli.render.render_scale = std::stof(value());  // internal resolution x480x272
         else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
             cli.render.enabled = true;
             const std::string range = value();

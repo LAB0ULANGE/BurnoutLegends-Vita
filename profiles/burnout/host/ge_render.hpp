@@ -39,8 +39,8 @@ struct Options {
     // OpenGL: unchanged leaf sub-lists forwarded from a copy instead of
     // walked (ge_cached_call).
     bool cache_sublists{};
-    // OpenGL: internal resolution, a multiple of 480x272.
-    int render_scale{1};
+    // OpenGL: internal resolution, a multiple of 480x272 (whole or half: 1.5 = 720x408).
+    float render_scale{1.0f};
     // OpenGL (Vita): compiled shader programs kept in this directory (empty:
     // compiled at every launch).
     std::filesystem::path shader_cache_dir;

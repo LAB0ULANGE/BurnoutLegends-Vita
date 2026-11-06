@@ -63,14 +63,14 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-72a";
+constexpr const char *kBuild = "gl-73";
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
 constexpr bool kReorder = false;  // E: alpha-tested opaque draws after the opaque scenery
 constexpr bool kMergeCutouts = false;  // cut-out PRIMs in world space, merged into few draws
 constexpr bool kMergeAll = false;  // ... and every unlit unblended PRIM
-constexpr bool kCutoutPrepass = true;  // gl-72: cut-outs depth-only with discard, then colour at EQUAL depth
+constexpr bool kCutoutPrepass = false;  // gl-72: cut-outs depth-only with discard, then colour at EQUAL depth
 constexpr bool kBlendDeferred = false;  // F: those draws blend a 0/1 alpha instead of discarding
 constexpr bool kSoundCore2 = true;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
@@ -321,7 +321,7 @@ int main() {
         render.skip_when_behind = g_settings.skip_when_behind;
         render.offscreen_1x = g_settings.offscreen_1x;
         render.cache_sublists = g_settings.cache_sublists;
-        render.render_scale = g_settings.render_scale;  // 2 = 960x544, 1 = 480x272
+        render.render_scale = g_settings.render_scale == 3 ? 1.5f : static_cast<float>(g_settings.render_scale);  // 2 = 960x544, 3 = 720x408, 1 = 480x272
         if (g_settings.shader_cache) {
             const std::string cache = std::string(kRoot) + "shader_cache";
             sceIoMkdir(cache.c_str(), 0777);
@@ -329,7 +329,7 @@ int main() {
         }
         render.cached_gpu_memory = g_settings.cached_gpu_memory;
         render.variant_list = std::string(kRoot) + "shader_variants.txt";
-        std::fprintf(stderr, "[vita] render scale %d\n", render.render_scale);
+        std::fprintf(stderr, "[vita] render scale %g\n", static_cast<double>(render.render_scale));
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::render::configure(render);
         burnout::gl::set_stencil_ab(kStencilAB);
