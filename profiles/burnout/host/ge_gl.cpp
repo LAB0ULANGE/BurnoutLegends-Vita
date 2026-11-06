@@ -19,6 +19,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #if defined(_MSC_VER)
 #include <xmmintrin.h>
 #endif
@@ -645,6 +646,14 @@ bool g_blend_deferred_cutouts{std::getenv("PSPRECOMP_BURNOUT_BLEND_DEFERRED") !=
 bool g_no_cutouts{std::getenv("PSPRECOMP_BURNOUT_NO_CUTOUTS") != nullptr};
 bool g_draw_is_cutout{};
 bool g_texture_foliage{};
+// Far foliage thinning (gl-77): foliage PRIMs (cut-out, green textures in
+// VRAM) farther than g_thin_near from the camera are partly left out, more
+// of them past g_thin_far, chosen by vertex address so the same trees stay.
+bool g_thin_foliage{std::getenv("PSPRECOMP_BURNOUT_THIN_FOLIAGE") != nullptr};
+float g_thin_near{std::getenv("PSPRECOMP_BURNOUT_THIN_NEAR") != nullptr ? static_cast<float>(std::atof(std::getenv("PSPRECOMP_BURNOUT_THIN_NEAR"))) : 120.0f};
+float g_thin_far{std::getenv("PSPRECOMP_BURNOUT_THIN_FAR") != nullptr ? static_cast<float>(std::atof(std::getenv("PSPRECOMP_BURNOUT_THIN_FAR"))) : 240.0f};
+std::unordered_set<std::uint32_t> g_foliage_addresses;  // decode thread
+std::uint64_t g_thinned_prims{}, g_thinned_vertices{};
 float g_texture_clear{};  // the texture bind_texture last bound is foliage
 // Cut-out textures not drawn (trees): guest addresses; PC: PSPRECOMP_BURNOUT_SKIP_TEX=a,b,...
 std::vector<std::uint32_t> g_skipped_cutouts = [] {
@@ -1204,6 +1213,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                              b = static_cast<double>(sum[2]) / opaque;
                 texture.clear = static_cast<float>(clear_fraction);
                 texture.foliage = (address & 0x0F000000u) == 0x04000000u && clear_fraction >= 0.05 && g >= b * 1.4 && r <= g * 1.25 && g < 200.0;
+                if (texture.foliage) g_foliage_addresses.insert(address);
+                else g_foliage_addresses.erase(address);
                 if (std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr)
                     std::fprintf(stderr, "[texfmt] fmt %u clutfmt %u %ux%u levels %u swz %d minA %u clear %.3f rgb %.0f %.0f %.0f foliage %d addr %08X\n",
                                  format, cmd(0xC5u) & 3u, width, height, levels, swizzled ? 1 : 0, min_alpha, clear_fraction, r, g, b,
@@ -2514,6 +2525,54 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     const std::uint32_t vertex_count = count == 0u ? 0u : max_vertex + 1u;
     const std::uint8_t *raw = guest_bytes(memory, g_vertex_address, vertex_count * stride, true);
     if (raw == nullptr) { ++g_stats.skipped_primitives; return false; }
+    static const bool foliage_stats = std::getenv("PSPRECOMP_BURNOUT_FOLIAGE_STATS") != nullptr || g_thin_foliage;
+    if ((g_thin_foliage || foliage_stats) && weights == 0u && !through && (cmd(0x1Eu) & 1u) != 0u && (cmd(0x22u) & 1u) != 0u &&
+        (cmd(0xDBu) & 7u) != 1u && (cmd(0x21u) & 1u) == 0u && vertex_count != 0u &&
+        g_foliage_addresses.count((cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u)) != 0u) {
+        // Distance from the camera of the PRIM's first and last vertices (nearest).
+        const std::uint32_t pos = (psp_vtype >> 7u) & 3u;
+        const float pos_scale = pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f;
+        const std::uint32_t pos_format = std::max<std::uint32_t>(pos, 1u);
+        float nearest = 1e30f;
+        for (const std::uint32_t v : {0u, vertex_count - 1u}) {
+            const std::uint8_t *at = raw + static_cast<std::size_t>(v) * stride + psp_layout.pos;
+            const float p[3]{component(at, pos_format, 0u, true) * pos_scale, component(at, pos_format, 1u, true) * pos_scale,
+                             component(at, pos_format, 2u, true) * pos_scale};
+            float w[3], e[3];
+            for (int c = 0; c < 3; ++c) w[c] = p[0] * g_world[c] + p[1] * g_world[3 + c] + p[2] * g_world[6 + c] + g_world[9 + c];
+            for (int c = 0; c < 3; ++c) e[c] = w[0] * g_view[c] + w[1] * g_view[3 + c] + w[2] * g_view[6 + c] + g_view[9 + c];
+            nearest = std::min(nearest, std::sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]));
+        }
+        if (foliage_stats) {
+            static double bins[10]{}, vbins[10]{};
+            static std::uint64_t last_frame = 0;
+            int bin = 0;
+            for (float edge = 16.0f; bin < 9 && nearest >= edge; edge *= 2.0f) ++bin;
+            bins[bin] += 1.0;
+            vbins[bin] += vertex_count;
+            if (g_stats.frames != last_frame && g_stats.frames % 300u == 0u) {
+                last_frame = g_stats.frames;
+                std::fprintf(stderr, "[foliage] PRIMs (vertices) per frame by distance <16 <32 <64 <128 <256 <512 <1k <2k <4k more:");
+                for (int i = 0; i < 10; ++i) std::fprintf(stderr, " %.0f(%.0f)", bins[i] / 300.0, vbins[i] / 300.0);
+                std::fprintf(stderr, "; thinned %.0f PRIMs (%.0f vertices)\n", g_thinned_prims / 300.0, g_thinned_vertices / 300.0);
+                for (int i = 0; i < 10; ++i) bins[i] = vbins[i] = 0.0;
+                g_thinned_prims = g_thinned_vertices = 0u;
+            }
+        }
+        if (g_thin_foliage && nearest > g_thin_near) {
+            // Kept: 2 in 3 between near and far, 1 in 3 beyond.
+            const std::uint32_t h = (g_vertex_address * 2654435761u) >> 28u;  // 0..15, the same for the same object
+            const bool keep = nearest > g_thin_far ? h < 6u : h < 11u;
+            if (!keep) {
+                ++g_thinned_prims;
+                g_thinned_vertices += vertex_count;
+                if (index != 0u) g_index_address += count * (index == 1u ? 1u : 2u);
+                else g_vertex_address += count * stride;
+                phase = 0u;
+                return false;
+            }
+        }
+    }
     // Skinned vertices are blended here and drawn as plain float ones.
     std::uint32_t vtype = psp_vtype;
     const VertexLayout *source_layout = &psp_layout;
@@ -3464,6 +3523,12 @@ void set_dynamic_resolution(bool enabled, float min_scale) {
     g_dynamic_min = std::clamp(static_cast<int>(std::lround(min_scale * 8.0f)), 8, 32);
 }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
+void set_thin_foliage(bool enabled, float near_distance, float far_distance) {
+    if (!enabled) return;
+    g_thin_foliage = true;
+    g_thin_near = near_distance;
+    g_thin_far = far_distance;
+}
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }

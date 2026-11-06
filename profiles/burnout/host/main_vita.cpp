@@ -75,6 +75,8 @@ constexpr unsigned kDrawBudget = 0;  // gl-74 test: draws past this per frame dr
 constexpr int kForceScale = 0;  // test builds: 4 = 840x476, 3 = 720x408, 1 = 480x272 without the menu (0: settings)
 constexpr bool kSharpen = true;  // sharpen the enlarged picture (render scale below 2)
 constexpr bool kDynamicRes = true;  // 960x544 lowered towards 720x408 while the GPU is late
+constexpr bool kThinFoliage = false;  // gl-77: far foliage partly left out
+constexpr float kThinNear = 256.0f, kThinFar = 512.0f;
 constexpr bool kBlendDeferred = false;  // F: those draws blend a 0/1 alpha instead of discarding
 constexpr bool kSoundCore2 = true;  // test B: sound on core 2, the decode worker alone on core 1
 constexpr bool kStencilAB = false;  // diagnostic: stencil full/minimal/off, 600 frames each
@@ -338,6 +340,7 @@ int main() {
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::gl::set_present_sharpen(kSharpen);
         burnout::gl::set_dynamic_resolution(kDynamicRes, 1.5f);
+        burnout::gl::set_thin_foliage(kThinFoliage, kThinNear, kThinFar);
         burnout::render::configure(render);
         burnout::gl::set_stencil_ab(kStencilAB);
         burnout::gl::set_gpu_probe(kGpuProbe);

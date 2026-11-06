@@ -24,6 +24,8 @@ bool initialize(std::string &error);
 void set_render_scale(float scale);
 // Vita: sharpen the picture as it is enlarged to the screen (render scale below 2).
 void set_present_sharpen(bool enabled);
+// gl-77: foliage PRIMs past near_distance partly left out (2 in 3 kept), past far_distance more (1 in 3 kept).
+void set_thin_foliage(bool enabled, float near_distance, float far_distance);
 // Screen-sized targets drawn between min_scale and the render scale, by GPU load.
 void set_dynamic_resolution(bool enabled, float min_scale);
 // Render targets narrower than the screen (the game's effect buffers) at 1x
