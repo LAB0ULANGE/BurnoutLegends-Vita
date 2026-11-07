@@ -56,6 +56,8 @@ void configure(const Options &options);
 void cpu_wrote_vram(std::uint32_t address, std::uint32_t size);
 // The next presented frame is captured (PNG in the capture folder).
 void request_capture();
+// Block transfer copies made ahead and not yet used (memory diagnostics).
+std::size_t early_queue_size();
 [[nodiscard]] bool active() noexcept;
 // Emulation-thread time spent walking display lists (ge_scan with the hooks).
 void account_scan(double ms) noexcept;

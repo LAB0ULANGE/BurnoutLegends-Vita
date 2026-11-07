@@ -570,6 +570,11 @@ std::uint32_t g_scans{};       // ge_scan calls (list submissions and stall upda
 
 } // namespace
 
+std::size_t early_queue_size() {
+    std::lock_guard lock(g_early_mutex);
+    return g_early.size();
+}
+
 void request_capture() {
     g_capture_requested = true;
     gl::trace_next_frame();

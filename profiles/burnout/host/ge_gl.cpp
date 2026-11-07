@@ -1,5 +1,6 @@
 #include "core_load.hpp"
 #include "ge_gl.hpp"
+#include "ge_render.hpp"
 
 #include "gl_api.hpp"
 
@@ -4327,6 +4328,9 @@ void invalidate_textures(std::uint32_t address, std::uint32_t size) {
 // forever, and on the biggest track (US/C1) the Vita ran out of memory after
 // ~4 min (std::bad_alloc, gl-103d/f). One drawn again is uploaded anew.
 std::uint64_t g_textures_evicted{};
+#if defined(__vita__)
+extern "C" void *sbrk(std::ptrdiff_t increment);  // newlib (unistd.h does not declare it here)
+#endif
 void evict_textures() {
     if (g_stats.frames % 300u != 0u) return;
     for (auto it = g_textures.begin(); it != g_textures.end();) {
@@ -4408,11 +4412,18 @@ void present(std::uint32_t address) {
             // Texture memory (a heap exhausted after ~4 min of a race,
             // gl-103d/f). Only our own counts: asking vitaGL for its pools
             // from this thread crashed the Vita (gl-103h, C2-12828-1).
-            std::size_t texture_bytes = 0u;
+            // newlib's printf has no %zu: plain unsigned values. The heap
+            // top (sbrk(0)) only rises: it climbs if something leaks.
+            static const auto heap_base = reinterpret_cast<std::uintptr_t>(sbrk(0));
+            const auto heap_top = reinterpret_cast<std::uintptr_t>(sbrk(0));
+            unsigned long texture_bytes = 0u;
             for (const auto &entry : g_textures) texture_bytes += entry.second.bytes;
-            char memory_line[200];
-            std::snprintf(memory_line, sizeof(memory_line), "  memory: %zu textures (%zu KiB of PSP data), %llu deleted so far, %zu targets",
-                          g_textures.size(), texture_bytes / 1024u, static_cast<unsigned long long>(g_textures_evicted), g_targets.size());
+            char memory_line[240];
+            std::snprintf(memory_line, sizeof(memory_line),
+                          "  memory: heap top +%lu KiB; %lu textures (%lu KiB of PSP data), %lu deleted so far; %lu targets; skin cache %lu; early transfers queued %lu",
+                          static_cast<unsigned long>((heap_top - heap_base) / 1024u), static_cast<unsigned long>(g_textures.size()),
+                          texture_bytes / 1024u, static_cast<unsigned long>(g_textures_evicted), static_cast<unsigned long>(g_targets.size()),
+                          static_cast<unsigned long>(g_skin_cache.size()), static_cast<unsigned long>(render::early_queue_size()));
             trace(memory_line);
         }
 #endif
