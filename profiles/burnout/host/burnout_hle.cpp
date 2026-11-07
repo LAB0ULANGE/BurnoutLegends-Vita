@@ -11,6 +11,7 @@
 #include "core_load.hpp"
 #include "movie.hpp"
 #include "save_dialog.hpp"
+#include "psp_savedata.hpp"
 #include <sys/stat.h>
 #include <chrono>
 #include "burnout_hle.hpp"
@@ -2268,6 +2269,86 @@ void save_log(const std::string &line) {
     std::fflush(stderr);
 }
 
+std::vector<std::uint8_t> read_whole(const fs::path &path) {
+    std::vector<std::uint8_t> bytes;
+    if (std::FILE *in = std::fopen(path.string().c_str(), "rb")) {
+        std::uint8_t chunk[16384];
+        for (std::size_t n; (n = std::fread(chunk, 1u, sizeof(chunk), in)) > 0u;) bytes.insert(bytes.end(), chunk, chunk + n);
+        std::fclose(in);
+    }
+    return bytes;
+}
+
+bool write_whole(const fs::path &path, const std::uint8_t *data, std::size_t size) {
+    std::FILE *out = std::fopen(path.string().c_str(), "wb");
+    if (out == nullptr) return false;
+    const bool ok = std::fwrite(data, 1u, size, out) == size;
+    std::fclose(out);
+    return ok;
+}
+
+} // namespace
+
+// Saves of `game` kept by an older build as plain files under `old_root`
+// (no PARAM.SFO) are rewritten in the PSP format under `new_root`: same
+// folder name when free there, else the first free one of SAVE000..SAVE007.
+// The old root is renamed afterwards so it is done once.
+void migrate_plain_saves(const fs::path &old_root, const fs::path &new_root, const std::string &game) {
+    std::error_code ec;
+    if (!fs::is_directory(old_root, ec)) return;
+    fs::create_directories(new_root, ec);
+    std::vector<fs::path> sources;
+    for (const auto &entry : fs::directory_iterator(old_root, ec))
+        if (entry.is_directory(ec) && entry.path().filename().string().rfind(game, 0) == 0) sources.push_back(entry.path());
+    std::sort(sources.begin(), sources.end());
+    for (const auto &source : sources) {
+        const auto data = read_whole(source / "DATA.BIN");
+        if (data.empty()) continue;
+        std::string name = source.filename().string();
+        for (int i = 0; fs::exists(new_root / name, ec) && i < 8; ++i) {
+            char candidate[32];
+            std::snprintf(candidate, sizeof(candidate), "%sSAVE%03d", game.c_str(), i);
+            name = candidate;
+        }
+        if (fs::exists(new_root / name, ec)) {
+            save_log("migrate " + source.generic_string() + ": no free slot, left in place");
+            continue;
+        }
+        fs::create_directories(new_root / name, ec);
+        psp_savedata::Hash hash{};
+        const auto stored = psp_savedata::encrypt(data.data(), data.size(), hash);
+        psp_savedata::SfoInfo info;
+        info.title = "BURNOUT LEGENDS";
+        info.savedata_title = "Profil recomp";
+        info.directory = name;
+        const auto sfo = psp_savedata::build_sfo(info, "DATA.BIN", hash, {});
+        const bool ok = write_whole(new_root / name / "DATA.BIN", stored.data(), stored.size()) &&
+                        write_whole(new_root / name / "PARAM.SFO", sfo.data(), sfo.size());
+        save_log("migrate " + source.generic_string() + " -> " + (new_root / name).generic_string() + (ok ? "" : " FAILED"));
+    }
+    fs::rename(old_root, old_root.parent_path() / (old_root.filename().string() + "_migrated"), ec);
+}
+
+namespace {
+
+// Once, before the first save is written: a copy of the game's save folders
+// as they were (Adrenaline's, on the Vita), never overwritten afterwards.
+void backup_saves_once(const fs::path &root, const std::string &game) {
+    static bool done = false;
+    if (done || k.options.save_backup.empty()) return;
+    done = true;
+    std::error_code ec;
+    if (fs::exists(k.options.save_backup, ec)) return;
+    for (const auto &entry : fs::directory_iterator(root, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (!entry.is_directory(ec) || name.rfind(game, 0) != 0) continue;
+        fs::create_directories(k.options.save_backup / name, ec);
+        fs::copy(entry.path(), k.options.save_backup / name, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        save_log("backup " + name + " -> " + (k.options.save_backup / name).generic_string() + (ec ? " FAILED " + ec.message() : ""));
+    }
+    fs::create_directories(k.options.save_backup, ec);
+}
+
 constexpr std::uint32_t kSavedataPending = 0xFFFFFFFFu;  // the native dialog answers later
 std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t mode, const std::string &game, const std::string &save,
                                const std::string &file);
@@ -2327,6 +2408,15 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
             slot.title = "Profil " + std::to_string(i + 1u);
             slot.subtitle = "Burnout Legends";
             slot.detail = game + candidates[i];
+            psp_savedata::SfoInfo sfo;
+            if (slot.exists && psp_savedata::read_sfo(read_whole(data.parent_path() / "PARAM.SFO"), sfo)) {
+                // As the PSP lists them: the profile name, then its detail
+                // (play time, completion, points).
+                if (!sfo.savedata_title.empty()) slot.title = sfo.savedata_title;
+                const auto line = sfo.detail.find('\n');
+                if (!sfo.detail.empty()) slot.subtitle = sfo.detail.substr(0, line);
+                if (!sfo.detail.empty()) slot.detail = sfo.detail;
+            }
             struct stat info {};
             if (slot.exists && stat(data.string().c_str(), &info) == 0) slot.modified = info.st_mtime;
             if (focus < 0 && candidates[i] == chosen) focus = static_cast<int>(i);
@@ -2363,33 +2453,71 @@ std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t m
     const std::uint32_t buffer_size = memory.load32(params + 120u);
 
     if (mode == 0u || mode == 2u || mode == 4u) {  // AUTOLOAD / LOAD / LISTLOAD
-        std::FILE *in = std::fopen(path.string().c_str(), "rb");
-        if (in == nullptr) {
+        if (!fs::exists(path, ec)) {
             save_log("savedata load " + path.generic_string() + ": no data");
             return kSavedataNoData;
         }
-        std::uint8_t *host = memory.raw_pointer(buffer, buffer_size);
-        const std::size_t read = host ? std::fread(host, 1u, buffer_size, in) : 0u;
-        std::fclose(in);
+        // A file written by a PSP (or Adrenaline, or this port) is encrypted
+        // when its PARAM.SFO says so; an older plain one is read as it is.
+        std::vector<std::uint8_t> data = read_whole(path);
+        const auto sfo = read_whole(path.parent_path() / "PARAM.SFO");
+        std::string how = "plain";
+        if (psp_savedata::crypt_mode(sfo) == 1) {
+            std::vector<std::uint8_t> plain;
+            psp_savedata::Hash hash{}, recorded{};
+            psp_savedata::decrypt(data, plain, hash);
+            const bool listed = psp_savedata::file_hash(sfo, file, recorded);
+            how = listed && hash == recorded ? "decrypted" : "decrypted, HASH MISMATCH";
+            data = std::move(plain);
+        } else if (psp_savedata::crypt_mode(sfo) != 0) {
+            how = "UNSUPPORTED hash mode " + std::to_string(psp_savedata::crypt_mode(sfo));
+        }
+        const std::size_t read = std::min<std::size_t>(data.size(), buffer_size);
+        if (std::uint8_t *host = memory.raw_pointer(buffer, static_cast<std::uint32_t>(read)); host != nullptr && read != 0u)
+            std::memcpy(host, data.data(), read);
         memory.store32(params + 124u, static_cast<std::uint32_t>(read));
         k.loaded_save = save;
-        save_log("savedata load " + path.generic_string() + " " + std::to_string(read) + " bytes");
+        save_log("savedata load " + path.generic_string() + " " + std::to_string(read) + " bytes (" + how + ")");
         return 0u;
     }
     if (mode == 1u || mode == 3u || mode == 5u) {  // AUTOSAVE / SAVE / LISTSAVE
         const std::uint32_t size = std::min(memory.load32(params + 124u), buffer_size);
         const std::uint8_t *host = memory.raw_pointer(buffer, size);
+        backup_saves_once(root, game);
         fs::create_directories(path.parent_path(), ec);
-        std::size_t written = 0u;
-        bool opened = false;
-        if (std::FILE *out = std::fopen(path.string().c_str(), "wb")) {
-            opened = true;
-            if (host != nullptr) written = std::fwrite(host, 1u, size, out);
-            std::fclose(out);
+        // As the PSP firmware writes it (hash mode 1), so that a PSP or
+        // Adrenaline reads it too: the file encrypted, PARAM.SFO with the
+        // game's title and detail and the file's hash, signed; the icons.
+        const fs::path sfo_path = path.parent_path() / "PARAM.SFO";
+        const auto previous = read_whole(sfo_path);
+        psp_savedata::SfoInfo info;
+        psp_savedata::read_sfo(previous, info);
+        // SceUtilitySavedataParam.sfoParam: title @128, savedataTitle @256,
+        // detail @384, parentalLevel @1408 (kept as they were when empty).
+        if (const std::string title = memory.read_c_string(params + 128u, 128u); !title.empty()) {
+            info.title = title;
+            info.savedata_title = memory.read_c_string(params + 256u, 128u);
+            info.detail = memory.read_c_string(params + 384u, 1024u);
+            info.parental_level = memory.load8(params + 1408u);
+        }
+        if (info.title.empty()) info.title = "BURNOUT LEGENDS";
+        info.directory = game + save;
+        psp_savedata::Hash hash{};
+        const auto stored = host != nullptr ? psp_savedata::encrypt(host, size, hash) : std::vector<std::uint8_t>{};
+        const bool data_ok = host != nullptr && write_whole(path, stored.data(), stored.size());
+        const auto sfo = psp_savedata::build_sfo(info, file, hash, previous);
+        const bool sfo_ok = write_whole(sfo_path, sfo.data(), sfo.size());
+        // icon0 @1412, icon1 @1428, pic1 @1444, snd0 @1460: {buf, bufSize, size, unknown}.
+        static const char *const kExtras[4]{"ICON0.PNG", "ICON1.PMF", "PIC1.PNG", "SND0.AT3"};
+        for (std::uint32_t i = 0; i < 4u; ++i) {
+            const std::uint32_t at = params + 1412u + i * 16u;
+            const std::uint32_t extra = memory.load32(at), extra_size = memory.load32(at + 8u);
+            if (extra == 0u || extra_size == 0u) continue;
+            if (const std::uint8_t *bytes = memory.raw_pointer(extra, extra_size)) write_whole(path.parent_path() / kExtras[i], bytes, extra_size);
         }
         k.loaded_save = save;
         save_log("savedata save mode=" + std::to_string(mode) + " " + path.generic_string() + " " + std::to_string(size) +
-                 " bytes: " + (opened ? std::to_string(written) + " written" : std::string("CANNOT OPEN (") + ec.message() + ")"));
+                 " bytes: " + (data_ok && sfo_ok ? "written (PSP format) '" + info.savedata_title + "'" : std::string("WRITE FAILED")));
         return 0u;
     }
     save_log("savedata mode=" + std::to_string(mode) + " (not emulated)");

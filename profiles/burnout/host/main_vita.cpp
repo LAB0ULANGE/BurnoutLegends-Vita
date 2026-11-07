@@ -7,6 +7,8 @@
 // PSV-VSH-Menu, override the request; the report logs the clock obtained), and
 // writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
 // solid status colour: blue running, green done, red error.
+#include "burnout_hle.hpp"
+#include <filesystem>
 #include "core_load.hpp"
 #include "audio_out.hpp"
 #include "music.hpp"
@@ -50,7 +52,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0xdea0] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0xebfc] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -64,7 +66,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-102";
+constexpr const char *kBuild = "gl-103";
 constexpr bool kAllProbe = false;  // gl-90/91 tests: GPU probe on every draw, 600 frames per mode
 constexpr int kProbeSet = 1;  // 1: pixels (gl-90), 2: draws (gl-92), 3: geometry (gl-93)
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
@@ -208,7 +210,25 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
     options.elf = root + "EBOOT_DECRYPTED.ELF";
     options.usrdir = root + "USRDIR";
     options.disc_root = root;
-    options.memstick = root + "ms0";
+    // Saves are Adrenaline's: the PSP memory stick of the Vita, in the PSP
+    // format (shared with the PSP game). Before anything is written there,
+    // the game's save folders are copied once to backup_adrenaline; plain
+    // saves of builds before gl-103 (ms0/) are then moved there, encrypted.
+    options.memstick = "ux0:pspemu";
+    options.save_backup = root + "backup_adrenaline";
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path saves = "ux0:pspemu/PSP/SAVEDATA", backup = options.save_backup;
+        const fs::path old_saves = root + "ms0/PSP/SAVEDATA";
+        if (fs::is_directory(old_saves, ec) && !fs::exists(backup, ec)) {
+            fs::create_directories(backup, ec);
+            for (const auto &entry : fs::directory_iterator(saves, ec))
+                if (entry.path().filename().string().rfind("ULES00125", 0) == 0)
+                    fs::copy(entry.path(), backup / entry.path().filename(), fs::copy_options::recursive, ec);
+        }
+        burnout::migrate_plain_saves(old_saves, saves, "ULES00125");
+    }
     options.save_slot = static_cast<std::uint32_t>(g_settings.save_slot);
     options.script = script;
     options.max_vblanks = 9000u;

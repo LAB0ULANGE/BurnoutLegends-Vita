@@ -17,6 +17,7 @@ struct HleOptions {
     std::filesystem::path usrdir;      // PSP_GAME/USRDIR of the user's own disc
     std::filesystem::path disc_root;   // directory holding PARAM.SFO etc. (optional)
     std::filesystem::path memstick;    // writable stand-in for ms0:
+    std::filesystem::path save_backup; // copy of the save folders made before the first write (empty: none)
     // Save list dialogs (no system UI): load picks this entry of the game's
     // list when it exists (0 = first), a new save the first free entry.
     std::uint32_t save_slot{};
@@ -51,6 +52,10 @@ void prepare_boot_thread(psprecomp::Runtime &runtime, const std::string &boot_pa
 [[nodiscard]] std::uint64_t virtual_time_us() noexcept;
 [[nodiscard]] std::uint64_t vblank_count() noexcept;
 void print_hle_summary();
+
+// Plain saves of an older build (under old_root) rewritten in the PSP format
+// under new_root, once (old_root is then renamed *_migrated).
+void migrate_plain_saves(const std::filesystem::path &old_root, const std::filesystem::path &new_root, const std::string &game);
 // Host ms per frame each guest thread ran since the previous call (threads
 // above 0.05 ms), as "name ms, ...".
 [[nodiscard]] std::string thread_time_report(double frames);
