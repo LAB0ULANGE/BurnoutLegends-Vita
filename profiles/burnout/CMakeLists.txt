@@ -96,9 +96,26 @@ if(VITA)
             SceCtrl_stub SceSysmem_stub ScePower_stub SceKernelThreadMgr_stub SceProcessmgr_stub
             SceLibKernel_stub SceAudio_stub pthread m)
         vita_create_self(eboot_gl.bin burnout_vita_gl UNSAFE)
+        # LiveArea icon (128x128, 8-bit palette PNG): game-derived art, kept
+        # beside the game files, never in the repository.
+        set(BURNOUT_VITA_ICON "${CMAKE_SOURCE_DIR}/../original/vita_icon0.png" CACHE FILEPATH "LiveArea icon0.png")
+        set(BURNOUT_VITA_ICON_FILE)
+        # (vita.cmake quotes the -a paths: patched locally for "Burnout Legends".)
+        if(EXISTS "${BURNOUT_VITA_ICON}")
+            set(BURNOUT_VITA_ICON_FILE FILE "${BURNOUT_VITA_ICON}" sce_sys/icon0.png)
+        endif()
+        # LiveArea background and gate image (840x500 bg.png, 280x158
+        # startup.png, 8-bit palette) with their template.xml, same place.
+        set(BURNOUT_VITA_LIVEAREA "${CMAKE_SOURCE_DIR}/../original/vita_livearea" CACHE PATH "LiveArea contents folder")
+        if(EXISTS "${BURNOUT_VITA_LIVEAREA}/template.xml")
+            foreach(item bg.png startup.png template.xml)
+                list(APPEND BURNOUT_VITA_ICON_FILE FILE "${BURNOUT_VITA_LIVEAREA}/${item}" sce_sys/livearea/contents/${item})
+            endforeach()
+        endif()
         vita_create_vpk(burnout-gl.vpk ${BURNOUT_VITA_GL_TITLE_ID} eboot_gl.bin
             VERSION 01.00
-            NAME "${BURNOUT_VITA_GL_NAME}")
+            NAME "${BURNOUT_VITA_GL_NAME}"
+            ${BURNOUT_VITA_ICON_FILE})
     endif()
     return()
 endif()
