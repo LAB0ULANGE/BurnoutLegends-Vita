@@ -1030,10 +1030,13 @@ void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v, 
 std::uint32_t target_key(std::uint32_t address) noexcept { return address & 0x001FFFF0u; }
 extern int g_scale;
 
+void end_scene();  // gl-98 per-scene regions, below
+
 RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     auto [it, inserted] = g_targets.try_emplace(key);
     RenderTarget &target = it->second;
     if (!inserted) return target;
+    end_scene();  // its creation clears it: a GPU scene of its own
     target.width = static_cast<int>(std::max<std::uint32_t>(stride, 64u));
     target.height = 272;
     target.texture = g_next_texture_id++;
@@ -1488,7 +1491,51 @@ void splice_deferred() {
 }
 
 std::string trace_batch_box();  // diagnostic, defined after the batch layout
-int batch_max_x();  // through-mode batch: rightmost x (PSP pixels), -1 otherwise
+// Through-mode batch: rightmost x and top y (PSP pixels); false for 3D.
+bool batch_extent(int &x1, int &y0);
+
+// gl-98 per-scene regions (decode thread): the scene being recorded.
+struct SceneRegion {
+    std::size_t op_index{SIZE_MAX};  // its ValidRegion op in g_frame.ops
+    GLuint framebuffer{~0u};
+    int width{}, height{}, scale{8};
+    int x1{}, y0{};                  // PSP pixels reached
+    bool full{};
+};
+SceneRegion g_scene;
+std::uint64_t g_scene_count{}, g_scene_area{}, g_scene_full_area{};  // stats
+
+// Writes the ended scene's region into its placeholder. The GPU processes
+// columns [0, x1] and, as PSP rows sit upside down in the FBO, GXM rows
+// [0, height - y0]: the PSP rows from y0 down.
+void close_scene() {
+    if (g_scene.op_index != SIZE_MAX && g_scene.op_index + 2u < g_frame.ops.size()) {
+        const int full_w = g_scene.width * g_scene.scale / 8, full_h = g_scene.height * g_scene.scale / 8;
+        int w = full_w, h = full_h;
+        if (!g_scene.full) {
+            w = std::clamp((g_scene.x1 + 1) * g_scene.scale / 8 + 2, 1, full_w);
+            h = std::clamp((g_scene.height - g_scene.y0 + 1) * g_scene.scale / 8 + 2, 1, full_h);
+        }
+        g_frame.ops[g_scene.op_index + 1u] = static_cast<std::uint32_t>(w);
+        g_frame.ops[g_scene.op_index + 2u] = static_cast<std::uint32_t>(h);
+        static const long region_trace = [] {
+            const char *v = std::getenv("PSPRECOMP_BURNOUT_REGION_TRACE");
+            return v != nullptr ? std::atol(v) : -1L;
+        }();
+        if (region_trace >= 0 && g_stats.frames == static_cast<std::uint64_t>(region_trace))
+            std::fprintf(stderr, "[region] fb %u: %dx%d of %dx%d%s\n", g_scene.framebuffer, w, h, full_w, full_h, g_scene.full ? " (3D)" : "");
+        ++g_scene_count;
+        g_scene_area += static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+        g_scene_full_area += static_cast<std::uint64_t>(full_w) * static_cast<std::uint64_t>(full_h);
+    }
+    g_scene.op_index = SIZE_MAX;
+}
+
+// The GPU scene ends whatever is drawn next (swap, read back, new target).
+void end_scene() {
+    close_scene();
+    g_scene.framebuffer = ~0u;
+}
 
 void flush() {
     if (g_batch_runs.empty() || !g_drawing) {
@@ -1581,18 +1628,30 @@ void flush() {
         ++use.binds;
         ++g_gpu.switches;
     }
-    if (g_tight_regions && !(target.dynamic && g_valid_region) && target.region_x < target.width) {
-        // Grows to cover this draw (never shrinks); a 3D draw takes the whole width.
-        const int right = batch_max_x();
-        const int needed = right < 0 ? target.width : std::min(target.width, right + 1);
-        if (needed > target.region_x) {
-            target.region_x = needed;
-            char line[80];
-            std::snprintf(line, sizeof(line), "tight region: %d of %d columns (stride %d)", needed, target.width, target.width);
-            trace(line);
-            const int scale = target.dynamic ? target.draw_q : target.draw_q != 0 ? target.draw_q : g_scale;
-            record(Op::ValidRegion, {static_cast<std::uint32_t>(needed * scale / 8 + 1),
-                                     static_cast<std::uint32_t>(target.height * scale / 8)});
+    if (g_tight_regions && !(target.dynamic && g_valid_region)) {
+        // vitaGL begins a GPU scene at the first draw into another framebuffer
+        // than the scene's; the region it is given there must hold every draw
+        // until the next one. A placeholder op is patched when the scene ends.
+        if (g_scene.framebuffer != target.framebuffer) {
+            close_scene();
+            g_scene.op_index = g_frame.ops.size();
+            record(Op::ValidRegion, {0u, 0u});
+            g_scene.framebuffer = target.framebuffer;
+            g_scene.width = target.width;
+            g_scene.height = target.height;
+            g_scene.scale = target.dynamic ? target.draw_q : target.draw_q != 0 ? target.draw_q : g_scale;
+            g_scene.x1 = 0;
+            g_scene.y0 = target.height;
+            g_scene.full = false;
+        }
+        if (!g_scene.full) {
+            int x1 = 0, y0 = 0;
+            if (g_recording_deferred || !batch_extent(x1, y0)) {
+                g_scene.full = true;
+            } else {
+                g_scene.x1 = std::max(g_scene.x1, x1);
+                g_scene.y0 = std::min(g_scene.y0, y0);
+            }
         }
     }
     if (g_state.viewport_w != target.width || g_state.viewport_h != target.height) {
@@ -2019,20 +2078,32 @@ void copy_vertex(std::uint8_t *out, const std::uint8_t *in, const BatchLayout &t
 
 BatchLayout g_layout;
 
-int batch_max_x() {
-    if ((g_batch_vtype & 0x800000u) == 0u || g_batch_count == 0u) return -1;
+bool batch_extent(int &x1, int &y0) {
+    if ((g_batch_vtype & 0x800000u) == 0u || g_batch_count == 0u) return false;
     const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
     const std::uint32_t format = (g_batch_vtype >> 7u) & 3u;
-    float x1 = 0.0f;
+    float right = 0.0f, top = 1e9f;
     for (std::uint32_t i = 0; i < g_batch_count; ++i) {
         const std::uint8_t *p = vertices + i * g_layout.stride + g_layout.pos;
-        float x = 0.0f;
-        if (format == 3u) std::memcpy(&x, p, 4);
-        else if (format == 2u) { std::int16_t v; std::memcpy(&v, p, 2); x = v; }
-        else x = static_cast<std::int8_t>(p[0]);
-        x1 = std::max(x1, x);
+        float x = 0.0f, y = 0.0f;
+        if (format == 3u) {
+            std::memcpy(&x, p, 4);
+            std::memcpy(&y, p + 4, 4);
+        } else if (format == 2u) {
+            std::int16_t v[2];
+            std::memcpy(v, p, 4);
+            x = v[0];
+            y = v[1];
+        } else {
+            x = static_cast<std::int8_t>(p[0]);
+            y = static_cast<std::int8_t>(p[1]);
+        }
+        right = std::max(right, x);
+        top = std::min(top, y);
     }
-    return static_cast<int>(std::ceil(x1));
+    x1 = static_cast<int>(std::ceil(right));
+    y0 = std::max(0, static_cast<int>(std::floor(top)));
+    return true;
 }
 
 std::string trace_batch_box() {
@@ -4156,6 +4227,13 @@ void present(std::uint32_t address) {
             trace((std::string("  vitaGL scenes over ") + scenes).c_str());
         }
 #endif
+        if (g_tight_regions && g_scene_count != 0u) {
+            char text[128];
+            std::snprintf(text, sizeof(text), "  tight regions: %.1f scenes/frame, %.0f%% of their full area processed",
+                          static_cast<double>(g_scene_count) / n, 100.0 * static_cast<double>(g_scene_area) / static_cast<double>(g_scene_full_area));
+            trace(text);
+            g_scene_count = g_scene_area = g_scene_full_area = 0u;
+        }
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
                       "gpu: %.0f prepassed, %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f as blending, %.0f deferred in %.0f runs, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",
@@ -4187,6 +4265,7 @@ void present(std::uint32_t address) {
         phase = 0u;
         return;  // skipped frame: the screen keeps the previous one
     }
+    end_scene();
     record(Op::Present, {it != g_targets.end() ? it->second.texture : 0u,
                          it != g_targets.end() ? static_cast<std::uint32_t>(it->second.width) : 0u,
                          it != g_targets.end() ? static_cast<std::uint32_t>(it->second.draw_q) : static_cast<std::uint32_t>(g_scale)});
@@ -4201,6 +4280,7 @@ void capture(std::uint32_t address, std::function<void(std::vector<std::uint8_t>
     if (std::getenv("PSPRECOMP_BURNOUT_TARGET_TRACE") != nullptr)
         std::fprintf(stderr, "[tt] capture after frame %llu\n", static_cast<unsigned long long>(g_stats.frames));
     const auto it = g_targets.find(target_key(address));
+    end_scene();
     record(Op::Capture, {it != g_targets.end() ? it->second.framebuffer : 0u,
                          it != g_targets.end() ? static_cast<std::uint32_t>(it->second.height) : 272u,
                          static_cast<std::uint32_t>(g_frame.captures.size())});
