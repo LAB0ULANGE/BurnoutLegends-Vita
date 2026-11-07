@@ -29,6 +29,9 @@
 #endif
 
 #if defined(__vita__)
+#include <malloc.h>
+#endif
+#if defined(__vita__)
 #include <psp2/kernel/threadmgr.h>
 #include <pthread.h>
 #endif
@@ -556,6 +559,7 @@ struct Texture {
     GLint sampling[4]{-1, -1, -1, -1};
     std::uint32_t uploaded_w{}, uploaded_h{};  // size of the GL texture's level 0 (0: none yet)
     std::uint32_t rewrites{};      // uploads after a CPU or transfer write (a movie: every frame)
+    std::uint64_t last_frame{};    // last frame it was bound in (unused ones are deleted)
 };
 
 // Uniforms are recorded by slot; the GL thread keeps the latest value of each
@@ -870,7 +874,7 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
 enum class Op : std::uint32_t {
     Enable, Disable, BlendFunc, BlendEquation, DepthFunc, DepthMask, ColorMask, FrontFace, Scissor, Viewport,
     UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, TexImageP8, Uniform4, UniformMatrix, Draw, CreateTarget,
-    Present, Capture, StencilFunc, StencilOp, StencilMask, Prepass, ValidRegion
+    Present, Capture, StencilFunc, StencilOp, StencilMask, Prepass, ValidRegion, DeleteTexture
 };
 
 // Cut-out depth prepass (gl-72): an opaque alpha-tested textured draw that
@@ -1220,6 +1224,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                         (swizzled ? 1u : 0u) ^ (static_cast<std::uint64_t>(buffer_width) << 40u);
     if (paletted) key ^= (g_clut_hash ^ cmd(0xC5u)) * 31u;
     Texture &texture = g_textures[key];
+    texture.last_frame = g_stats.frames;
     const bool fresh = texture.name == 0u;
     if (fresh) {
         texture.name = g_next_texture_id++;
@@ -3766,6 +3771,15 @@ void replay(const Frame &frame) {
 #endif
             op += 2;
             break;
+        case Op::DeleteTexture:
+            if (op[0] < g_gl_textures.size() && g_gl_textures[op[0]] != 0u) {
+                if (g_gl_bound_texture == g_gl_textures[op[0]]) g_gl_bound_texture = 0u;
+                g_gl_filters.erase(g_gl_textures[op[0]]);
+                glDeleteTextures(1, &g_gl_textures[op[0]]);
+                g_gl_textures[op[0]] = 0u;
+            }
+            op += 1;
+            break;
         case Op::BindTexture:
             g_gl_bound_texture = gl_texture(op[0]);
             glBindTexture(GL_TEXTURE_2D, g_gl_bound_texture);
@@ -4311,11 +4325,31 @@ void invalidate_textures(std::uint32_t address, std::uint32_t size) {
         if (texture.address < address + size && address < texture.address + texture.bytes) texture.stale = true;
 }
 
+// Textures not drawn for ~30 s are deleted (every 10 s): every palette
+// variant and every piece of scenery streamed in during a long race was kept
+// forever, and on the biggest track (US/C1) the Vita ran out of memory after
+// ~4 min (std::bad_alloc, gl-103d/f). One drawn again is uploaded anew.
+std::uint64_t g_textures_evicted{};
+void evict_textures() {
+    if (g_stats.frames % 300u != 0u) return;
+    for (auto it = g_textures.begin(); it != g_textures.end();) {
+        if (g_stats.frames - it->second.last_frame > 900u) {
+            record(Op::DeleteTexture, {it->second.name});
+            ++g_textures_evicted;
+            it = g_textures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g_state.texture = ~0u;
+}
+
 void present(std::uint32_t address) {
     g_sun_box.valid = false;
     g_sun_copy = UINT32_MAX;
     flush();
     splice_deferred();
+    evict_textures();
     phase = 11u;
     ++g_stats.frames;
     if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 6u), std::memory_order_relaxed);
@@ -4372,6 +4406,19 @@ void present(std::uint32_t address) {
             char scenes[320];
             vglGetSceneStats(scenes, static_cast<int>(sizeof(scenes)));
             trace((std::string("  vitaGL scenes over ") + scenes).c_str());
+        }
+        {
+            // Memory (a heap exhausted after ~4 min of a race, gl-103d/f):
+            // newlib heap in use and free, vitaGL pools free, our tables.
+            const struct mallinfo heap = mallinfo();
+            char memory_line[320];
+            std::snprintf(memory_line, sizeof(memory_line),
+                          "  memory: heap used %d KiB, free %d KiB (arena %d KiB); vitaGL free ram %u cdram %u phycont %u KiB; "
+                          "%zu textures (%llu deleted), %zu targets, %zu frame blobs",
+                          heap.uordblks / 1024, heap.fordblks / 1024, heap.arena / 1024,
+                          static_cast<unsigned>(vglMemFree(VGL_MEM_RAM) / 1024u), static_cast<unsigned>(vglMemFree(VGL_MEM_VRAM) / 1024u),
+                          static_cast<unsigned>(vglMemFree(VGL_MEM_PHYCONT) / 1024u), g_textures.size(), static_cast<unsigned long long>(g_textures_evicted), g_targets.size(), g_frame.blobs.size());
+            trace(memory_line);
         }
 #endif
         if (g_tight_regions && g_scene_count != 0u) {
