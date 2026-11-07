@@ -1536,6 +1536,22 @@ struct SceneRegion {
 };
 SceneRegion g_scene;
 std::uint64_t g_scene_count{}, g_scene_area{}, g_scene_full_area{};  // stats
+// Depth and stencil across a target's scenes in a frame. vitaGL neither
+// stores nor reloads them between scenes, so a target left for another one
+// and drawn again starts with no depth: the car showroom draws its backdrop
+// (depth cleared), the paint's reflection into a small target, then the car,
+// depth-tested against nothing it could pass. A scene that tests depth or
+// stencil after an earlier scene of its target wrote them reloads them, and
+// that earlier scene stores them (third word of the ValidRegion op).
+struct DepthCarry {
+    std::uint64_t frame{~0ull};
+    std::size_t last_op{SIZE_MAX};  // ValidRegion op of the target's latest scene
+    std::size_t prev_op{SIZE_MAX};  // ... of the scene before it, if it left depth
+    bool written{};                 // the latest scene wrote depth or stencil (or loaded them)
+    bool loading{};                 // the latest scene reloads them
+};
+std::unordered_map<GLuint, DepthCarry> g_depth_carry;
+std::uint64_t g_depth_reloads{};  // stats: scenes that reload depth
 
 // Writes the ended scene's region into its placeholder. The GPU processes
 // columns [0, x1] and, as PSP rows sit upside down in the FBO, GXM rows
@@ -1667,7 +1683,14 @@ void flush() {
         if (g_scene.framebuffer != target.framebuffer) {
             close_scene();
             g_scene.op_index = g_frame.ops.size();
-            record(Op::ValidRegion, {0u, 0u});
+            record(Op::ValidRegion, {0u, 0u, 0u});
+            DepthCarry &carry = g_depth_carry[target.framebuffer];
+            const bool same_frame = carry.frame == g_stats.frames;
+            carry.prev_op = same_frame && carry.written ? carry.last_op : SIZE_MAX;
+            carry.frame = g_stats.frames;
+            carry.last_op = g_scene.op_index;
+            carry.written = false;
+            carry.loading = false;
             g_scene.framebuffer = target.framebuffer;
             g_scene.width = target.width;
             g_scene.height = target.height;
@@ -1762,6 +1785,8 @@ void flush() {
         const bool stencil = (clear & 0x200u) != 0u && stencil_mode() == 0u;
         set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
         if (stencil) set_stencil(GL_ALWAYS, 0u, 0xFFu, GL_REPLACE, GL_REPLACE, GL_REPLACE, 0xFFu);
+        // A clear writes depth and stencil: a later scene may test them.
+        if (g_tight_regions && g_scene.op_index != SIZE_MAX) g_depth_carry[g_scene.framebuffer].written = true;
         set_capability(GL_CULL_FACE, g_state.cull, false);
         uniform4(kBlendFix, 1.0f, 1.0f, 1.0f, 0.0f);
         uniform4(kAlphaOut, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -1790,6 +1815,20 @@ void flush() {
             stencil = (func & 7u) != 1u || marks((op >> 8u) & 7u) || marks((op >> 16u) & 7u);
         }
         set_capability(GL_STENCIL_TEST, g_state.stencil_test, stencil);
+        if (g_tight_regions && g_scene.op_index != SIZE_MAX) {
+            DepthCarry &carry = g_depth_carry[g_scene.framebuffer];
+            const bool depth_test = (cmd(0x23u) & 1u) != 0u && (cmd(0xDEu) & 7u) != 1u;
+            const bool stencil_test = stencil && (func & 7u) != 1u;
+            if ((depth_test || stencil_test) && !carry.loading && carry.prev_op != SIZE_MAX &&
+                carry.prev_op + 3u < g_frame.ops.size() && carry.last_op + 3u < g_frame.ops.size()) {
+                g_frame.ops[carry.prev_op + 3u] |= 2u;  // the earlier scene stores
+                g_frame.ops[carry.last_op + 3u] |= 1u;  // this one reloads
+                carry.loading = true;
+                carry.written = true;
+                ++g_depth_reloads;
+            }
+            if ((cmd(0xE7u) & 1u) == 0u || stencil) carry.written = true;
+        }
         if (stencil) {
             set_stencil(compare(func), (func >> 8u) & 0xFFu, (func >> 16u) & 0xFFu, stencil_op(op), stencil_op(op >> 8u),
                         stencil_op(op >> 16u), ~cmd(0xE9u) & 0xFFu);
@@ -1914,12 +1953,12 @@ void flush() {
             const bool samples_target = textured && (texture & 0x0F000000u) == 0x04000000u && g_targets.count(target_key(texture)) != 0u;
             std::fprintf(stderr,
                          "[tt] %u target %06X n=%u through=%d masked=%d blend=%d(%06X) sample=%s%06X tex=%08X clear=%d ztest=%d zf=%u zw=%d "
-                         "zscale=%g zoff=%g fog=%d tfunc=%05X alpha=%d/%06X cull=%d\n",
+                         "zscale=%g zoff=%g fog=%d(%g,%g,%06X) tfunc=%05X alpha=%d/%06X cull=%d\n",
                          index, target_key(address), g_batch_count, through ? 1 : 0, g_state.color_mask == 0 ? 1 : 0,
                          g_state.blend == 1 ? 1 : 0, cmd(0xDFu) & 0xFFFFFFu, samples_target ? "T" : "-",
                          samples_target ? target_key(texture) : 0u, textured ? texture : 0u, clear_mode ? 1 : 0,
                          (cmd(0x23u) & 1u) != 0u ? 1 : 0, cmd(0xDEu) & 7u, (cmd(0xE7u) & 1u) == 0u ? 1 : 0, float24(cmd(0x44u)),
-                         float24(cmd(0x47u)), fog ? 1 : 0, texfunc & 0x1FFFFu, alpha_enabled ? 1 : 0, alpha_test & 0xFFFFFFu,
+                         float24(cmd(0x47u)), fog ? 1 : 0, float24(cmd(0xCDu)), float24(cmd(0xCEu)), cmd(0xCFu) & 0xFFFFFFu, texfunc & 0x1FFFFu, alpha_enabled ? 1 : 0, alpha_test & 0xFFFFFFu,
                          (cmd(0x1Du) & 1u) != 0u ? 1 : 0);
             std::fprintf(stderr, "[tt]    scissor %u,%u-%u,%u region %u,%u-%u,%u offset %u,%u\n", (std::fprintf(stderr, "%s", trace_batch_box().c_str()), cmd(0xD4u)) & 0x3FFu, (cmd(0xD4u) >> 10u) & 0x3FFu,
                          cmd(0xD5u) & 0x3FFu, (cmd(0xD5u) >> 10u) & 0x3FFu, cmd(0x15u) & 0x3FFu, (cmd(0x15u) >> 10u) & 0x3FFu,
@@ -3766,8 +3805,9 @@ void replay(const Frame &frame) {
         case Op::ValidRegion:
 #if defined(__vita__)
             vglSetFramebufferValidRegion(static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]));
+            vglSetFramebufferDepthKeep((op[2] & 1u) != 0u ? GL_TRUE : GL_FALSE, (op[2] & 2u) != 0u ? GL_TRUE : GL_FALSE);
 #endif
-            op += 2;
+            op += 3;
             break;
         }
     }
@@ -4311,10 +4351,12 @@ void present(std::uint32_t address) {
 #endif
         if (g_tight_regions && g_scene_count != 0u) {
             char text[128];
-            std::snprintf(text, sizeof(text), "  tight regions: %.1f scenes/frame, %.0f%% of their full area processed",
-                          static_cast<double>(g_scene_count) / n, 100.0 * static_cast<double>(g_scene_area) / static_cast<double>(g_scene_full_area));
+            std::snprintf(text, sizeof(text), "  tight regions: %.1f scenes/frame, %.0f%% of their full area processed, %.2f depth reloads/frame",
+                          static_cast<double>(g_scene_count) / n, 100.0 * static_cast<double>(g_scene_area) / static_cast<double>(g_scene_full_area),
+                          static_cast<double>(g_depth_reloads) / n);
             trace(text);
             g_scene_count = g_scene_area = g_scene_full_area = 0u;
+            g_depth_reloads = 0u;
         }
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),

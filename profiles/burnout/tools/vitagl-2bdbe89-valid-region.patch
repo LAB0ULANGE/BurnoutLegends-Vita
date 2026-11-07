@@ -1,16 +1,17 @@
 diff --git a/source/framebuffers.c b/source/framebuffers.c
-index 15e59ea..4673a30 100644
+index 15e59ea..1fd4e6d 100644
 --- a/source/framebuffers.c
 +++ b/source/framebuffers.c
-@@ -216,6 +216,7 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
+@@ -216,6 +216,8 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
  			framebuffers[i].depthbuffer_state = DEPTHBUFFER_MISSING;
  			framebuffers[i].depthbuffer_ptr = NULL;
  			framebuffers[i].target = NULL;
 +			framebuffers[i].valid_w = framebuffers[i].valid_h = 0;
++			framebuffers[i].depth_keep = 0;
  			framebuffers[i].tex = NULL;
  		}
  		if (j >= n)
-@@ -322,6 +323,15 @@ void glBindFramebuffer(GLenum target, GLuint fb) {
+@@ -322,6 +324,21 @@ void glBindFramebuffer(GLenum target, GLuint fb) {
  	}
  }
  
@@ -23,11 +24,17 @@ index 15e59ea..4673a30 100644
 +	active_write_fb->valid_h = h;
 +}
 +
++void vglSetFramebufferDepthKeep(GLboolean load, GLboolean store) {
++	if (!active_write_fb)
++		return;
++	active_write_fb->depth_keep = (load ? 1 : 0) | (store ? 2 : 0);
++}
++
  void glBindRenderbuffer(GLenum target, GLuint rb) {
  	THREAD_SAFE()
  
 diff --git a/source/gxm.c b/source/gxm.c
-index 7bcce62..dd2149b 100644
+index 7bcce62..e75f46c 100644
 --- a/source/gxm.c
 +++ b/source/gxm.c
 @@ -22,6 +22,7 @@
@@ -81,11 +88,19 @@ index 7bcce62..dd2149b 100644
  			int r = sceGxmBeginScene(gxm_context, 0, gxm_render_target,
  				NULL, NULL,
  				gxm_sync_objects[gxm_back_buffer_index],
-@@ -661,6 +691,14 @@ void scene_reset(void) {
+@@ -661,6 +691,22 @@ void scene_reset(void) {
  				}
  			}
  #endif
 +			vgl_count_scene(active_write_fb->width, active_write_fb->height);
++			// burnout patch: depth/stencil kept across this target's scenes when asked
++			// (a target left for another one mid-frame and drawn again with depth tests).
++			if (active_write_fb->depthbuffer_ptr) {
++				sceGxmDepthStencilSurfaceSetForceLoadMode(active_write_fb->depthbuffer_ptr,
++					(active_write_fb->depth_keep & 1) ? SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED : SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED);
++				sceGxmDepthStencilSurfaceSetForceStoreMode(active_write_fb->depthbuffer_ptr,
++					(active_write_fb->depth_keep & 2) ? SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED : SCE_GXM_DEPTH_STENCIL_FORCE_STORE_DISABLED);
++			}
 +			SceGxmValidRegion valid_region;
 +			const SceGxmValidRegion *valid_ptr = NULL;
 +			if (active_write_fb->valid_w > 0 && active_write_fb->valid_h > 0) {
@@ -96,7 +111,7 @@ index 7bcce62..dd2149b 100644
  #ifdef HAVE_SHARED_RENDERTARGETS
  			render_target *fbo_rt = (render_target *)active_write_fb->target;
  #ifdef RECYCLE_RENDERTARGETS
-@@ -670,7 +708,7 @@ void scene_reset(void) {
+@@ -670,7 +716,7 @@ void scene_reset(void) {
  #else
  			int r = sceGxmBeginScene(gxm_context, 0, active_write_fb->target,
  #endif
@@ -105,7 +120,7 @@ index 7bcce62..dd2149b 100644
  					&active_write_fb->colorbuffer,
  					active_write_fb->depthbuffer_ptr);
  #ifdef LOG_ERRORS
-@@ -784,6 +822,7 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+@@ -784,6 +830,7 @@ void vglSwapBuffers(GLboolean has_commondialog) {
  #endif
  
  	vgl_framecount++;
@@ -114,27 +129,29 @@ index 7bcce62..dd2149b 100644
  #ifdef HAVE_DEBUG_INTERFACE
  	vgl_circular_pool_frame_peak = (uint32_t)circular_data_pool_ptr[vgl_circular_idx] - (uint32_t)circular_data_pool[vgl_circular_idx];
 diff --git a/source/shared.h b/source/shared.h
-index 6954fa3..2cfdf5c 100644
+index 6954fa3..3d3a166 100644
 --- a/source/shared.h
 +++ b/source/shared.h
-@@ -597,6 +597,7 @@ typedef struct {
+@@ -597,6 +597,8 @@ typedef struct {
  	GLboolean is_float;
  	uint8_t depthbuffer_state;
  	SceGxmRenderTarget *target;
 +	int valid_w, valid_h; // burnout patch: scene valid region (0 = whole target)
++	int depth_keep; // burnout patch: next scene's depth/stencil: 1 loaded from memory, 2 stored to memory
  	SceGxmColorSurface colorbuffer;
  	SceGxmDepthStencilSurface depthbuffer;
  	SceGxmDepthStencilSurface *depthbuffer_ptr;
 diff --git a/source/vitaGL.h b/source/vitaGL.h
-index eeec610..fb1e453 100644
+index eeec610..32076c7 100644
 --- a/source/vitaGL.h
 +++ b/source/vitaGL.h
-@@ -1280,6 +1280,8 @@ void vglSetupGarbageCollector(int priority, int affinity);
+@@ -1280,6 +1280,9 @@ void vglSetupGarbageCollector(int priority, int affinity);
  
  // Change the scenes per frame value to use for the display and fbos rendertargets. Default value: 1, 1.
  void vglSetupRenderTargetScenesNum(uint8_t display_size, uint8_t fbo_size);
 +int vglGetSceneStats(char *buf, int size); // burnout patch: "N frames: WxH scenes ..." since the last call (resets)
 +void vglSetFramebufferValidRegion(GLsizei w, GLsizei h); // burnout patch: tiles of the bound FBO's top-left w x h only (0: all)
++void vglSetFramebufferDepthKeep(GLboolean load, GLboolean store); // burnout patch: the bound FBO's next scene loads / stores its depth and stencil
  
  // Change what kind of vertex buffer objects are considered eligible for scratch memory usage in order to reduce allocation costs. Requires USE_SCRATCH_MEMORY.
  void vglSetupScratchMemory(GLboolean scratch_for_dynamic, GLboolean scratch_for_stream);
