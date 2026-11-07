@@ -30,6 +30,8 @@ void set_valid_region(bool enabled);
 void set_param_buffer_mib(int mib);
 // gl-90: GPU probe on every draw (log mode 100 normal, 101 32x32 scissor, 102 white texture, 103 no blending).
 void set_all_probe(bool enabled);
+// gl-91: probe set 2 (log 200 normal, 201 no draws, 202 no effect-buffer draws, 203 present without quad).
+void set_probe_set(int set);
 void set_only_current_level(bool enabled);  // test
 void set_present_sharpen(bool enabled);
 // gl-77: foliage PRIMs past near_distance partly left out (2 in 3 kept), past far_distance more (1 in 3 kept).

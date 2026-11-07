@@ -659,6 +659,11 @@ bool g_all_probe{std::getenv("PSPRECOMP_BURNOUT_ALL_PROBE") != nullptr};
 std::atomic<std::uint32_t> g_all_probe_mode{0u};
 GLint g_probe_scissor[4]{0, 0, 4096, 4096};
 GLuint g_probe_white{};
+// gl-91 second set (g_probe_set 2): 0 normal, 1 no draws at all, 2 no draws
+// into the effect buffers (narrower than 480), 3 present without its quad.
+int g_probe_set{1};
+GLuint g_probe_fb{};                 // framebuffer id bound on the GL thread
+std::vector<std::uint8_t> g_probe_effect;  // by framebuffer id: an effect buffer
 // Test F: deferred cut-outs (drawn after the opaque scenery) blend with a 0/1 alpha instead of discarding.
 bool g_blend_deferred_cutouts{std::getenv("PSPRECOMP_BURNOUT_BLEND_DEFERRED") != nullptr};
 // Test: cut-out draws (alpha-tested, not blended: trees, hedges, fences) are not drawn.
@@ -3283,7 +3288,11 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
         return;
     }
 #endif
-    if (g_all_probe) {
+    if (g_all_probe && g_probe_set == 2) {
+        const std::uint32_t mode = g_all_probe_mode.load(std::memory_order_relaxed);
+        if (mode == 1u) return;
+        if (mode == 2u && g_probe_fb < g_probe_effect.size() && g_probe_effect[g_probe_fb] != 0u) return;
+    } else if (g_all_probe) {
         const std::uint32_t mode = g_all_probe_mode.load(std::memory_order_relaxed);
         if (mode == 1u) {
             const GLboolean on = glIsEnabled(GL_SCISSOR_TEST);
@@ -3329,7 +3338,8 @@ void present_target(GLuint texture_id, int width, float fraction) {
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    if (texture_id != 0u) {
+    const bool probe_no_quad = g_all_probe && g_probe_set == 2 && g_all_probe_mode.load(std::memory_order_relaxed) == 3u;
+    if (texture_id != 0u && !probe_no_quad) {
         const float k = g_valid_region && g_dynamic_resolution ? fraction : 1.0f;  // drawn part of a valid-region target
         const float u = 480.0f / static_cast<float>(width) * k, v = k;
         const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
@@ -3441,6 +3451,7 @@ void replay(const Frame &frame) {
         case Op::UseProgram: use_program(probe_key(op[0])); op += 1; break;
         case Op::BindFramebuffer:
             glBindFramebuffer(GL_FRAMEBUFFER, op[0] < g_gl_framebuffers.size() ? g_gl_framebuffers[op[0]] : 0u);
+            g_probe_fb = op[0];
             g_bound_scale = op[1] != 0u ? static_cast<int>(op[1])
                             : op[0] < g_framebuffer_scales.size() ? g_framebuffer_scales[op[0]] : g_scale;
             if (op[0] >= g_framebuffer_drawn.size()) g_framebuffer_drawn.resize(op[0] + 1u, 0);
@@ -3495,6 +3506,9 @@ void replay(const Frame &frame) {
             g_bound_scale = scale;  // create_target leaves it bound
             if (op[0] >= g_framebuffer_region.size()) g_framebuffer_region.resize(op[0] + 1u, 0u);
             g_framebuffer_region[op[0]] = (op[4] & 0x200u) != 0u ? op[2] << 16 | op[3] : 0u;
+            if (op[0] >= g_probe_effect.size()) g_probe_effect.resize(op[0] + 1u, 0u);
+            g_probe_effect[op[0]] = op[2] < 480u ? 1u : 0u;
+            g_probe_fb = op[0];
             op += 5;
             break;
         }
@@ -3664,6 +3678,7 @@ void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
 void set_all_probe(bool enabled) { g_all_probe = g_all_probe || enabled; }
+void set_probe_set(int set) { g_probe_set = set; }
 void set_fragment_mediump(bool enabled) { g_fragment_mediump = enabled; }
 void set_merge_cutouts(bool enabled, bool all) {
     g_merge_cutouts = g_merge_cutouts || enabled;
@@ -4034,7 +4049,7 @@ void present(std::uint32_t address) {
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       busy,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
-                      g_all_probe ? 100 + static_cast<int>(((g_stats.frames - 1u) / 600u) % 4u)
+                      g_all_probe ? 100 * g_probe_set + static_cast<int>(((g_stats.frames - 1u) / 600u) % 4u)
                       : g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.

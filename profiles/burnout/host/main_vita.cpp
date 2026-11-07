@@ -50,7 +50,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x4bf0] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x5894] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -65,7 +65,8 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
 constexpr const char *kBuild = "gl-89";
-constexpr bool kAllProbe = false;  // gl-90 test: GPU probe on every draw, 600 frames per mode
+constexpr bool kAllProbe = false;  // gl-90/91 tests: GPU probe on every draw, 600 frames per mode
+constexpr int kProbeSet = 1;  // 1: pixels (gl-90), 2: scenes (gl-91)
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
@@ -358,6 +359,7 @@ int main() {
         burnout::gl::set_stencil_ab(kStencilAB);
         burnout::gl::set_gpu_probe(kGpuProbe);
         burnout::gl::set_all_probe(kAllProbe);
+        burnout::gl::set_probe_set(kProbeSet);
         burnout::gl::set_no_trees(kNoTrees);
         burnout::gl::set_fragment_mediump(kMediump);
         burnout::gl::set_reorder_cutouts(kReorder);
