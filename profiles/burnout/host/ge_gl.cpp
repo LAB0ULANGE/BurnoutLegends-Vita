@@ -1819,13 +1819,21 @@ void flush() {
             DepthCarry &carry = g_depth_carry[g_scene.framebuffer];
             const bool depth_test = (cmd(0x23u) & 1u) != 0u && (cmd(0xDEu) & 7u) != 1u;
             const bool stencil_test = stencil && (func & 7u) != 1u;
-            if ((depth_test || stencil_test) && !carry.loading && carry.prev_op != SIZE_MAX &&
+            // 3D draws only: the 2D glows drawn over a race test depth after the
+            // effect targets, and reloading it there cost ~1 ms a frame for
+            // no visible change.
+            if ((depth_test || stencil_test) && !through && !carry.loading && carry.prev_op != SIZE_MAX &&
                 carry.prev_op + 3u < g_frame.ops.size() && carry.last_op + 3u < g_frame.ops.size()) {
                 g_frame.ops[carry.prev_op + 3u] |= 2u;  // the earlier scene stores
                 g_frame.ops[carry.last_op + 3u] |= 1u;  // this one reloads
                 carry.loading = true;
                 carry.written = true;
                 ++g_depth_reloads;
+                static const bool why = std::getenv("PSPRECOMP_BURNOUT_DEPTH_TRACE") != nullptr;
+                if (why)
+                    std::fprintf(stderr, "[depth] frame %llu fb %u: reload for depth %d (func %u, mask %u) stencil %d (func %06X op %06X) through %d blend %d\n",
+                                 static_cast<unsigned long long>(g_stats.frames), g_scene.framebuffer, depth_test ? 1 : 0, cmd(0xDEu) & 7u,
+                                 cmd(0xE7u) & 1u, stencil_test ? 1 : 0, func & 0xFFFFFFu, op & 0xFFFFFFu, through ? 1 : 0, g_state.blend == 1 ? 1 : 0);
             }
             if ((cmd(0xE7u) & 1u) == 0u || stencil) carry.written = true;
         }
