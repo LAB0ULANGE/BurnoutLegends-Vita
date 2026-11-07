@@ -115,6 +115,14 @@ if(VITA)
                 list(APPEND BURNOUT_VITA_ICON_FILE FILE "${BURNOUT_VITA_LIVEAREA}/${item}" sce_sys/livearea/contents/${item})
             endforeach()
         endif()
+        # Save slot icons of the native save dialog (PSP / PS VITA marked):
+        # made from the game's save icon, beside the game files.
+        set(BURNOUT_VITA_SAVE_ICONS "${CMAKE_SOURCE_DIR}/../original/save_icons" CACHE PATH "Save dialog icons folder")
+        foreach(item psp.png vita.png)
+            if(EXISTS "${BURNOUT_VITA_SAVE_ICONS}/${item}")
+                list(APPEND BURNOUT_VITA_ICON_FILE FILE "${BURNOUT_VITA_SAVE_ICONS}/${item}" save_icons/${item})
+            endif()
+        endforeach()
         vita_create_vpk(burnout-gl.vpk ${BURNOUT_VITA_GL_TITLE_ID} eboot_gl.bin
             VERSION 01.00
             NAME "${BURNOUT_VITA_GL_NAME}"

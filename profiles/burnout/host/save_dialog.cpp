@@ -120,10 +120,37 @@ bool start(bool save, const std::vector<Slot> &slots, int focus) {
             wide(param.title, 32, slots[i].title);
             wide(param.subTitle, 64, slots[i].subtitle);
             wide(param.detail, 256, slots[i].detail);
+            // Icon: the game's, marked PSP (written by a PSP / Adrenaline) or PS VITA.
+            const char *icon = slots[i].psp ? "app0:save_icons/psp.png" : "app0:save_icons/vita.png";
+            std::strncpy(param.iconPath, icon, sizeof(param.iconPath) - 1u);
             local_time(slots[i].modified, param.modifiedTime);
-            int result = sceAppUtilSaveDataSlotCreate(static_cast<unsigned>(i), &param, nullptr);
-            if (result == kSlotExists) result = sceAppUtilSaveDataSlotSetParam(static_cast<unsigned>(i), &param, nullptr);
-            if (result < 0) std::fprintf(stderr, "[save] slot %d: 0x%08X\n", i, static_cast<unsigned>(result));
+            // The slot is only rewritten when the save changed (userParam
+            // keeps a digest of what it shows): the system may date a slot
+            // when it is written.
+            std::uint32_t digest = 2166136261u;
+            const auto mix = [&digest](const void *data, std::size_t size) {
+                for (std::size_t b = 0; b < size; ++b) digest = (digest ^ static_cast<const unsigned char *>(data)[b]) * 16777619u;
+            };
+            mix(param.title, sizeof(param.title));
+            mix(param.subTitle, sizeof(param.subTitle));
+            mix(param.detail, sizeof(param.detail));
+            mix(param.iconPath, sizeof(param.iconPath));
+            mix(&slots[i].modified, sizeof(slots[i].modified));
+            param.userParam = static_cast<int>(digest);
+            SceAppUtilSaveDataSlotParam current{};
+            const bool same = sceAppUtilSaveDataSlotGetParam(static_cast<unsigned>(i), &current, nullptr) >= 0 && current.userParam == param.userParam;
+            int result = 0;
+            if (!same) {
+                result = sceAppUtilSaveDataSlotCreate(static_cast<unsigned>(i), &param, nullptr);
+                if (result == kSlotExists) result = sceAppUtilSaveDataSlotSetParam(static_cast<unsigned>(i), &param, nullptr);
+            }
+            SceAppUtilSaveDataSlotParam check{};
+            sceAppUtilSaveDataSlotGetParam(static_cast<unsigned>(i), &check, nullptr);
+            std::fprintf(stderr, "[save] slot %d '%s' %s: 0x%08X; date sent %04d-%02d-%02d %02d:%02d, kept %04d-%02d-%02d %02d:%02d\n", i,
+                         slots[i].title.c_str(), same ? "unchanged" : "written", static_cast<unsigned>(result), param.modifiedTime.year,
+                         param.modifiedTime.month, param.modifiedTime.day, param.modifiedTime.hour, param.modifiedTime.minute,
+                         check.modifiedTime.year, check.modifiedTime.month, check.modifiedTime.day, check.modifiedTime.hour,
+                         check.modifiedTime.minute);
         }
         g_slots[i] = SceAppUtilSaveDataSlot{};
         g_slots[i].id = static_cast<SceAppUtilSaveDataSlotId>(i);

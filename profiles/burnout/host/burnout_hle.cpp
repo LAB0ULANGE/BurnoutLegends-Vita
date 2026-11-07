@@ -2433,7 +2433,8 @@ save_dialog::Slot save_slot(const fs::path &folder, const std::string &file, std
             slot.detail = info.detail;
         }
     }
-    if (psp_savedata::console_signed(sfo)) slot.title += other ? " - PSP " + region_of(folder.filename().string()) : " - PSP";
+    slot.psp = psp_savedata::console_signed(sfo);
+    if (slot.psp) slot.title += other ? " - PSP " + region_of(folder.filename().string()) : " - PSP";
     else if (other) slot.title += " - " + region_of(folder.filename().string());
     struct stat st {};
     if (stat((folder / file).string().c_str(), &st) == 0) slot.modified = st.st_mtime;

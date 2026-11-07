@@ -13,6 +13,7 @@ namespace burnout::save_dialog {
 
 struct Slot {
     bool exists{};
+    bool psp{};  // written by a PSP or Adrenaline (icon marked PSP, else PS VITA)
     std::string title, subtitle, detail;
     std::time_t modified{};  // UTC
 };

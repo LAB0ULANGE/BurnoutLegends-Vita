@@ -554,6 +554,8 @@ struct Texture {
     bool foliage{};                // cut-out and mostly green (trees, bushes)
     float clear{};                 // fraction of texels with alpha <= 16
     GLint sampling[4]{-1, -1, -1, -1};
+    std::uint32_t uploaded_w{}, uploaded_h{};  // size of the GL texture's level 0 (0: none yet)
+    std::uint32_t rewrites{};      // uploads after a CPU or transfer write (a movie: every frame)
 };
 
 // Uniforms are recorded by slot; the GL thread keeps the latest value of each
@@ -1295,7 +1297,16 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             // the GPU builds the chain from level 0 instead. Without one a
             // distant road samples a 256-texel texture sparsely, which on the
             // SGX misses the texture cache on nearly every fetch.
-            texture.mipmapped = g_mipmaps && upload_mode == 0u && levels != 0u && width >= 8u && height >= 8u;
+            // A texture rewritten again and again (the menu movie's frame,
+            // every frame) gets no mip chain and is updated in place: a new
+            // 1 MiB texture plus its mips each frame cost the GL thread
+            // 40-75 ms on the Vita.
+            texture.rewrites = written ? texture.rewrites + 1u : 0u;
+            const bool streaming = texture.rewrites >= 2u;
+            texture.mipmapped = g_mipmaps && !streaming && upload_mode == 0u && levels != 0u && width >= 8u && height >= 8u;
+            const bool in_place = streaming && texture.uploaded_w == width && texture.uploaded_h == height;
+            texture.uploaded_w = width;
+            texture.uploaded_h = height;
             std::uint8_t min_alpha = 255u;
             {
                 // Foliage (trees, bushes): a cut-out texture whose visible
@@ -1345,7 +1356,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 const bool deferred = g_recording_deferred;
                 g_recording_deferred = false;
                 if (deferred) record(Op::BindTexture, {texture.name});
-                record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()), texture.mipmapped ? 1u : 0u});
+                record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()),
+                                      (texture.mipmapped ? 1u : 0u) | (in_place ? 2u : 0u)});
                 g_recording_deferred = deferred;
                 if (deferred) g_state.texture = ~0u;
                 g_frame.blobs.push_back(std::move(rgba));
@@ -3769,9 +3781,14 @@ void replay(const Frame &frame) {
             op += 2;
             break;
         case Op::TexImage:
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), 0, GL_RGBA,
-                         GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
-            if (op[3] != 0u) glGenerateMipmap(GL_TEXTURE_2D);
+            // Flag 2: same size as before, written in place (no new texture).
+            if ((op[3] & 2u) != 0u)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), GL_RGBA,
+                                GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
+            else
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
+            if ((op[3] & 1u) != 0u) glGenerateMipmap(GL_TEXTURE_2D);
             op += 4;
             break;
         case Op::TexImageP8:
