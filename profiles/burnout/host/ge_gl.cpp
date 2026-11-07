@@ -29,9 +29,6 @@
 #endif
 
 #if defined(__vita__)
-#include <malloc.h>
-#endif
-#if defined(__vita__)
 #include <psp2/kernel/threadmgr.h>
 #include <pthread.h>
 #endif
@@ -4408,16 +4405,14 @@ void present(std::uint32_t address) {
             trace((std::string("  vitaGL scenes over ") + scenes).c_str());
         }
         {
-            // Memory (a heap exhausted after ~4 min of a race, gl-103d/f):
-            // newlib heap in use and free, vitaGL pools free, our tables.
-            const struct mallinfo heap = mallinfo();
-            char memory_line[320];
-            std::snprintf(memory_line, sizeof(memory_line),
-                          "  memory: heap used %d KiB, free %d KiB (arena %d KiB); vitaGL free ram %u cdram %u phycont %u KiB; "
-                          "%zu textures (%llu deleted), %zu targets, %zu frame blobs",
-                          heap.uordblks / 1024, heap.fordblks / 1024, heap.arena / 1024,
-                          static_cast<unsigned>(vglMemFree(VGL_MEM_RAM) / 1024u), static_cast<unsigned>(vglMemFree(VGL_MEM_VRAM) / 1024u),
-                          static_cast<unsigned>(vglMemFree(VGL_MEM_PHYCONT) / 1024u), g_textures.size(), static_cast<unsigned long long>(g_textures_evicted), g_targets.size(), g_frame.blobs.size());
+            // Texture memory (a heap exhausted after ~4 min of a race,
+            // gl-103d/f). Only our own counts: asking vitaGL for its pools
+            // from this thread crashed the Vita (gl-103h, C2-12828-1).
+            std::size_t texture_bytes = 0u;
+            for (const auto &entry : g_textures) texture_bytes += entry.second.bytes;
+            char memory_line[200];
+            std::snprintf(memory_line, sizeof(memory_line), "  memory: %zu textures (%zu KiB of PSP data), %llu deleted so far, %zu targets",
+                          g_textures.size(), texture_bytes / 1024u, static_cast<unsigned long long>(g_textures_evicted), g_targets.size());
             trace(memory_line);
         }
 #endif
