@@ -7,6 +7,7 @@
 // PSV-VSH-Menu, override the request; the report logs the clock obtained), and
 // writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
 // solid status colour: blue running, green done, red error.
+#include "core_load.hpp"
 #include "audio_out.hpp"
 #include "music.hpp"
 #include "sas_worker.hpp"
@@ -49,7 +50,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x3584] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x3e5c] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -63,7 +64,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-88b";
+constexpr const char *kBuild = "gl-88c";
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
@@ -286,6 +287,7 @@ int main() {
 #if defined(BURNOUT_VITA_PROFILE) || defined(BURNOUT_VITA_GL)
     // Keep the emulation thread on core 0, off the sampler's or GL worker's core.
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
+    burnout::core_load::register_current_thread("emulation");
 #endif
 #if defined(BURNOUT_VITA_PROFILE)
     const SceUID profiler = sceKernelCreateThread("profiler", profiler_thread, 0x10000100, 0x10000, 0,

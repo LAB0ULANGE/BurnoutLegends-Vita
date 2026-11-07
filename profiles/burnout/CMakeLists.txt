@@ -48,7 +48,8 @@ set(BURNOUT_HOST_SOURCES
     host/audio_out.cpp
     host/sas_core.cpp
     host/sas_worker.cpp
-    host/music.cpp)
+    host/music.cpp
+    host/core_load.cpp)
 
 if(VITA)
     # PS Vita: the same headless runtime packaged as a VPK that benchmarks the

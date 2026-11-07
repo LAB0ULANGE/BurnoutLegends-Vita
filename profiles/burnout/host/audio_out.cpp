@@ -1,3 +1,4 @@
+#include "core_load.hpp"
 #include "audio_out.hpp"
 
 #include "thread_sync.hpp"
@@ -45,6 +46,7 @@ void *output_thread(void *core_mask) {
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), static_cast<int>(reinterpret_cast<std::uintptr_t>(core_mask)));
     // Above the GL thread sharing the core: a late output call is a click.
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), 64);
+    core_load::register_current_thread("audio_out");
     std::array<std::int16_t, kGrain * 2u> out{};
     std::array<std::int32_t, kGrain * 2u> mix{};
     while (!g_stop) {

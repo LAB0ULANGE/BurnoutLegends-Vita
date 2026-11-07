@@ -8,6 +8,7 @@
 // thread is runnable the clock jumps to the next event (vblank, delay expiry or
 // audio buffer drain). Host time spent between two game frames is therefore the
 // pure CPU cost of that frame, which is what the benchmark measures.
+#include "core_load.hpp"
 #include "burnout_hle.hpp"
 #include "audio_out.hpp"
 #include "burnout_bench.hpp"
@@ -1004,6 +1005,7 @@ void *thread_main(void *) {
     // thread, the SAS mixer and the audio output), ahead of it in priority.
     const int changed = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), 150);
+    core_load::register_current_thread("ge_front");
     char line[128];
     std::snprintf(line, sizeof(line), "GE front end started: affinity change 0x%x, mask 0x%x, priority %d, cpu %d",
                   static_cast<unsigned>(changed), static_cast<unsigned>(sceKernelGetThreadCpuAffinityMask(sceKernelGetThreadId())),
@@ -1658,6 +1660,10 @@ void install_display_input(Runtime &rt) {
         }
         static std::uint32_t flips = 0u;
         if (++flips % 300u == 0u) gl::trace(("emulation threads (ms/flip): " + thread_time_report(300.0)).c_str());
+        if (flips % 300u == 0u) {
+            const std::string load = core_load::report();
+            if (!load.empty()) gl::trace(load.c_str());
+        }
 #endif
         if (k.observer.on_set_frame_buffer) k.observer.on_set_frame_buffer(arg(ctx, 0), k.vblanks);
         ret(ctx, 0u);

@@ -1,3 +1,4 @@
+#include "core_load.hpp"
 #include "music.hpp"
 
 #include "thread_sync.hpp"
@@ -118,6 +119,7 @@ void reader_loop() {
 
 #if defined(__vita__)
 void *reader_entry(void *) {
+    core_load::register_current_thread("music_read");
     reader_loop();
     return nullptr;
 }

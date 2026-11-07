@@ -1,3 +1,4 @@
+#include "core_load.hpp"
 #include "ge_render.hpp"
 #if defined(_WIN32)
 #include "sampling_profiler_win.hpp"
@@ -450,6 +451,7 @@ void worker_loop() {
 
 #if defined(__vita__)
 int sampler_entry(SceSize, void *) {
+    core_load::register_current_thread("sampler");
     sample_phases();
     return 0;
 }
@@ -457,6 +459,7 @@ int sampler_entry(SceSize, void *) {
 void *worker_entry(void *) {
     // Core 1: core 0 runs the emulation.
     const int affinity = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
+    core_load::register_current_thread("decode");
     char line[96];
     std::snprintf(line, sizeof(line), "worker started (core 1 affinity 0x%x, priority %d)", affinity,
                   sceKernelGetThreadCurrentPriority());

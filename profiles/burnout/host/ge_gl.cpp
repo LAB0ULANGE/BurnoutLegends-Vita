@@ -1,3 +1,4 @@
+#include "core_load.hpp"
 #include "ge_gl.hpp"
 
 #include "gl_api.hpp"
@@ -3511,6 +3512,7 @@ void gl_thread_main() {
 void *gl_thread_entry(void *) {
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
     trace("GL thread started (core 2)");
+    core_load::register_current_thread("gl");
     gl_thread_main();
     return nullptr;
 }

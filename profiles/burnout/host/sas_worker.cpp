@@ -1,3 +1,4 @@
+#include "core_load.hpp"
 #include "sas_worker.hpp"
 
 #include "burnout_bench.hpp"
@@ -57,6 +58,7 @@ void *thread_main(void *core_mask) {
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), static_cast<int>(reinterpret_cast<std::uintptr_t>(core_mask)));
     // Above the GL thread sharing the core, so the game seldom waits for it.
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), 80);
+    core_load::register_current_thread("sas_mix");
     run();
     return nullptr;
 }
