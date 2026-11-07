@@ -533,6 +533,9 @@ struct RenderTarget {
     // as slow as a full-size one on the Vita).
     GLuint level_framebuffer[4]{}, level_texture[4]{};
     GLint sampling[4]{-1, -1, -1, -1};
+    // gl-97 tight regions: widest x (PSP pixels) the target's draws reach,
+    // -1 none yet; the GPU processes only those columns (valid region).
+    int region_x{-1};
 };
 
 struct Texture {
@@ -640,6 +643,10 @@ int g_dynamic_min{12};
 int g_dynamic_q{0};  // 0 until the first frame: the render scale
 bool g_lazy_levels{false};
 bool g_effect_1x{false};  // gl-95 test: effect buffer 110000 at 1x
+// gl-97: scenes on a target only process the columns its draws reach (the
+// bloom buffer 110000 is 512 wide and drawn in its 128x128 corner; each full
+// 1024x544 scene cost the Vita's GPU ~13 ms at 960x544). Patched vitaGL.
+bool g_tight_regions{std::getenv("PSPRECOMP_BURNOUT_TIGHT_REGIONS") != nullptr};
 // gl-89: one target per screen buffer at the render scale; a lower level is
 // drawn in its lower-left part and the Vita's GPU told to process only the
 // tiles there (patched vitaGL: vglSetFramebufferValidRegion).
@@ -856,7 +863,7 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
 enum class Op : std::uint32_t {
     Enable, Disable, BlendFunc, BlendEquation, DepthFunc, DepthMask, ColorMask, FrontFace, Scissor, Viewport,
     UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, TexImageP8, Uniform4, UniformMatrix, Draw, CreateTarget,
-    Present, Capture, StencilFunc, StencilOp, StencilMask, Prepass
+    Present, Capture, StencilFunc, StencilOp, StencilMask, Prepass, ValidRegion
 };
 
 // Cut-out depth prepass (gl-72): an opaque alpha-tested textured draw that
@@ -1480,6 +1487,9 @@ void splice_deferred() {
     ++g_deferred_splices;
 }
 
+std::string trace_batch_box();  // diagnostic, defined after the batch layout
+int batch_max_x();  // through-mode batch: rightmost x (PSP pixels), -1 otherwise
+
 void flush() {
     if (g_batch_runs.empty() || !g_drawing) {
         g_batch_indices.clear();
@@ -1570,6 +1580,20 @@ void flush() {
         record(Op::BindFramebuffer, {target.framebuffer, target.dynamic ? static_cast<std::uint32_t>(target.draw_q) : 0u});
         ++use.binds;
         ++g_gpu.switches;
+    }
+    if (g_tight_regions && !(target.dynamic && g_valid_region) && target.region_x < target.width) {
+        // Grows to cover this draw (never shrinks); a 3D draw takes the whole width.
+        const int right = batch_max_x();
+        const int needed = right < 0 ? target.width : std::min(target.width, right + 1);
+        if (needed > target.region_x) {
+            target.region_x = needed;
+            char line[80];
+            std::snprintf(line, sizeof(line), "tight region: %d of %d columns (stride %d)", needed, target.width, target.width);
+            trace(line);
+            const int scale = target.dynamic ? target.draw_q : target.draw_q != 0 ? target.draw_q : g_scale;
+            record(Op::ValidRegion, {static_cast<std::uint32_t>(needed * scale / 8 + 1),
+                                     static_cast<std::uint32_t>(target.height * scale / 8)});
+        }
     }
     if (g_state.viewport_w != target.width || g_state.viewport_h != target.height) {
         g_state.viewport_w = target.width;
@@ -1801,6 +1825,9 @@ void flush() {
                          (cmd(0x23u) & 1u) != 0u ? 1 : 0, cmd(0xDEu) & 7u, (cmd(0xE7u) & 1u) == 0u ? 1 : 0, float24(cmd(0x44u)),
                          float24(cmd(0x47u)), fog ? 1 : 0, texfunc & 0x1FFFFu, alpha_enabled ? 1 : 0, alpha_test & 0xFFFFFFu,
                          (cmd(0x1Du) & 1u) != 0u ? 1 : 0);
+            std::fprintf(stderr, "[tt]    scissor %u,%u-%u,%u region %u,%u-%u,%u offset %u,%u\n", (std::fprintf(stderr, "%s", trace_batch_box().c_str()), cmd(0xD4u)) & 0x3FFu, (cmd(0xD4u) >> 10u) & 0x3FFu,
+                         cmd(0xD5u) & 0x3FFu, (cmd(0xD5u) >> 10u) & 0x3FFu, cmd(0x15u) & 0x3FFu, (cmd(0x15u) >> 10u) & 0x3FFu,
+                         cmd(0x16u) & 0x3FFu, (cmd(0x16u) >> 10u) & 0x3FFu, (cmd(0x4Cu) & 0xFFFFu) >> 4u, (cmd(0x4Du) & 0xFFFFu) >> 4u);
             std::fprintf(stderr, "[tt]    stencil test %u func %06X op %06X; alpha blend fix %06X/%06X; mask %06X/%06X; logic %u\n",
                          cmd(0x24u) & 1u, cmd(0xDCu) & 0xFFFFFFu, cmd(0xDDu) & 0xFFFFFFu, cmd(0xE0u) & 0xFFFFFFu,
                          cmd(0xE1u) & 0xFFFFFFu, cmd(0xE8u) & 0xFFFFFFu, cmd(0xE9u) & 0xFFFFFFu, cmd(0x28u) & 1u);
@@ -1991,6 +2018,41 @@ void copy_vertex(std::uint8_t *out, const std::uint8_t *in, const BatchLayout &t
 }
 
 BatchLayout g_layout;
+
+int batch_max_x() {
+    if ((g_batch_vtype & 0x800000u) == 0u || g_batch_count == 0u) return -1;
+    const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+    const std::uint32_t format = (g_batch_vtype >> 7u) & 3u;
+    float x1 = 0.0f;
+    for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+        const std::uint8_t *p = vertices + i * g_layout.stride + g_layout.pos;
+        float x = 0.0f;
+        if (format == 3u) std::memcpy(&x, p, 4);
+        else if (format == 2u) { std::int16_t v; std::memcpy(&v, p, 2); x = v; }
+        else x = static_cast<std::int8_t>(p[0]);
+        x1 = std::max(x1, x);
+    }
+    return static_cast<int>(std::ceil(x1));
+}
+
+std::string trace_batch_box() {
+                // Through-mode position box of the batch (any position format).
+                if ((g_batch_vtype & 0x800000u) == 0u || g_batch_count == 0u) return std::string("[tt]    box: 3D\n");
+                const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+                const std::uint32_t format = (g_batch_vtype >> 7u) & 3u;
+                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+                    const std::uint8_t *p = vertices + i * g_layout.stride + g_layout.pos;
+                    float x = 0.0f, y = 0.0f;
+                    if (format == 3u) { std::memcpy(&x, p, 4); std::memcpy(&y, p + 4, 4); }
+                    else if (format == 2u) { std::int16_t v[2]; std::memcpy(v, p, 4); x = v[0]; y = v[1]; }
+                    else { x = static_cast<std::int8_t>(p[0]); y = static_cast<std::int8_t>(p[1]); }
+                    x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y);
+                }
+                char text[96];
+                std::snprintf(text, sizeof(text), "[tt]    box %.0f,%.0f-%.0f,%.0f (format %u)\n", x0, y0, x1, y1, format);
+                return std::string(text);
+            }
 
 // Vertices whose fields already sit at the batch offsets: one fixed-size copy
 // each (the common odd strides get a constant size the compiler inlines).
@@ -3548,6 +3610,12 @@ void replay(const Frame &frame) {
             break;
         }
         case Op::Capture: capture_target(op[0], static_cast<int>(op[1]), frame.captures[op[2]]); op += 3; break;
+        case Op::ValidRegion:
+#if defined(__vita__)
+            vglSetFramebufferValidRegion(static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]));
+#endif
+            op += 2;
+            break;
         }
     }
 }
@@ -3692,6 +3760,7 @@ void set_dynamic_resolution(bool enabled, float min_scale, float pinned) {
 }
 void set_lazy_levels(bool enabled) { g_lazy_levels = enabled; }
 void set_effect_1x(bool enabled) { g_effect_1x = enabled; }
+void set_tight_regions(bool enabled) { g_tight_regions = g_tight_regions || enabled; }
 void set_valid_region(bool enabled) { g_valid_region = g_valid_region || enabled; }
 void set_only_current_level(bool enabled) { g_only_current_level = g_only_current_level || enabled; }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }

@@ -50,7 +50,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x64a8] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x6e0c] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -83,6 +83,7 @@ constexpr int kParamBufferMiB = 0;  // gl-89q test: GXM parameter buffer (0: 16 
 constexpr bool kValidRegion = true;  // one target per screen buffer, patched vitaGL processes only the drawn tiles
 //constexpr bool kDynamicRes = false;  // gl-88: off. Any dynamic target set (76-87d) made present wait 12-35 ms; one level fixed at creation (87e, static) 0.4 ms
 constexpr bool kOnlyLevel = false;  // test: dynamic targets with the current level alone
+constexpr bool kTightRegions = true;  // gl-97: scenes limited to the columns drawn (bloom buffer: a quarter)
 constexpr bool kEffect1x = false;  // gl-95 test: full-width effect buffer 110000 at 1x
 constexpr bool kLazyLevels = true;  // dynamic levels not cleared at creation (no GXM render target until drawn)
 constexpr float kDynamicPin = 0.0f;  // test: that scale always (1.5 = 720x408), targets never recreated
@@ -211,8 +212,9 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
     options.script = script;
     options.max_vblanks = 9000u;
 #if defined(BURNOUT_VITA_GL)
-    // The scripted test race stops after 30 minutes; free play never does.
-    options.max_vblanks = timed ? 60u * 60u * 30u : UINT64_MAX;
+    // The scripted test race (an A/B measurement) stops by itself after 150 s
+    // of PSP time, about 2 minutes of race; free play never does.
+    options.max_vblanks = timed ? 9000u : UINT64_MAX;
     options.realtime = true;
     // Walks the display lists on another core (no faster: the game waits for
     // the GE right after submitting).
@@ -352,6 +354,7 @@ int main() {
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::gl::set_lazy_levels(kLazyLevels);
         burnout::gl::set_effect_1x(kEffect1x);
+        burnout::gl::set_tight_regions(kTightRegions);
         burnout::gl::set_valid_region(kValidRegion);
         burnout::gl::set_param_buffer_mib(kParamBufferMiB);
         burnout::gl::set_fbo_scenes(kFboScenes);
