@@ -20,6 +20,8 @@ public:
     // The next frame, RGBA8888 rows of kWidth pixels; false past the last one.
     virtual bool next_frame(std::vector<std::uint8_t> &rgba) = 0;
     [[nodiscard]] virtual std::size_t frame_count() const = 0;
+    // Back to the first frame (a looping menu movie).
+    virtual void rewind() = 0;
 };
 
 // Splits a PSMF file's MPEG-PS video stream (0xE0) into access units (one

@@ -305,7 +305,12 @@ psprecomp::GuestMemory *g_memory{};
 void capture_rgb(const std::vector<std::uint8_t> &rgb, std::uint64_t vblank) {
     char name[64];
     std::snprintf(name, sizeof(name), "frame_%06llu.png", static_cast<unsigned long long>(vblank));
-    write_png(g_options.capture_dir / name, 480u, 272u, rgb);
+    // 480x272, or the render resolution (480 * s / 8 by 272 * s / 8).
+    std::uint32_t width = 480u, height = 272u;
+    for (std::uint32_t s = 1u; s <= 32u; ++s)
+        if (static_cast<std::size_t>(480u * s / 8u) * (272u * s / 8u) * 3u == rgb.size()) { width = 480u * s / 8u; height = 272u * s / 8u; }
+    if (static_cast<std::size_t>(width) * height * 3u != rgb.size()) return;
+    write_png(g_options.capture_dir / name, width, height, rgb);
     ++g_captures;
 }
 

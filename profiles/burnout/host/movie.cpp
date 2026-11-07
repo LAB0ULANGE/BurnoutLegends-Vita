@@ -148,6 +148,8 @@ public:
     }
 
     std::size_t frame_count() const override { return units_.size(); }
+    // The first unit is an IDR picture: the decoder restarts from it.
+    void rewind() override { next_ = 0; }
 
 private:
     static constexpr std::uint32_t kPitch = 512;
@@ -191,6 +193,10 @@ public:
         return true;
     }
     std::size_t frame_count() const override { return count_; }
+    void rewind() override {
+        next_ = 0;
+        if (!path_.empty()) { in_.clear(); in_.seekg(0); }
+    }
 
 private:
     std::size_t count_{}, next_{};

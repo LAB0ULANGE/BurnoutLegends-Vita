@@ -1007,6 +1007,8 @@ void bind_texture_object(GLuint name) {
     record(Op::BindTexture, {name});
 }
 
+bool g_smooth_2d{std::getenv("PSPRECOMP_BURNOUT_SMOOTH_2D") != nullptr};
+
 // Sampler parameters live in the texture object: only set when they change.
 void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v, GLint min_filter = 0) {
     const GLint wanted[4]{min_filter != 0 ? min_filter : linear ? GL_LINEAR : GL_NEAREST, linear ? GL_LINEAR : GL_NEAREST,
@@ -1162,7 +1164,10 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     const std::uint32_t format = cmd(0xC3u) & 0xFu;
     const bool swizzled = (cmd(0xC2u) & 1u) != 0u;
     const bool clamp_u = (cmd(0xC7u) & 1u) != 0u, clamp_v = (cmd(0xC7u) & 0x100u) != 0u;
-    const bool linear = (cmd(0xC6u) & 0x100u) != 0u;
+    bool linear = (cmd(0xC6u) & 0x100u) != 0u;
+    // 2D (through mode: menus, text, HUD) drawn texel for pixel on the PSP:
+    // upscaled, nearest sampling shows each texel as a block.
+    if (g_smooth_2d && !linear && (cmd(0x12u) & 0x800000u) != 0u) linear = true;
 
     // Render to texture: sample the framebuffer object, flipped vertically.
     if ((address & 0x0F000000u) == 0x04000000u) {
@@ -3571,6 +3576,20 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
         std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4u);
         glReadPixels(0, scaled(height - 272, scale), static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE,
                      rgba.data());
+#if defined(__vita__)
+        static const bool full = true;  // screenshots: the picture as shown
+#else
+        static const bool full = std::getenv("PSPRECOMP_BURNOUT_CAPTURE_FULL") != nullptr;
+#endif
+        if (full) {
+            // At the render resolution (capture_rgb tells the size from the bytes).
+            rgb.resize(static_cast<std::size_t>(w) * h * 3u);
+            for (std::uint32_t y = 0; y < h; ++y)
+                for (std::uint32_t x = 0; x < w; ++x)
+                    for (int c = 0; c < 3; ++c) rgb[(y * w + x) * 3u + c] = rgba[((h - 1u - y) * w + x) * 4u + c];
+            done(rgb);
+            return;
+        }
         rgb.resize(480u * 272u * 3u);
         for (std::uint32_t y = 0; y < 272u; ++y) {
             const std::uint32_t fy = 271u - y, y0 = fy * s / 8u, y1 = (fy + 1u) * s / 8u;

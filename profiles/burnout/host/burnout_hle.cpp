@@ -206,7 +206,11 @@ struct MpegMovie {
     std::vector<std::uint8_t> frame;   // last decoded, RGBA8888 480x272
     std::uint32_t pixel_mode{3u};      // sceMpegAvcDecodeMode: 3 = 8888, 0 = 565, 1 = 5551, 2 = 4444
     std::uint32_t units{};             // access units handed out
+    std::uint32_t past_end{};          // "no data" answers since the last frame
 };
+
+// "No data" answers past a movie's last frame before it starts over.
+constexpr std::uint32_t kMovieLoopAfter = 8u;
 
 struct Kernel {
     HleOptions options;
@@ -2185,7 +2189,20 @@ void install_mpeg(Runtime &rt) {
         if (movie != k.mpeg_movies.end() && movie->second.movie) {
             // SceMpegAu: pts (hi, lo), dts (hi, lo), es buffer, es size; 29.97 fps at 90 kHz.
             MpegMovie &state = movie->second;
-            if (state.units >= state.movie->frame_count()) { ret(ctx, 0x80618001u); return; }
+            if (state.units >= state.movie->frame_count()) {
+                // A one-shot movie (intro) is torn down as soon as the game
+                // gets "no data"; a menu movie keeps being asked for frames:
+                // it starts over.
+                if (++state.past_end < kMovieLoopAfter) {
+                    if (std::getenv("PSPRECOMP_BURNOUT_MOVIE_TRACE")) std::fprintf(stderr, "[movie] past end %u\n", state.past_end);
+                    ret(ctx, 0x80618001u);
+                    return;
+                }
+                std::fprintf(stderr, "[movie] loop\n");
+                state.past_end = 0;
+                state.movie->rewind();
+                state.units = 0;
+            }
             const std::uint32_t au = arg(ctx, 2);
             const std::uint64_t pts = 90000u + static_cast<std::uint64_t>(state.units) * 3003u;
             ++state.units;
