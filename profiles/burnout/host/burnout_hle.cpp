@@ -10,6 +10,7 @@
 // pure CPU cost of that frame, which is what the benchmark measures.
 #include "core_load.hpp"
 #include "movie.hpp"
+#include <chrono>
 #include "burnout_hle.hpp"
 #include "audio_out.hpp"
 #include "burnout_bench.hpp"
@@ -208,6 +209,19 @@ struct MpegMovie {
     std::uint32_t units{};             // access units handed out
     std::uint32_t past_end{};          // "no data" answers since the last frame
 };
+
+// Movie cost on the emulation thread, logged every 150 frames: decode
+// (hardware decoder and copy out) and colour conversion into VRAM.
+void movie_time(int which, std::chrono::steady_clock::time_point started) {
+    static double total[2]{};
+    static std::uint32_t count[2]{};
+    total[which] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (++count[which] == 150u) {
+        std::fprintf(stderr, "[movie] %s %.2f ms/frame\n", which == 0 ? "decode" : "csc", total[which] / 150.0);
+        total[which] = 0.0;
+        count[which] = 0u;
+    }
+}
 
 // "No data" answers past a movie's last frame before it starts over.
 constexpr std::uint32_t kMovieLoopAfter = 8u;
@@ -2084,7 +2098,9 @@ void install_mpeg(Runtime &rt) {
     reg(rt, lib, 0xF0EB1125u, [](Runtime &r, AllegrexContext &ctx) {
         const auto it = k.mpeg_movies.find(arg(ctx, 0));
         bool decoded = false;
+        const auto started = std::chrono::steady_clock::now();
         if (it != k.mpeg_movies.end() && it->second.movie) decoded = it->second.movie->next_frame(it->second.frame);
+        movie_time(0, started);
         static const bool debug = std::getenv("PSPRECOMP_BURNOUT_MOVIE_DEBUG") != nullptr;
         if (debug && decoded && it->second.units % 60u == 10u) {
             std::uint64_t sum = 0u;
@@ -2111,8 +2127,21 @@ void install_mpeg(Runtime &rt) {
             std::fprintf(stderr, "[movie] csc range %d,%d %dx%d stride %u mode %u -> 0x%08X\n", x0, y0, w, h, stride,
                          state.pixel_mode, destination);
         }
+        const auto started = std::chrono::steady_clock::now();
+        static const bool white = std::getenv("PSPRECOMP_BURNOUT_MOVIE_WHITE") != nullptr;
+        // 8888 rows inside the frame: copied as they are (alpha forced opaque).
+        const bool direct = bpp == 4u && !white && x0 >= 0 && w > 0 && x0 + w <= movie::kWidth;
         for (std::int32_t y = 0; y < h && w > 0; ++y) {
             const std::int32_t sy = y0 + y;
+            if (direct) {
+                if (sy < 0 || sy >= movie::kHeight) continue;
+                std::uint8_t *out = r.memory().raw_pointer(destination + static_cast<std::uint32_t>(y) * stride * 4u, static_cast<std::uint32_t>(w) * 4u);
+                if (out == nullptr) continue;
+                std::memcpy(out, &state.frame[(static_cast<std::size_t>(sy) * movie::kWidth + static_cast<std::size_t>(x0)) * 4u],
+                            static_cast<std::size_t>(w) * 4u);
+                for (std::int32_t x = 0; x < w; ++x) out[x * 4 + 3] = 0xFFu;
+                continue;
+            }
             if (sy < 0 || sy >= movie::kHeight) continue;
             std::uint8_t *out = r.memory().raw_pointer(destination + static_cast<std::uint32_t>(y) * stride * bpp,
                                                        static_cast<std::uint32_t>(w) * bpp);
@@ -2121,7 +2150,6 @@ void install_mpeg(Runtime &rt) {
                 const std::int32_t sx = x0 + x;
                 const bool inside = sx >= 0 && sx < movie::kWidth;
                 const std::uint8_t *p = inside ? &state.frame[(static_cast<std::size_t>(sy) * movie::kWidth + static_cast<std::size_t>(sx)) * 4u] : nullptr;
-                static const bool white = std::getenv("PSPRECOMP_BURNOUT_MOVIE_WHITE") != nullptr;
                 const std::uint8_t cr = white ? 0xFFu : p ? p[0] : 0u, cg = white ? 0xFFu : p ? p[1] : 0u, cb = white ? 0xFFu : p ? p[2] : 0u;
                 if (bpp == 4u) {
                     out[x * 4 + 0] = cr;
@@ -2142,6 +2170,7 @@ void install_mpeg(Runtime &rt) {
         if ((destination & 0x0F000000u) == 0x04000000u && h > 0)
             render::cpu_wrote_vram(destination, static_cast<std::uint32_t>(h) * stride * bpp);
 #endif
+        movie_time(1, started);
         ret(ctx, 0u);
     });
     reg(rt, lib, 0xB5F6DC87u, [](Runtime &r, AllegrexContext &ctx) {  // RingbufferAvailableSize

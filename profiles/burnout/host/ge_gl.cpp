@@ -641,6 +641,7 @@ bool g_offscreen_1x{};
 bool g_dynamic_resolution{std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_RES") != nullptr};
 int g_dynamic_min{12};
 int g_dynamic_q{0};  // 0 until the first frame: the render scale
+std::uint32_t g_frame_3d_draws{};  // draws not in through mode in the frame being recorded
 bool g_lazy_levels{false};
 bool g_effect_1x{false};  // gl-95 test: effect buffer 110000 at 1x
 // gl-97: scenes on a target only process the columns its draws reach (the
@@ -1229,11 +1230,14 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
         texture.stale = false;
         // Every 64 frames (staggered) the whole texture is hashed anyway.
         const std::uint64_t probe = probe_hash(source, bytes);
-        const bool full = fresh || reformat || probe != texture.probe || ((g_stats.frames + texture.name) & 63u) == 0u;
+        // A VRAM texture is only stale after a write into it: re-uploaded
+        // without hashing it whole (a movie frame: 1 MiB every frame).
+        const bool written = in_vram && !fresh && !reformat;
+        const bool full = !written && (fresh || reformat || probe != texture.probe || ((g_stats.frames + texture.name) & 63u) == 0u);
         texture.probe = probe;
         if (full) g_stats.texture_bytes_hashed += bytes;
         const std::uint64_t hash = full ? fnv(source, bytes) : texture.hash;
-        if (fresh || reformat || hash != texture.hash) {
+        if (written || fresh || reformat || hash != texture.hash) {
             texture.hash = hash;
             texture.upload_mode = upload_mode;
             std::vector<std::uint8_t> linear_bytes;
@@ -1253,6 +1257,10 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             for (std::uint32_t y = 0; y < height; ++y) {
                 const std::uint8_t *row = data + y * row_bytes;
                 std::uint8_t *out = &rgba[static_cast<std::size_t>(y) * width * 4u];
+                if (format == 3u) {
+                    std::memcpy(out, row, static_cast<std::size_t>(width) * 4u);
+                    continue;
+                }
                 for (std::uint32_t x = 0; x < width; ++x, out += 4) {
                     std::array<std::uint8_t, 4> c{255u, 0u, 255u, 255u};
                     switch (format) {
@@ -1283,14 +1291,13 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             // SGX misses the texture cache on nearly every fetch.
             texture.mipmapped = g_mipmaps && upload_mode == 0u && levels != 0u && width >= 8u && height >= 8u;
             std::uint8_t min_alpha = 255u;
-            for (std::size_t i = 3u; i < rgba.size(); i += 4u) min_alpha = std::min(min_alpha, rgba[i]);
-            texture.min_alpha = min_alpha;
             {
                 // Foliage (trees, bushes): a cut-out texture whose visible
                 // texels are mostly green. The "no trees" option skips those.
                 std::size_t clear = 0u;
                 std::uint64_t sum[3]{};
                 for (std::size_t i = 0u; i < rgba.size(); i += 4u) {
+                    min_alpha = std::min(min_alpha, rgba[i + 3u]);
                     if (rgba[i + 3u] <= 16u) { ++clear; continue; }
                     sum[0] += rgba[i]; sum[1] += rgba[i + 1u]; sum[2] += rgba[i + 2u];
                 }
@@ -1300,6 +1307,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 const double r = static_cast<double>(sum[0]) / opaque, g = static_cast<double>(sum[1]) / opaque,
                              b = static_cast<double>(sum[2]) / opaque;
                 texture.clear = static_cast<float>(clear_fraction);
+                texture.min_alpha = min_alpha;
                 texture.foliage = (address & 0x0F000000u) == 0x04000000u && clear_fraction >= 0.05 && g >= b * 1.4 && r <= g * 1.25 && g < 200.0;
                 if (texture.foliage) g_foliage_addresses.insert(address);
                 else g_foliage_addresses.erase(address);
@@ -1867,6 +1875,7 @@ void flush() {
     }
     if (g_state.blend == 1) { ++g_gpu.blended; ++use.blended; }
     if (through) { ++g_gpu.through; ++use.through; }
+    else ++g_frame_3d_draws;
     if (alpha_testing || color_function != 1u) ++g_gpu.discards;
     if (color_function != 1u) variant |= 1u << 23u | color_function << 24u;
     if (blend_scaled) variant |= 1u << 21u;
@@ -3051,6 +3060,9 @@ void update_dynamic_resolution() {
     last_wall = now_wall;
     ++at_level[g_dynamic_q];
     ++frames;
+    static int flat_frames = 0;
+    flat_frames = g_frame_3d_draws == 0u ? flat_frames + 1 : 0;
+    g_frame_3d_draws = 0u;
     if (ceiling_frames > 0 && --ceiling_frames == 0) ceiling = g_scale;
     static const bool test = std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_TEST") != nullptr;
     if (g_dynamic_pin != 0) {
@@ -3058,6 +3070,14 @@ void update_dynamic_resolution() {
     } else if (test) {
         // PC check: every level in turn, 60 frames each.
         g_dynamic_q = g_scale - 2 * static_cast<int>((frames / 60u) % static_cast<std::uint64_t>((g_scale - g_dynamic_min) / 2 + 1));
+    } else if (flat_frames >= 2) {
+        // Menus (2D only: text, pictures, movies) cost the GPU next to
+        // nothing: a slow menu frame is the CPU's, and a lower resolution
+        // would only blur the text. Full resolution.
+        g_dynamic_q = ceiling = g_scale;
+        ceiling_frames = 0;
+        hold = 0;
+        calm = 0;
     } else if (hold > 0) {
         --hold;
     } else if (smooth > 2.0 && wall_smooth > 35.0 && g_dynamic_q - 2 >= g_dynamic_min) {
