@@ -118,7 +118,17 @@ bool start(bool save, const std::vector<Slot> &slots, int focus) {
         } else {
             SceAppUtilSaveDataSlotParam param{};
             wide(param.title, 32, slots[i].title);
-            wide(param.subTitle, 64, slots[i].subtitle);
+            // The system dates a slot when it is written (the date given is
+            // ignored): the save's own date leads the subtitle instead.
+            std::string subtitle = slots[i].subtitle;
+            if (slots[i].modified != 0) {
+                SceDateTime when{};
+                local_time(slots[i].modified, when);
+                char date[32];
+                std::snprintf(date, sizeof(date), "%02d/%02d/%04d %02d:%02d - ", when.day, when.month, when.year, when.hour, when.minute);
+                subtitle = date + subtitle;
+            }
+            wide(param.subTitle, 64, subtitle);
             wide(param.detail, 256, slots[i].detail);
             // Icon: the game's, marked PSP (written by a PSP / Adrenaline) or PS VITA.
             const char *icon = slots[i].psp ? "app0:save_icons/psp.png" : "app0:save_icons/vita.png";

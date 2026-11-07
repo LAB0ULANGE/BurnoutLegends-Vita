@@ -198,12 +198,16 @@ std::array<std::uint32_t, 8> transfer_key(const std::array<std::uint32_t, 256> &
 
 // The copy early_transfers made for this kick, if the registers agree.
 // A kick the pre-pass did not see leaves the queue alone; copies the front end
-// never reaches (at most a few) are dropped when a later one matches.
+// never reaches are dropped when a later one matches, and the queue is
+// bounded (kEarlyMax): before gl-103f a copy that never matched blocked the
+// head (only 4 entries were looked at) and every later copy piled up behind
+// it, one texture copy per frame, until the heap ran out (std::bad_alloc
+// after ~4 min of a race on US/C1_V1).
+constexpr std::size_t kEarlyMax = 32u;
 bool take_early_transfer(std::uint32_t data, Transfer &out) {
     const auto key = transfer_key(g_commands, data);
     std::lock_guard lock(g_early_mutex);
-    constexpr std::size_t kLookAhead = 4u;
-    for (std::size_t i = 0; i < g_early.size() && i < kLookAhead; ++i) {
+    for (std::size_t i = 0; i < g_early.size(); ++i) {
         if (g_early[i].regs != key) continue;
         out = std::move(g_early[i].transfer);
         g_early.erase(g_early.begin(), g_early.begin() + static_cast<std::ptrdiff_t>(i) + 1);
@@ -1082,6 +1086,7 @@ bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std
     if (!found.empty()) {
         std::lock_guard lock(g_early_mutex);
         for (EarlyTransfer &early : found) g_early.push_back(std::move(early));
+        while (g_early.size() > kEarlyMax) g_early.pop_front();
     }
     return covered && !to_ram;
 }
