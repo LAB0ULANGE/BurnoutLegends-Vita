@@ -1628,7 +1628,7 @@ void flush() {
         ++use.binds;
         ++g_gpu.switches;
     }
-    if (g_tight_regions && !(target.dynamic && g_valid_region)) {
+    if (g_tight_regions) {  // dynamic valid-region targets too: their scenes at draw_q
         // vitaGL begins a GPU scene at the first draw into another framebuffer
         // than the scene's; the region it is given there must hold every draw
         // until the next one. A placeholder op is patched when the scene ends.
@@ -3012,6 +3012,13 @@ void update_dynamic_resolution() {
     const double wait = total - last_present;
     last_present = total;
     smooth = smooth * 0.75 + wait * 0.25;
+    // gl-98d: the frame's wall time decides too. The GPU may make present wait
+    // while the game still holds its 30 fps (a frame every 33.4 ms): only a
+    // frame late beyond 35 ms lowers the resolution.
+    static double last_wall = 0.0, wall_smooth = 33.4;
+    const double now_wall = host_now_ms();
+    if (last_wall != 0.0) wall_smooth = wall_smooth * 0.9 + std::min(now_wall - last_wall, 100.0) * 0.1;
+    last_wall = now_wall;
     ++at_level[g_dynamic_q];
     ++frames;
     if (ceiling_frames > 0 && --ceiling_frames == 0) ceiling = g_scale;
@@ -3023,7 +3030,7 @@ void update_dynamic_resolution() {
         g_dynamic_q = g_scale - 2 * static_cast<int>((frames / 60u) % static_cast<std::uint64_t>((g_scale - g_dynamic_min) / 2 + 1));
     } else if (hold > 0) {
         --hold;
-    } else if (smooth > 2.0 && g_dynamic_q - 2 >= g_dynamic_min) {
+    } else if (smooth > 2.0 && wall_smooth > 35.0 && g_dynamic_q - 2 >= g_dynamic_min) {
         // The GPU is late: one step down, and that level stays out of reach
         // for ~10 s so the picture does not pump between two sizes.
         ceiling = g_dynamic_q - 2;
@@ -3031,7 +3038,7 @@ void update_dynamic_resolution() {
         g_dynamic_q -= 2;
         hold = 6;
         calm = 0;
-    } else if (smooth < 0.6) {
+    } else if (smooth < 0.6 || wall_smooth < 34.0) {
         if (++calm >= 45 && g_dynamic_q + 2 <= ceiling) {
             g_dynamic_q += 2;
             calm = 0;
