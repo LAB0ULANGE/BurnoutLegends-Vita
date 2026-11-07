@@ -28,6 +28,8 @@ void set_lazy_levels(bool enabled);
 void set_valid_region(bool enabled);
 // Vita: GXM parameter buffer size before initialize (0: vitaGL default 16 MiB).
 void set_param_buffer_mib(int mib);
+// gl-90: GPU probe on every draw (log mode 100 normal, 101 32x32 scissor, 102 white texture, 103 no blending).
+void set_all_probe(bool enabled);
 void set_only_current_level(bool enabled);  // test
 void set_present_sharpen(bool enabled);
 // gl-77: foliage PRIMs past near_distance partly left out (2 in 3 kept), past far_distance more (1 in 3 kept).

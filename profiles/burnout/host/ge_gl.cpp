@@ -652,6 +652,13 @@ bool g_stencil_ab{};
 // depth writes, 5 cut-outs merged (world applied as decoded). (gl-64 probed scissor 1/16, no discard, untextured; gl-66
 // texture formats; gl-67 alpha test as blending.)
 bool g_gpu_probe{};
+// gl-90 GPU probe on every draw, 600 frames per mode: 0 normal, 1 scissored to
+// a 32x32 corner (pixel work gone, geometry and scenes kept), 2 a 1x1 white
+// texture (no texture fetch cost), 3 blending off.
+bool g_all_probe{std::getenv("PSPRECOMP_BURNOUT_ALL_PROBE") != nullptr};
+std::atomic<std::uint32_t> g_all_probe_mode{0u};
+GLint g_probe_scissor[4]{0, 0, 4096, 4096};
+GLuint g_probe_white{};
 // Test F: deferred cut-outs (drawn after the opaque scenery) blend with a 0/1 alpha instead of discarding.
 bool g_blend_deferred_cutouts{std::getenv("PSPRECOMP_BURNOUT_BLEND_DEFERRED") != nullptr};
 // Test: cut-out draws (alpha-tested, not blended: trees, hedges, fences) are not drawn.
@@ -3276,6 +3283,39 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
         return;
     }
 #endif
+    if (g_all_probe) {
+        const std::uint32_t mode = g_all_probe_mode.load(std::memory_order_relaxed);
+        if (mode == 1u) {
+            const GLboolean on = glIsEnabled(GL_SCISSOR_TEST);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(0, 0, 32, 32);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+            glScissor(g_probe_scissor[0], g_probe_scissor[1], g_probe_scissor[2], g_probe_scissor[3]);
+            if (!on) glDisable(GL_SCISSOR_TEST);
+            return;
+        }
+        if (mode == 2u) {
+            if (g_probe_white == 0u) {
+                const std::uint32_t white = 0xFFFFFFFFu;
+                glGenTextures(1, &g_probe_white);
+                glBindTexture(GL_TEXTURE_2D, g_probe_white);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            }
+            glBindTexture(GL_TEXTURE_2D, g_probe_white);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+            glBindTexture(GL_TEXTURE_2D, g_gl_bound_texture);
+            return;
+        }
+        if (mode == 3u) {
+            const GLboolean on = glIsEnabled(GL_BLEND);
+            if (on) glDisable(GL_BLEND);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+            if (on) glEnable(GL_BLEND);
+            return;
+        }
+    }
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
 }
 
@@ -3387,6 +3427,10 @@ void replay(const Frame &frame) {
             const int x0 = scaled(x, g_bound_scale), y0 = scaled(y, g_bound_scale);
             glScissor(x0, y0, (scaled(x + static_cast<int>(op[2]), g_bound_scale) - x0) / cut,
                       (scaled(y + static_cast<int>(op[3]), g_bound_scale) - y0) / cut);
+            g_probe_scissor[0] = x0;
+            g_probe_scissor[1] = y0;
+            g_probe_scissor[2] = (scaled(x + static_cast<int>(op[2]), g_bound_scale) - x0) / cut;
+            g_probe_scissor[3] = (scaled(y + static_cast<int>(op[3]), g_bound_scale) - y0) / cut;
         }
             op += 4;
             break;
@@ -3619,6 +3663,7 @@ void set_thin_foliage(bool enabled, float near_distance, float far_distance) {
 void set_offscreen_1x(bool enabled) { g_offscreen_1x = enabled; }
 void set_stencil_ab(bool enabled) { g_stencil_ab = enabled; }
 void set_gpu_probe(bool enabled) { g_gpu_probe = enabled; }
+void set_all_probe(bool enabled) { g_all_probe = g_all_probe || enabled; }
 void set_fragment_mediump(bool enabled) { g_fragment_mediump = enabled; }
 void set_merge_cutouts(bool enabled, bool all) {
     g_merge_cutouts = g_merge_cutouts || enabled;
@@ -3945,6 +3990,7 @@ void present(std::uint32_t address) {
     phase = 11u;
     ++g_stats.frames;
     if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 6u), std::memory_order_relaxed);
+    if (g_all_probe) g_all_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 4u), std::memory_order_relaxed);
     static const char *fixed_probe = std::getenv("PSPRECOMP_BURNOUT_PROBE_MODE");
     if (fixed_probe != nullptr) {
         g_gpu_probe = true;
@@ -3988,7 +4034,8 @@ void present(std::uint32_t address) {
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       busy,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
-                      g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
+                      g_all_probe ? 100 + static_cast<int>(((g_stats.frames - 1u) / 600u) % 4u)
+                      : g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),

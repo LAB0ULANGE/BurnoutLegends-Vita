@@ -65,6 +65,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
 constexpr const char *kBuild = "gl-89";
+constexpr bool kAllProbe = false;  // gl-90 test: GPU probe on every draw, 600 frames per mode
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
@@ -356,6 +357,7 @@ int main() {
         burnout::render::configure(render);
         burnout::gl::set_stencil_ab(kStencilAB);
         burnout::gl::set_gpu_probe(kGpuProbe);
+        burnout::gl::set_all_probe(kAllProbe);
         burnout::gl::set_no_trees(kNoTrees);
         burnout::gl::set_fragment_mediump(kMediump);
         burnout::gl::set_reorder_cutouts(kReorder);
