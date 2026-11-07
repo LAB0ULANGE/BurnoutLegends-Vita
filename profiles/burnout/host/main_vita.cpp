@@ -64,7 +64,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-101g";
+constexpr const char *kBuild = "gl-101h";
 constexpr bool kAllProbe = false;  // gl-90/91 tests: GPU probe on every draw, 600 frames per mode
 constexpr int kProbeSet = 1;  // 1: pixels (gl-90), 2: draws (gl-92), 3: geometry (gl-93)
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
@@ -223,10 +223,11 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
     options.live_buttons = [] {
         SceCtrlData pad{};
         sceCtrlPeekBufferPositive(0, &pad, 1);
-        // L + R + SELECT: a screenshot in ux0:data/burnout-frames (one per press).
+        // L + R + DOWN: a screenshot in ux0:data/burnout-frames and the next
+        // frame's draws in the log (one per press; L + R + SELECT opens the VSH menu).
         static bool held = false;
-        const bool combo = (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT)) ==
-                           (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT);
+        const bool combo = (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_DOWN)) ==
+                           (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_DOWN);
         if (combo && !held) burnout::render::request_capture();
         held = combo;
         return static_cast<std::uint32_t>(pad.buttons) & 0xF3F9u;  // PSP-compatible bits
