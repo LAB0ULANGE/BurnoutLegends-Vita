@@ -82,6 +82,7 @@ constexpr int kParamBufferMiB = 0;  // gl-89q test: GXM parameter buffer (0: 16 
 constexpr bool kValidRegion = true;  // one target per screen buffer, patched vitaGL processes only the drawn tiles
 //constexpr bool kDynamicRes = false;  // gl-88: off. Any dynamic target set (76-87d) made present wait 12-35 ms; one level fixed at creation (87e, static) 0.4 ms
 constexpr bool kOnlyLevel = false;  // test: dynamic targets with the current level alone
+constexpr bool kEffect1x = false;  // gl-95 test: full-width effect buffer 110000 at 1x
 constexpr bool kLazyLevels = true;  // dynamic levels not cleared at creation (no GXM render target until drawn)
 constexpr float kDynamicPin = 0.0f;  // test: that scale always (1.5 = 720x408), targets never recreated
 constexpr bool kThinFoliage = false;  // gl-77: far foliage partly left out
@@ -349,6 +350,7 @@ int main() {
         std::fprintf(stderr, "[vita] render scale %g\n", static_cast<double>(render.render_scale));
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::gl::set_lazy_levels(kLazyLevels);
+        burnout::gl::set_effect_1x(kEffect1x);
         burnout::gl::set_valid_region(kValidRegion);
         burnout::gl::set_param_buffer_mib(kParamBufferMiB);
         burnout::gl::set_only_current_level(kOnlyLevel);

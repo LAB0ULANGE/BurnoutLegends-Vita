@@ -639,6 +639,7 @@ bool g_dynamic_resolution{std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_RES") != nullpt
 int g_dynamic_min{12};
 int g_dynamic_q{0};  // 0 until the first frame: the render scale
 bool g_lazy_levels{false};
+bool g_effect_1x{false};  // gl-95 test: effect buffer 110000 at 1x
 // gl-89: one target per screen buffer at the render scale; a lower level is
 // drawn in its lower-left part and the Vita's GPU told to process only the
 // tiles there (patched vitaGL: vglSetFramebufferValidRegion).
@@ -1034,6 +1035,12 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     // ones are the game's effect buffers, which offscreen_1x keeps at 1x.
     target.dynamic = g_dynamic_resolution && target.width >= 480;
     int scale = g_offscreen_1x && target.width < 480 ? 8 : g_scale;
+    // gl-95 test: the full-width effect buffer (110000: 4 draws, sampled 3 times a frame) at 1x.
+    static const bool effect_1x = g_effect_1x || std::getenv("PSPRECOMP_BURNOUT_EFFECT_1X") != nullptr;
+    if (effect_1x && key == 0x110000u) {
+        target.dynamic = false;
+        scale = 8;
+    }
     if (target.dynamic && g_valid_region) {
         // Allocated at the render scale, drawn at draw_q (see flush).
         record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
@@ -3684,6 +3691,7 @@ void set_dynamic_resolution(bool enabled, float min_scale, float pinned) {
     }
 }
 void set_lazy_levels(bool enabled) { g_lazy_levels = enabled; }
+void set_effect_1x(bool enabled) { g_effect_1x = enabled; }
 void set_valid_region(bool enabled) { g_valid_region = g_valid_region || enabled; }
 void set_only_current_level(bool enabled) { g_only_current_level = g_only_current_level || enabled; }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }

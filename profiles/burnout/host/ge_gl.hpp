@@ -24,6 +24,7 @@ bool initialize(std::string &error);
 void set_render_scale(float scale);
 // Vita: sharpen the picture as it is enlarged to the screen (render scale below 2).
 void set_lazy_levels(bool enabled);
+void set_effect_1x(bool enabled);  // gl-95 test
 // gl-89: dynamic resolution in one target per screen buffer, GPU tiles limited to the drawn part.
 void set_valid_region(bool enabled);
 // Vita: GXM parameter buffer size before initialize (0: vitaGL default 16 MiB).
