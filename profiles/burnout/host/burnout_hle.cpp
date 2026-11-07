@@ -10,6 +10,8 @@
 // pure CPU cost of that frame, which is what the benchmark measures.
 #include "core_load.hpp"
 #include "movie.hpp"
+#include "save_dialog.hpp"
+#include <sys/stat.h>
 #include <chrono>
 #include "burnout_hle.hpp"
 #include "audio_out.hpp"
@@ -288,6 +290,12 @@ struct Kernel {
     std::map<std::uint32_t, MpegMovie> mpeg_movies;              // by mpeg handle
     std::string movie_path;                                      // host path of the last .pmf opened
     std::string loaded_save;                                     // save name loaded or written this session
+    struct SavePending {                                         // a list dialog waiting for the player's choice
+        bool active{};
+        std::uint32_t params{}, mode{};
+        std::string game, file;
+        std::vector<std::string> candidates;
+    } save_pending;
 
     std::set<std::pair<std::string, std::uint32_t>> implemented;
     std::map<std::string, std::uint64_t> stub_calls;
@@ -2260,6 +2268,22 @@ void save_log(const std::string &line) {
     std::fflush(stderr);
 }
 
+constexpr std::uint32_t kSavedataPending = 0xFFFFFFFFu;  // the native dialog answers later
+std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t mode, const std::string &game, const std::string &save,
+                               const std::string &file);
+
+// The native dialog's answer: the chosen entry is loaded or saved; a cancel
+// is the PSP dialog's "cancelled" result (1).
+std::uint32_t savedata_resolve(Runtime &r, int choice) {
+    Kernel::SavePending pending = std::move(k.save_pending);
+    k.save_pending = Kernel::SavePending{};
+    if (choice < 0 || static_cast<std::size_t>(choice) >= pending.candidates.size()) {
+        save_log("savedata mode=" + std::to_string(pending.mode) + ": cancelled");
+        return 1u;
+    }
+    return savedata_perform(r, pending.params, pending.mode, pending.game, pending.candidates[static_cast<std::size_t>(choice)], pending.file);
+}
+
 std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
     auto &memory = r.memory();
     const std::uint32_t mode = memory.load32(params + 48u);
@@ -2292,11 +2316,44 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
             for (const auto &candidate : candidates) if (chosen.empty() && !exists(candidate)) chosen = candidate;
             if (chosen.empty() && !candidates.empty()) chosen = candidates.front();
         }
+        // The Vita's own save dialog, when there is one: the choice comes
+        // later (sceUtilitySavedataGetStatus answers "running" meanwhile).
+        std::vector<save_dialog::Slot> slots;
+        int focus = -1;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            save_dialog::Slot slot;
+            const fs::path data = root / (game + candidates[i]) / file;
+            slot.exists = exists(candidates[i]);
+            slot.title = "Profil " + std::to_string(i + 1u);
+            slot.subtitle = "Burnout Legends";
+            slot.detail = game + candidates[i];
+            struct stat info {};
+            if (slot.exists && stat(data.string().c_str(), &info) == 0) slot.modified = info.st_mtime;
+            if (focus < 0 && candidates[i] == chosen) focus = static_cast<int>(i);
+            slots.push_back(std::move(slot));
+        }
+        if (save_dialog::start(mode == 5u, slots, focus)) {
+            k.save_pending = Kernel::SavePending{true, params, mode, game, file, candidates};
+            save_log("savedata mode=" + std::to_string(mode) + ": native dialog, " + std::to_string(candidates.size()) + " entries");
+            return kSavedataPending;
+        }
         if (chosen.empty()) {
             save_log("savedata mode=" + std::to_string(mode) + " " + game + ": no listed save");
             return kSavedataNoData;
         }
         save = chosen;
+    }
+    return savedata_perform(r, params, mode, game, save, file);
+}
+
+// The load or save of `save` (a list dialog's choice written back into the
+// parameters).
+std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t mode, const std::string &game, const std::string &save,
+                               const std::string &file) {
+    auto &memory = r.memory();
+    const fs::path root = k.options.memstick / "PSP" / "SAVEDATA";
+    std::error_code ec;
+    if (mode == 4u || mode == 5u) {
         std::vector<std::uint8_t> name(20u, 0u);
         std::copy_n(save.begin(), std::min<std::size_t>(save.size(), 19u), name.begin());
         memory.copy_in(params + 76u, name);
@@ -2348,7 +2405,14 @@ void install_utility(Runtime &rt) {
     });
     reg(rt, lib, 0x9790B33Cu, [](Runtime &, AllegrexContext &ctx) { k.savedata.status = 4u; ret(ctx, 0u); });
     reg_value(rt, lib, 0xD4B95FFBu, 0u);
-    reg(rt, lib, 0x8874DBE0u, [](Runtime &r, AllegrexContext &ctx) { ret(ctx, utility_status(r, k.savedata)); });
+    reg(rt, lib, 0x8874DBE0u, [](Runtime &r, AllegrexContext &ctx) {  // SavedataGetStatus
+        if (k.save_pending.active && k.savedata.status == 2u) {
+            const int choice = save_dialog::poll();
+            if (choice == save_dialog::kRunning) { ret(ctx, 2u); return; }
+            k.savedata.result = savedata_resolve(r, choice);
+        }
+        ret(ctx, utility_status(r, k.savedata));
+    });
 
     reg(rt, lib, 0x2AD8E239u, [](Runtime &r, AllegrexContext &ctx) {  // MsgDialogInitStart
         const std::uint32_t params = arg(ctx, 0);

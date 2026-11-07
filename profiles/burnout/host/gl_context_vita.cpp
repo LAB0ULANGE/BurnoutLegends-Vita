@@ -1,5 +1,6 @@
 // vitaGL context for the PS Vita GE renderer: 960x544, shaders compiled at
 // run time by vitaShaRK (libshacccg.suprx must be installed).
+#include "save_dialog.hpp"
 #include "gl_api.hpp"
 
 #include "ge_gl.hpp"
@@ -66,7 +67,8 @@ bool create_context(std::string &error) {
     return true;
 }
 
-void swap_buffers() { vglSwapBuffers(GL_FALSE); }
+// The Vita save dialog draws itself over the frames swapped while it is open.
+void swap_buffers() { vglSwapBuffers(burnout::save_dialog::drawing() ? GL_TRUE : GL_FALSE); }
 
 std::string memory_report() {
     char text[160];
