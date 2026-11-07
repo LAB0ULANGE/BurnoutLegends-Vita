@@ -29,6 +29,8 @@ void set_effect_1x(bool enabled);  // gl-95 test
 void set_valid_region(bool enabled);
 // Vita: GXM parameter buffer size before initialize (0: vitaGL default 16 MiB).
 void set_param_buffer_mib(int mib);
+// Vita: GXM scenes per frame of the FBO render targets (vitaGL; before initialize).
+void set_fbo_scenes(int scenes);
 // gl-90: GPU probe on every draw (log mode 100 normal, 101 32x32 scissor, 102 white texture, 103 no blending).
 void set_all_probe(bool enabled);
 // gl-91: probe set 2 (log 200 normal, 201 no draws, 202 no effect-buffer draws, 203 present without quad).

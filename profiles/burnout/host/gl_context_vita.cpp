@@ -14,6 +14,8 @@ namespace burnout::gl {
 
 int g_param_buffer_mib = 0;  // GXM parameter buffer, 0: vitaGL default (16 MiB)
 void set_param_buffer_mib(int mib) { g_param_buffer_mib = mib; }
+int g_fbo_scenes = 8;  // GXM scenes per frame of each FBO render target
+void set_fbo_scenes(int scenes) { g_fbo_scenes = scenes; }
 
 bool create_context(std::string &error) {
     // The guest heap is reserved at startup, so size each vitaGL pool from
@@ -38,7 +40,12 @@ bool create_context(std::string &error) {
     // vitaGL creates each render target for one scene a frame. The game goes
     // back to its frame buffer 5-6 times a frame (effect buffers between), so
     // every new scene on it waited for the GPU to finish the previous one.
-    vglSetupRenderTargetScenesNum(1, 8);
+    vglSetupRenderTargetScenesNum(1, static_cast<std::uint8_t>(g_fbo_scenes));
+    {
+        char line[64];
+        std::snprintf(line, sizeof(line), "FBO render targets: %d scenes per frame", g_fbo_scenes);
+        trace(line);
+    }
     // gl-89q: a full parameter buffer splits scenes into partial renders
     // (every tile stored and reloaded), more often the larger the target.
     if (g_param_buffer_mib > 0) {
