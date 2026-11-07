@@ -110,6 +110,7 @@ Settings load(const std::string &root) {
             else if (name == "offscreen_1x") settings.offscreen_1x = value != 0;
             else if (name == "cache_sublists") settings.cache_sublists = value != 0;
             else if (name == "sound_core1") settings.sound_core1 = value != 0;
+            else if (name == "save_slot") settings.save_slot = value >= 0 && value < 4 ? value : 0;
             else if (name == "sas_thread") settings.sas_thread = value != 0;
             // cached_gpu_memory is no longer offered: textures went missing on the Vita.
         }
@@ -133,6 +134,7 @@ void save(const std::string &root, const Settings &settings) {
                  settings.render_scale, flag(settings.sound), flag(settings.frame_skip), flag(settings.shader_cache));
     std::fprintf(file, "skip_when_behind %d\noffscreen_1x %d\ncache_sublists %d\nsound_core1 %d\n", flag(settings.skip_when_behind),
                  flag(settings.offscreen_1x), flag(settings.cache_sublists), flag(settings.sound_core1));
+    std::fprintf(file, "save_slot %d\n", settings.save_slot);
     std::fclose(file);
 }
 
@@ -172,9 +174,11 @@ Settings run(const std::string &root, const std::string &build) {
     int offscreen = flag(!settings.offscreen_1x);
     int sublists = flag(!settings.cache_sublists);
     int sound_core = flag(!settings.sound_core1);
+    int profile = settings.save_slot;
     int start = 0;
     const std::vector<Item> items = {
         {"Mode", {"Jeu libre", "Course test auto"}, &mode, "Course test: menus joues seuls jusqu'a une course."},
+        {"Profil", {"1", "2", "3", "4"}, &profile, "Profil charge par le jeu (un nouveau profil prend une place libre)."},
         {"Resolution", {"960x544 (Vita)", "840x476", "720x408", "480x272 (PSP)"}, &resolution, "Plafond: baisse seule si le jeu ralentit (30 fps tenus)."},
         {"Son/musique", {"Oui", "Non"}, &sound, "Sans le son, le jeu tourne un peu plus vite."},
         {"Saut d'images", {"Oui", "Non"}, &skip, "Saute une image si le rendu prend du retard."},
@@ -186,7 +190,7 @@ Settings run(const std::string &root, const std::string &build) {
         {"> LANCER LE JEU <", {}, &start, "X ou START pour lancer."},
     };
 
-    constexpr int kTop = 90, kRow = 28;
+    constexpr int kTop = 88, kRow = 26;
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
     int cursor = static_cast<int>(items.size()) - 1;
     std::uint32_t held = 0xFFFFFFFFu;  // ignore buttons already down at launch
@@ -243,6 +247,7 @@ Settings run(const std::string &root, const std::string &build) {
     settings.offscreen_1x = offscreen == 0;
     settings.cache_sublists = sublists == 0;
     settings.sound_core1 = sound_core == 0;
+    settings.save_slot = profile;
     save(root, settings);
 
     screen.clear();

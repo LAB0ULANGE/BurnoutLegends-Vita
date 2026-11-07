@@ -18,6 +18,7 @@ struct Settings {
     bool skip_when_behind{};      // the game never waits for the GPU side (frames skipped instead)
     bool offscreen_1x{};          // the game's effect buffers at 1x (off: changed the car lighting, gain negligible)
     bool cache_sublists{true};    // unchanged GE sub-lists forwarded from a copy
+    int save_slot{0};             // profile loaded: entry of the game's save list (0-3)
     bool sound_core1{true};       // SAS mixer and audio output on core 1 instead of beside the GL thread
     bool sas_thread{true};        // SAS mixing on its own thread; the emulation keeps shadow voices (gl-58)
 };

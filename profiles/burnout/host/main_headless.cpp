@@ -53,6 +53,7 @@ Cli parse(int argc, char **argv) {
         else if (key == "--usrdir") o.usrdir = value();
         else if (key == "--disc") o.disc_root = value();
         else if (key == "--ms0") o.memstick = value();
+        else if (key == "--save-slot") o.save_slot = static_cast<std::uint32_t>(std::stoul(value()));
         else if (key == "--script") cli.script = value();
         else if (key == "--report") cli.report = value();
         else if (key == "--frames-csv") o.frames_csv = value();

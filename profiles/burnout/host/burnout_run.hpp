@@ -18,6 +18,7 @@ struct BenchOptions {
     std::filesystem::path usrdir;
     std::filesystem::path disc_root;
     std::filesystem::path memstick;
+    std::uint32_t save_slot{};  // profile: entry of the game's save list loaded (0 = first)
     InputScript script;
     std::vector<std::filesystem::path> nid_tables;
     std::uint64_t max_vblanks{60u * 60u * 5u};

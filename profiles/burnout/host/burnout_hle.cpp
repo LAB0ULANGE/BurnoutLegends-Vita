@@ -269,6 +269,7 @@ struct Kernel {
     std::map<std::uint32_t, std::uint32_t> mpeg_ringbuffer_of;   // mpeg handle -> ringbuffer
     std::map<std::uint32_t, MpegMovie> mpeg_movies;              // by mpeg handle
     std::string movie_path;                                      // host path of the last .pmf opened
+    std::string loaded_save;                                     // save name loaded or written this session
 
     std::set<std::pair<std::string, std::uint32_t>> implemented;
     std::map<std::string, std::uint64_t> stub_calls;
@@ -2224,14 +2225,26 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
 
     const bool list_mode = mode == 4u || mode == 5u;
     if (list_mode && memory.load32(params + 96u) != 0u) {
-        // List dialogs: the player picks the first entry that exists (load) or
-        // the first entry offered (save), as if pressing CROSS on it.
+        // List dialogs (no system UI here): a load takes the profile chosen on
+        // the launch menu (save_slot) when it exists, else the first one that
+        // exists; a save keeps the profile loaded this session, else takes the
+        // first free entry (a new profile never overwrites another).
         const std::uint32_t list = memory.load32(params + 96u);
-        std::string chosen;
+        std::vector<std::string> candidates;
         for (std::uint32_t i = 0; i < 64u; ++i) {
             const std::string candidate = memory.read_c_string(list + i * 20u, 20u);
             if (candidate.empty()) break;
-            if (mode == 5u || fs::exists(root / (game + candidate) / file, ec)) { chosen = candidate; break; }
+            candidates.push_back(candidate);
+        }
+        const auto exists = [&](const std::string &candidate) { return fs::exists(root / (game + candidate) / file, ec); };
+        std::string chosen;
+        if (mode == 4u) {
+            if (k.options.save_slot < candidates.size() && exists(candidates[k.options.save_slot])) chosen = candidates[k.options.save_slot];
+            for (const auto &candidate : candidates) if (chosen.empty() && exists(candidate)) chosen = candidate;
+        } else {
+            for (const auto &candidate : candidates) if (candidate == k.loaded_save) chosen = candidate;
+            for (const auto &candidate : candidates) if (chosen.empty() && !exists(candidate)) chosen = candidate;
+            if (chosen.empty() && !candidates.empty()) chosen = candidates.front();
         }
         if (chosen.empty()) {
             save_log("savedata mode=" + std::to_string(mode) + " " + game + ": no listed save");
@@ -2256,6 +2269,7 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
         const std::size_t read = host ? std::fread(host, 1u, buffer_size, in) : 0u;
         std::fclose(in);
         memory.store32(params + 124u, static_cast<std::uint32_t>(read));
+        k.loaded_save = save;
         save_log("savedata load " + path.generic_string() + " " + std::to_string(read) + " bytes");
         return 0u;
     }
@@ -2270,6 +2284,7 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
             if (host != nullptr) written = std::fwrite(host, 1u, size, out);
             std::fclose(out);
         }
+        k.loaded_save = save;
         save_log("savedata save mode=" + std::to_string(mode) + " " + path.generic_string() + " " + std::to_string(size) +
                  " bytes: " + (opened ? std::to_string(written) + " written" : std::string("CANNOT OPEN (") + ec.message() + ")"));
         return 0u;

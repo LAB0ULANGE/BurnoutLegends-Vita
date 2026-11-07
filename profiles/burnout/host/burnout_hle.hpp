@@ -17,6 +17,9 @@ struct HleOptions {
     std::filesystem::path usrdir;      // PSP_GAME/USRDIR of the user's own disc
     std::filesystem::path disc_root;   // directory holding PARAM.SFO etc. (optional)
     std::filesystem::path memstick;    // writable stand-in for ms0:
+    // Save list dialogs (no system UI): load picks this entry of the game's
+    // list when it exists (0 = first), a new save the first free entry.
+    std::uint32_t save_slot{};
     std::uint32_t user_arena_start{};  // first byte after the loaded ELF image
     std::uint32_t module_gp{};
     bool verbose{};
