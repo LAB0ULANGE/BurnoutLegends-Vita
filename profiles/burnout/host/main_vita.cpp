@@ -49,7 +49,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x2674] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x3584] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -63,7 +63,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-82";
+constexpr const char *kBuild = "gl-88";
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
 constexpr bool kNoTrees = false;
 constexpr bool kMediump = false;  // test C: variant fragment shaders at medium precision
@@ -74,7 +74,9 @@ constexpr bool kCutoutPrepass = false;  // gl-72: cut-outs depth-only with disca
 constexpr unsigned kDrawBudget = 0;  // gl-74 test: draws past this per frame dropped (0: none)
 constexpr int kForceScale = 0;  // test builds: 4 = 840x476, 3 = 720x408, 1 = 480x272 without the menu (0: settings)
 constexpr bool kSharpen = true;  // sharpen the enlarged picture (render scale below 2)
-constexpr bool kDynamicRes = true;  // 960x544 lowered towards 720x408 while the GPU is late
+constexpr bool kDynamicRes = false;  // gl-88: off. Any dynamic target set (76-87d) made present wait 12-35 ms; one level fixed at creation (87e, static) 0.4 ms
+constexpr bool kOnlyLevel = false;  // test: dynamic targets with the current level alone
+constexpr bool kLazyLevels = true;  // dynamic levels not cleared at creation (no GXM render target until drawn)
 constexpr float kDynamicPin = 0.0f;  // test: that scale always (1.5 = 720x408), targets never recreated
 constexpr bool kThinFoliage = false;  // gl-77: far foliage partly left out
 constexpr float kThinNear = 256.0f, kThinFar = 512.0f;
@@ -339,6 +341,8 @@ int main() {
         render.variant_list = std::string(kRoot) + "shader_variants.txt";
         std::fprintf(stderr, "[vita] render scale %g\n", static_cast<double>(render.render_scale));
         std::fprintf(stderr, "[vita] starting the renderer\n");
+        burnout::gl::set_lazy_levels(kLazyLevels);
+        burnout::gl::set_only_current_level(kOnlyLevel);
         burnout::gl::set_present_sharpen(kSharpen);
         burnout::gl::set_dynamic_resolution(kDynamicRes, 1.5f, kDynamicPin);
         burnout::gl::set_thin_foliage(kThinFoliage, kThinNear, kThinFar);

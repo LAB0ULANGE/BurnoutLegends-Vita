@@ -637,6 +637,8 @@ bool g_offscreen_1x{};
 bool g_dynamic_resolution{std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_RES") != nullptr};
 int g_dynamic_min{12};
 int g_dynamic_q{0};  // 0 until the first frame: the render scale
+bool g_lazy_levels{false};
+bool g_only_current_level{std::getenv("PSPRECOMP_BURNOUT_ONLY_LEVEL") != nullptr};  // dynamic levels not cleared at creation
 int g_dynamic_pin{0};  // test: this level always (no recreation), 0: by GPU load
 bool g_stencil_ab{};
 // GPU probe (diagnostic): every 600 frames the alpha-tested textured draws
@@ -1014,10 +1016,13 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
         const int current = g_dynamic_q != 0 ? g_dynamic_q : g_scale;
         for (int i = 0; i < 4 && g_scale - 2 * i >= g_dynamic_min; ++i) {
             const int q = g_scale - 2 * i;
+            if (g_only_current_level && q != current) continue;  // test: the current level alone
             target.level_framebuffer[i] = i == 0 ? target.framebuffer : g_next_framebuffer_id++;
             target.level_texture[i] = i == 0 ? target.texture : g_next_texture_id++;
+            // Levels other than the current one are not cleared (see create_target).
+            const std::uint32_t lazy = g_lazy_levels && q != current ? 0x100u : 0u;
             record(Op::CreateTarget, {target.level_framebuffer[i], target.level_texture[i], static_cast<std::uint32_t>(target.width),
-                                      static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(q)});
+                                      static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(q) | lazy});
             if (q == current) {
                 target.framebuffer = target.level_framebuffer[i];
                 target.texture = target.level_texture[i];
@@ -2894,7 +2899,7 @@ int g_bound_scale{8};
 
 std::vector<GLuint> g_gl_depths;  // depth/stencil renderbuffer by framebuffer id
 
-void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int height) {
+void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int height, bool clear = true) {
     if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
         // Recreated at another size (dynamic resolution): the old objects go.
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -2932,7 +2937,9 @@ void create_target(GLuint framebuffer_id, GLuint texture_id, int width, int heig
     glDepthMask(GL_TRUE);
     glStencilMask(0xFFu);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    // Not cleared (lazy): vitaGL gives a framebuffer its GXM render target and
+    // depth buffer at its first scene, so a level never drawn costs nothing.
+    if (clear) glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     if (framebuffer_id >= g_gl_framebuffers.size()) g_gl_framebuffers.resize(framebuffer_id + 1u, 0u);
     g_gl_framebuffers[framebuffer_id] = framebuffer;
     if (framebuffer_id >= g_gl_depths.size()) g_gl_depths.resize(framebuffer_id + 1u, 0u);
@@ -3412,8 +3419,9 @@ void replay(const Frame &frame) {
         case Op::UniformMatrix: set_slot(op[0], floats(op[1]), 16u, true); op += 2; break;
         case Op::Draw: draw(frame, op); op += 9; break;
         case Op::CreateTarget: {
-            const int scale = static_cast<int>(op[4]);
-            create_target(op[0], op[1], scaled(static_cast<int>(op[2]), scale), scaled(static_cast<int>(op[3]), scale));
+            const int scale = static_cast<int>(op[4] & 0xFFu);
+            create_target(op[0], op[1], scaled(static_cast<int>(op[2]), scale), scaled(static_cast<int>(op[3]), scale),
+                          (op[4] & 0x100u) == 0u);
             if (op[0] >= g_framebuffer_scales.size()) g_framebuffer_scales.resize(op[0] + 1u, g_scale);
             g_framebuffer_scales[op[0]] = scale;
             g_bound_scale = scale;  // create_target leaves it bound
@@ -3571,6 +3579,8 @@ void set_dynamic_resolution(bool enabled, float min_scale, float pinned) {
         g_dynamic_q = g_dynamic_pin;
     }
 }
+void set_lazy_levels(bool enabled) { g_lazy_levels = enabled; }
+void set_only_current_level(bool enabled) { g_only_current_level = g_only_current_level || enabled; }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
 void set_thin_foliage(bool enabled, float near_distance, float far_distance) {
     if (!enabled) return;

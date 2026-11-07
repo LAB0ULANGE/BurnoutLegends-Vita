@@ -23,6 +23,8 @@ bool initialize(std::string &error);
 // Internal resolution as a multiple of the PSP's 480x272 (before initialize).
 void set_render_scale(float scale);
 // Vita: sharpen the picture as it is enlarged to the screen (render scale below 2).
+void set_lazy_levels(bool enabled);
+void set_only_current_level(bool enabled);  // test
 void set_present_sharpen(bool enabled);
 // gl-77: foliage PRIMs past near_distance partly left out (2 in 3 kept), past far_distance more (1 in 3 kept).
 void set_thin_foliage(bool enabled, float near_distance, float far_distance);
