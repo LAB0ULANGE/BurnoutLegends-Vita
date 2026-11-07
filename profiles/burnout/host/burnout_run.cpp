@@ -85,6 +85,7 @@ BenchResult run_benchmark(const BenchOptions &options) {
     hle.memstick = options.memstick;
     hle.save_slot = options.save_slot;
     hle.save_backup = options.save_backup;
+    hle.extra_memsticks = options.extra_memsticks;
     hle.user_arena_start = static_cast<std::uint32_t>(image_end);
     hle.module_gp = module->gp;
     hle.verbose = options.verbose;

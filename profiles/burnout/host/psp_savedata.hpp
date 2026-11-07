@@ -33,6 +33,9 @@ struct SfoInfo {
 bool read_sfo(const std::vector<std::uint8_t> &sfo, SfoInfo &info);
 // The hash mode the save's PARAM.SFO says its files were written with (0 = plain).
 int crypt_mode(const std::vector<std::uint8_t> &sfo);
+// Whether a PSP (or Adrenaline) signed it: only the console-bound hash it
+// holds cannot be made elsewhere (this port leaves it as it found it).
+bool console_signed(const std::vector<std::uint8_t> &sfo);
 // The hash recorded for `file` in PARAM.SFO's file list; false if none.
 bool file_hash(const std::vector<std::uint8_t> &sfo, const std::string &file, Hash &hash);
 // A PARAM.SFO for `info` whose file list holds `file` with `hash`, signed as

@@ -336,6 +336,14 @@ int crypt_mode(const std::vector<std::uint8_t> &sfo) {
     }
 }
 
+bool console_signed(const std::vector<std::uint8_t> &sfo) {
+    std::vector<SfoEntry> entries;
+    if (!parse_sfo(sfo, entries)) return false;
+    const SfoEntry *params = find(entries, "SAVEDATA_PARAMS");
+    if (params == nullptr || params->value.size() < 0x30u) return false;
+    return std::any_of(params->value.begin() + 0x20, params->value.begin() + 0x30, [](std::uint8_t b) { return b != 0u; });
+}
+
 bool file_hash(const std::vector<std::uint8_t> &sfo, const std::string &file, Hash &hash) {
     std::vector<SfoEntry> entries;
     if (!parse_sfo(sfo, entries)) return false;

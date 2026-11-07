@@ -1,5 +1,8 @@
 #include "save_dialog.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 #if defined(__vita__)
 #include <psp2/apputil.h>
 #include <psp2/common_dialog.h>
@@ -176,8 +179,23 @@ bool drawing() { return g_drawing.load(std::memory_order_relaxed); }
 
 #else
 
-bool start(bool, const std::vector<Slot> &, int) { return false; }
-int poll() { return kCancelled; }
+// PC test tool: PSPRECOMP_BURNOUT_SAVE_CHOICE=n lists the slots in the log
+// and answers slot n (-1: cancel), as the Vita's dialog would.
+namespace {
+int g_answer = kCancelled;
+}
+
+bool start(bool save, const std::vector<Slot> &slots, int focus) {
+    const char *choice = std::getenv("PSPRECOMP_BURNOUT_SAVE_CHOICE");
+    if (choice == nullptr) return false;
+    std::fprintf(stderr, "[save] test dialog (%s), focus %d:\n", save ? "save" : "load", focus);
+    for (std::size_t i = 0; i < slots.size(); ++i)
+        std::fprintf(stderr, "[save]   %zu %s | %s | %s\n", i, slots[i].exists ? slots[i].title.c_str() : "(vide)", slots[i].subtitle.c_str(),
+                     slots[i].detail.c_str());
+    g_answer = std::atoi(choice);
+    return true;
+}
+int poll() { return g_answer; }
 bool drawing() { return false; }
 
 #endif

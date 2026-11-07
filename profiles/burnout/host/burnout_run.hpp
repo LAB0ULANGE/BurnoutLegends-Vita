@@ -20,6 +20,7 @@ struct BenchOptions {
     std::filesystem::path memstick;
     std::uint32_t save_slot{};  // profile: entry of the game's save list loaded (0 = first)
     std::filesystem::path save_backup;  // copy of the save folders before the first write (empty: none)
+    std::vector<std::filesystem::path> extra_memsticks;  // other PSP memory sticks searched for saves
     InputScript script;
     std::vector<std::filesystem::path> nid_tables;
     std::uint64_t max_vblanks{60u * 60u * 5u};

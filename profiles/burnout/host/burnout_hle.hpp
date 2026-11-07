@@ -18,6 +18,7 @@ struct HleOptions {
     std::filesystem::path disc_root;   // directory holding PARAM.SFO etc. (optional)
     std::filesystem::path memstick;    // writable stand-in for ms0:
     std::filesystem::path save_backup; // copy of the save folders made before the first write (empty: none)
+    std::vector<std::filesystem::path> extra_memsticks;  // other PSP memory sticks searched for saves (Adrenaline's)
     // Save list dialogs (no system UI): load picks this entry of the game's
     // list when it exists (0 = first), a new save the first free entry.
     std::uint32_t save_slot{};

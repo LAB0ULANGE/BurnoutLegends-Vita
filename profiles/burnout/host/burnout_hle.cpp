@@ -12,6 +12,8 @@
 #include "movie.hpp"
 #include "save_dialog.hpp"
 #include "psp_savedata.hpp"
+#include <cctype>
+#include <map>
 #include <sys/stat.h>
 #include <chrono>
 #include "burnout_hle.hpp"
@@ -295,8 +297,11 @@ struct Kernel {
         bool active{};
         std::uint32_t params{}, mode{};
         std::string game, file;
-        std::vector<std::string> candidates;
+        std::vector<std::string> list;                           // the game's save names
+        std::vector<std::string> names;                          // per dialog slot ("" = another version's save)
+        std::vector<fs::path> folders;                           // per dialog slot
     } save_pending;
+    std::map<std::string, fs::path> save_alias;                  // save played under a name of the game's list -> its folder
 
     std::set<std::pair<std::string, std::uint32_t>> implemented;
     std::map<std::string, std::uint64_t> stub_calls;
@@ -2331,20 +2336,131 @@ void migrate_plain_saves(const fs::path &old_root, const fs::path &new_root, con
 
 namespace {
 
+// ---------------------------------------------------------------- save folders
+//
+// Every PSP memory stick Adrenaline may use on a Vita is looked at (ux0, uma0,
+// imc0, ur0): the game's saves are listed wherever they are and written back
+// where they were, so a player never moves a file. Saves of the game's other
+// versions (US, JP...) hold the same data: they are listed too, played as this
+// version's and written back to their own folder.
+
+constexpr std::size_t kSaveDataSize = 63200u;  // Burnout Legends' DATA.BIN (plain)
+
+std::vector<fs::path> save_roots() {
+    std::vector<fs::path> roots;
+    std::error_code ec;
+    const auto add = [&](const fs::path &stick) {
+        const fs::path dir = stick / "PSP" / "SAVEDATA";
+        if (std::find(roots.begin(), roots.end(), dir) == roots.end() && fs::is_directory(dir, ec)) roots.push_back(dir);
+    };
+    add(k.options.memstick);
+    for (const auto &stick : k.options.extra_memsticks) add(stick);
+    return roots;
+}
+
+// Where a new save goes: the first memory stick already holding one of the
+// game's saves (the one Adrenaline uses), else the configured one.
+fs::path new_save_root(const std::string &game) {
+    std::error_code ec;
+    for (const auto &root : save_roots())
+        for (const auto &entry : fs::directory_iterator(root, ec))
+            if (entry.path().filename().string().rfind(game, 0) == 0) return root;
+    return k.options.memstick / "PSP" / "SAVEDATA";
+}
+
+// The folder of save `name`: another version's save this session plays
+// under that name, else the first memory stick holding it, else where a new
+// one goes.
+fs::path save_folder(const std::string &game, const std::string &name) {
+    if (const auto it = k.save_alias.find(game + name); it != k.save_alias.end()) return it->second;
+    std::error_code ec;
+    for (const auto &root : save_roots())
+        if (fs::exists(root / (game + name), ec)) return root / (game + name);
+    return new_save_root(game) / (game + name);
+}
+
+std::string upper(std::string s) {
+    for (char &c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// "US", "JP"... from a folder name's game id (ULUS10025SAVE000 -> US).
+std::string region_of(const std::string &folder) {
+    const std::string kind = folder.substr(0, std::min<std::size_t>(4u, folder.size()));
+    if (kind == "ULUS" || kind == "UCUS" || kind == "NPUH") return "US";
+    if (kind == "ULES" || kind == "UCES" || kind == "NPEH") return "EU";
+    if (kind == "ULJM" || kind == "ULJS" || kind == "UCJS" || kind == "NPJH") return "JP";
+    if (kind == "ULKS" || kind == "UCKS") return "KR";
+    if (kind == "ULAS" || kind == "UCAS") return "Asie";
+    return folder.substr(0, std::min<std::size_t>(9u, folder.size()));
+}
+
+// A save of another version of the game: PARAM.SFO titled Burnout Legends
+// (or the US version's id) and a data file of this version's size.
+bool other_version_save(const fs::path &folder, const std::string &game, const std::string &file) {
+    const std::string name = folder.filename().string();
+    if (name.rfind(game, 0) == 0) return false;
+    std::error_code ec;
+    if (!fs::is_regular_file(folder / file, ec)) return false;
+    psp_savedata::SfoInfo info;
+    if (!psp_savedata::read_sfo(read_whole(folder / "PARAM.SFO"), info)) return false;
+    const std::string title = upper(info.title);
+    const bool legends = name.rfind("ULUS10025", 0) == 0 ||
+                         (title.find("BURNOUT") != std::string::npos && title.find("LEGEND") != std::string::npos);
+    if (!legends) return false;
+    const auto size = fs::file_size(folder / file, ec);
+    return !ec && (size == kSaveDataSize || size == kSaveDataSize + 16u);
+}
+
+// A save listed in the dialog as the PSP does: the profile name, then the
+// detail (play time, completion, points). "- PSP" marks a save a PSP or
+// Adrenaline wrote (only they make PARAM.SFO's console-bound hash), with the
+// version when it is another one.
+save_dialog::Slot save_slot(const fs::path &folder, const std::string &file, std::size_t index, bool other) {
+    save_dialog::Slot slot;
+    std::error_code ec;
+    slot.exists = fs::exists(folder / file, ec);
+    slot.title = "Profil " + std::to_string(index + 1u);
+    slot.subtitle = "Burnout Legends";
+    slot.detail = folder.filename().string();
+    if (!slot.exists) return slot;
+    const auto sfo = read_whole(folder / "PARAM.SFO");
+    psp_savedata::SfoInfo info;
+    if (psp_savedata::read_sfo(sfo, info)) {
+        if (!info.savedata_title.empty()) slot.title = info.savedata_title;
+        if (!info.detail.empty()) {
+            slot.subtitle = info.detail.substr(0, info.detail.find('\n'));
+            slot.detail = info.detail;
+        }
+    }
+    if (psp_savedata::console_signed(sfo)) slot.title += other ? " - PSP " + region_of(folder.filename().string()) : " - PSP";
+    else if (other) slot.title += " - " + region_of(folder.filename().string());
+    struct stat st {};
+    if (stat((folder / file).string().c_str(), &st) == 0) slot.modified = st.st_mtime;
+    return slot;
+}
+
 // Once, before the first save is written: a copy of the game's save folders
 // as they were (Adrenaline's, on the Vita), never overwritten afterwards.
-void backup_saves_once(const fs::path &root, const std::string &game) {
+void backup_saves_once(const std::string &game, const std::string &file) {
     static bool done = false;
     if (done || k.options.save_backup.empty()) return;
     done = true;
     std::error_code ec;
     if (fs::exists(k.options.save_backup, ec)) return;
-    for (const auto &entry : fs::directory_iterator(root, ec)) {
-        const std::string name = entry.path().filename().string();
-        if (!entry.is_directory(ec) || name.rfind(game, 0) != 0) continue;
-        fs::create_directories(k.options.save_backup / name, ec);
-        fs::copy(entry.path(), k.options.save_backup / name, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
-        save_log("backup " + name + " -> " + (k.options.save_backup / name).generic_string() + (ec ? " FAILED " + ec.message() : ""));
+    for (const auto &root : save_roots()) {
+        // Folders of another memory stick than the main one are prefixed with it (uma0_...).
+        const std::string stick = root == k.options.memstick / "PSP" / "SAVEDATA" ? std::string()
+                                  : root.root_name().string().empty() ? std::string("other_")
+                                  : root.root_name().string().substr(0, root.root_name().string().find(':')) + "_";
+        for (const auto &entry : fs::directory_iterator(root, ec)) {
+            const std::string name = entry.path().filename().string();
+            if (!entry.is_directory(ec) || (name.rfind(game, 0) != 0 && !other_version_save(entry.path(), game, file))) continue;
+            const fs::path target = k.options.save_backup / (stick + name);
+            fs::create_directories(target, ec);
+            fs::copy(entry.path(), target, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+            save_log("backup " + entry.path().generic_string() + " -> " + target.generic_string() + (ec ? " FAILED " + ec.message() : ""));
+        }
     }
     fs::create_directories(k.options.save_backup, ec);
 }
@@ -2354,15 +2470,26 @@ std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t m
                                const std::string &file);
 
 // The native dialog's answer: the chosen entry is loaded or saved; a cancel
-// is the PSP dialog's "cancelled" result (1).
+// is the PSP dialog's "cancelled" result (1). Another version's save is
+// played under a free name of this version's list (else the first), its
+// folder remembered for the saves that follow.
 std::uint32_t savedata_resolve(Runtime &r, int choice) {
     Kernel::SavePending pending = std::move(k.save_pending);
     k.save_pending = Kernel::SavePending{};
-    if (choice < 0 || static_cast<std::size_t>(choice) >= pending.candidates.size()) {
+    if (choice < 0 || static_cast<std::size_t>(choice) >= pending.folders.size()) {
         save_log("savedata mode=" + std::to_string(pending.mode) + ": cancelled");
         return 1u;
     }
-    return savedata_perform(r, pending.params, pending.mode, pending.game, pending.candidates[static_cast<std::size_t>(choice)], pending.file);
+    const auto index = static_cast<std::size_t>(choice);
+    std::string name = pending.names[index];
+    if (name.empty()) {
+        std::error_code ec;
+        for (const auto &candidate : pending.list)
+            if (name.empty() && !fs::exists(save_folder(pending.game, candidate) / pending.file, ec)) name = candidate;
+        if (name.empty() && !pending.list.empty()) name = pending.list.front();
+    }
+    k.save_alias[pending.game + name] = pending.folders[index];
+    return savedata_perform(r, pending.params, pending.mode, pending.game, name, pending.file);
 }
 
 std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
@@ -2371,12 +2498,11 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
     const std::string game = memory.read_c_string(params + 60u, 13u);
     std::string save = memory.read_c_string(params + 76u, 20u);
     const std::string file = memory.read_c_string(params + 100u, 13u);
-    const fs::path root = k.options.memstick / "PSP" / "SAVEDATA";
     std::error_code ec;
 
     const bool list_mode = mode == 4u || mode == 5u;
     if (list_mode && memory.load32(params + 96u) != 0u) {
-        // List dialogs (no system UI here): a load takes the profile chosen on
+        // Without a dialog (PC test tool): a load takes the profile chosen on
         // the launch menu (save_slot) when it exists, else the first one that
         // exists; a save keeps the profile loaded this session, else takes the
         // first free entry (a new profile never overwrites another).
@@ -2387,7 +2513,7 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
             if (candidate.empty()) break;
             candidates.push_back(candidate);
         }
-        const auto exists = [&](const std::string &candidate) { return fs::exists(root / (game + candidate) / file, ec); };
+        const auto exists = [&](const std::string &candidate) { return fs::exists(save_folder(game, candidate) / file, ec); };
         std::string chosen;
         if (mode == 4u) {
             if (k.options.save_slot < candidates.size() && exists(candidates[k.options.save_slot])) chosen = candidates[k.options.save_slot];
@@ -2397,34 +2523,32 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
             for (const auto &candidate : candidates) if (chosen.empty() && !exists(candidate)) chosen = candidate;
             if (chosen.empty() && !candidates.empty()) chosen = candidates.front();
         }
-        // The Vita's own save dialog, when there is one: the choice comes
-        // later (sceUtilitySavedataGetStatus answers "running" meanwhile).
+        // The Vita's own save dialog: this version's list, then (to load)
+        // the other versions' saves. The choice comes later
+        // (sceUtilitySavedataGetStatus answers "running" meanwhile).
+        Kernel::SavePending pending{true, params, mode, game, file, candidates, {}, {}};
         std::vector<save_dialog::Slot> slots;
         int focus = -1;
         for (std::size_t i = 0; i < candidates.size(); ++i) {
-            save_dialog::Slot slot;
-            const fs::path data = root / (game + candidates[i]) / file;
-            slot.exists = exists(candidates[i]);
-            slot.title = "Profil " + std::to_string(i + 1u);
-            slot.subtitle = "Burnout Legends";
-            slot.detail = game + candidates[i];
-            psp_savedata::SfoInfo sfo;
-            if (slot.exists && psp_savedata::read_sfo(read_whole(data.parent_path() / "PARAM.SFO"), sfo)) {
-                // As the PSP lists them: the profile name, then its detail
-                // (play time, completion, points).
-                if (!sfo.savedata_title.empty()) slot.title = sfo.savedata_title;
-                const auto line = sfo.detail.find('\n');
-                if (!sfo.detail.empty()) slot.subtitle = sfo.detail.substr(0, line);
-                if (!sfo.detail.empty()) slot.detail = sfo.detail;
-            }
-            struct stat info {};
-            if (slot.exists && stat(data.string().c_str(), &info) == 0) slot.modified = info.st_mtime;
+            const fs::path folder = save_folder(game, candidates[i]);
+            slots.push_back(save_slot(folder, file, i, k.save_alias.count(game + candidates[i]) != 0u));
+            pending.names.push_back(candidates[i]);
+            pending.folders.push_back(folder);
             if (focus < 0 && candidates[i] == chosen) focus = static_cast<int>(i);
-            slots.push_back(std::move(slot));
+        }
+        if (mode == 4u) {
+            for (const auto &root : save_roots())
+                for (const auto &entry : fs::directory_iterator(root, ec)) {
+                    if (!entry.is_directory(ec) || !other_version_save(entry.path(), game, file)) continue;
+                    if (std::find(pending.folders.begin(), pending.folders.end(), entry.path()) != pending.folders.end()) continue;
+                    slots.push_back(save_slot(entry.path(), file, slots.size(), true));
+                    pending.names.emplace_back();
+                    pending.folders.push_back(entry.path());
+                }
         }
         if (save_dialog::start(mode == 5u, slots, focus)) {
-            k.save_pending = Kernel::SavePending{true, params, mode, game, file, candidates};
-            save_log("savedata mode=" + std::to_string(mode) + ": native dialog, " + std::to_string(candidates.size()) + " entries");
+            save_log("savedata mode=" + std::to_string(mode) + ": native dialog, " + std::to_string(slots.size()) + " entries");
+            k.save_pending = std::move(pending);
             return kSavedataPending;
         }
         if (chosen.empty()) {
@@ -2437,18 +2561,18 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
 }
 
 // The load or save of `save` (a list dialog's choice written back into the
-// parameters).
+// parameters), in its folder.
 std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t mode, const std::string &game, const std::string &save,
                                const std::string &file) {
     auto &memory = r.memory();
-    const fs::path root = k.options.memstick / "PSP" / "SAVEDATA";
     std::error_code ec;
     if (mode == 4u || mode == 5u) {
         std::vector<std::uint8_t> name(20u, 0u);
         std::copy_n(save.begin(), std::min<std::size_t>(save.size(), 19u), name.begin());
         memory.copy_in(params + 76u, name);
     }
-    const fs::path path = root / (game + save) / file;
+    const fs::path folder = save_folder(game, save);
+    const fs::path path = folder / file;
     const std::uint32_t buffer = memory.load32(params + 116u);
     const std::uint32_t buffer_size = memory.load32(params + 120u);
 
@@ -2460,7 +2584,7 @@ std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t m
         // A file written by a PSP (or Adrenaline, or this port) is encrypted
         // when its PARAM.SFO says so; an older plain one is read as it is.
         std::vector<std::uint8_t> data = read_whole(path);
-        const auto sfo = read_whole(path.parent_path() / "PARAM.SFO");
+        const auto sfo = read_whole(folder / "PARAM.SFO");
         std::string how = "plain";
         if (psp_savedata::crypt_mode(sfo) == 1) {
             std::vector<std::uint8_t> plain;
@@ -2483,12 +2607,12 @@ std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t m
     if (mode == 1u || mode == 3u || mode == 5u) {  // AUTOSAVE / SAVE / LISTSAVE
         const std::uint32_t size = std::min(memory.load32(params + 124u), buffer_size);
         const std::uint8_t *host = memory.raw_pointer(buffer, size);
-        backup_saves_once(root, game);
-        fs::create_directories(path.parent_path(), ec);
+        backup_saves_once(game, file);
+        fs::create_directories(folder, ec);
         // As the PSP firmware writes it (hash mode 1), so that a PSP or
         // Adrenaline reads it too: the file encrypted, PARAM.SFO with the
         // game's title and detail and the file's hash, signed; the icons.
-        const fs::path sfo_path = path.parent_path() / "PARAM.SFO";
+        const fs::path sfo_path = folder / "PARAM.SFO";
         const auto previous = read_whole(sfo_path);
         psp_savedata::SfoInfo info;
         psp_savedata::read_sfo(previous, info);
@@ -2501,7 +2625,7 @@ std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t m
             info.parental_level = memory.load8(params + 1408u);
         }
         if (info.title.empty()) info.title = "BURNOUT LEGENDS";
-        info.directory = game + save;
+        info.directory = folder.filename().string();  // another version's save keeps its own id
         psp_savedata::Hash hash{};
         const auto stored = host != nullptr ? psp_savedata::encrypt(host, size, hash) : std::vector<std::uint8_t>{};
         const bool data_ok = host != nullptr && write_whole(path, stored.data(), stored.size());
@@ -2513,7 +2637,7 @@ std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t m
             const std::uint32_t at = params + 1412u + i * 16u;
             const std::uint32_t extra = memory.load32(at), extra_size = memory.load32(at + 8u);
             if (extra == 0u || extra_size == 0u) continue;
-            if (const std::uint8_t *bytes = memory.raw_pointer(extra, extra_size)) write_whole(path.parent_path() / kExtras[i], bytes, extra_size);
+            if (const std::uint8_t *bytes = memory.raw_pointer(extra, extra_size)) write_whole(folder / kExtras[i], bytes, extra_size);
         }
         k.loaded_save = save;
         save_log("savedata save mode=" + std::to_string(mode) + " " + path.generic_string() + " " + std::to_string(size) +
