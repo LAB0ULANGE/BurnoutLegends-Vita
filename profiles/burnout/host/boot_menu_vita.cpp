@@ -175,7 +175,7 @@ Settings run(const std::string &root, const std::string &build) {
     int start = 0;
     const std::vector<Item> items = {
         {"Mode", {"Jeu libre", "Course test auto"}, &mode, "Course test: menus joues seuls jusqu'a une course."},
-        {"Resolution", {"960x544 (Vita)", "840x476", "720x408", "480x272 (PSP)"}, &resolution, "Plus bas: soulage le GPU, image plus floue."},
+        {"Resolution", {"960x544 (Vita)", "840x476", "720x408", "480x272 (PSP)"}, &resolution, "Plafond: baisse seule si le jeu ralentit (30 fps tenus)."},
         {"Son/musique", {"Oui", "Non"}, &sound, "Sans le son, le jeu tourne un peu plus vite."},
         {"Saut d'images", {"Oui", "Non"}, &skip, "Saute une image si le rendu prend du retard."},
         {"Attendre GPU", {"Non (vitesse)", "Oui"}, &behind, "Non: le jeu garde sa vitesse, des images sautent."},

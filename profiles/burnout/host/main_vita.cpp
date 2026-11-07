@@ -64,7 +64,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-89";
+constexpr const char *kBuild = "gl-99";
 constexpr bool kAllProbe = false;  // gl-90/91 tests: GPU probe on every draw, 600 frames per mode
 constexpr int kProbeSet = 1;  // 1: pixels (gl-90), 2: draws (gl-92), 3: geometry (gl-93)
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
@@ -77,7 +77,7 @@ constexpr bool kCutoutPrepass = false;  // gl-72: cut-outs depth-only with disca
 constexpr unsigned kDrawBudget = 0;  // gl-74 test: draws past this per frame dropped (0: none)
 constexpr int kForceScale = 0;  // test builds: 4 = 840x476, 3 = 720x408, 1 = 480x272 without the menu (0: settings)
 constexpr bool kSharpen = true;  // sharpen the enlarged picture (render scale below 2)
-constexpr bool kDynamicRes = true;  // gl-89: back on with kValidRegion
+constexpr bool kDynamicRes = true;  // gl-98d: 960x544 down to 720x408 only when frames run late (valid region + tight regions)
 constexpr int kFboScenes = 8;  // gl-96 tests: GXM scenes per frame of FBO render targets
 constexpr int kParamBufferMiB = 0;  // gl-89q test: GXM parameter buffer (0: 16 MiB default)
 constexpr bool kValidRegion = true;  // one target per screen buffer, patched vitaGL processes only the drawn tiles
