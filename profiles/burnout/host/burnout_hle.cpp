@@ -2078,6 +2078,12 @@ void install_mpeg(Runtime &rt) {
 // saveName[20] @76, saveNameList @96, fileName[13] @100, dataBuf @116,
 // dataBufSize @120, dataSize @124. Saves are stored unencrypted under ms0:,
 // which is also how a save prepared with PPSSPP's EncryptSave=False looks.
+// Save activity always reaches the log (stderr; ux0:data/burnout-<build>.log on the Vita).
+void save_log(const std::string &line) {
+    std::fprintf(stderr, "[save] %s\n", line.c_str());
+    std::fflush(stderr);
+}
+
 std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
     auto &memory = r.memory();
     const std::uint32_t mode = memory.load32(params + 48u);
@@ -2099,7 +2105,7 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
             if (mode == 5u || fs::exists(root / (game + candidate) / file, ec)) { chosen = candidate; break; }
         }
         if (chosen.empty()) {
-            log_line("savedata mode=" + std::to_string(mode) + " " + game + ": no listed save");
+            save_log("savedata mode=" + std::to_string(mode) + " " + game + ": no listed save");
             return kSavedataNoData;
         }
         save = chosen;
@@ -2114,28 +2120,32 @@ std::uint32_t savedata_execute(Runtime &r, std::uint32_t params) {
     if (mode == 0u || mode == 2u || mode == 4u) {  // AUTOLOAD / LOAD / LISTLOAD
         std::FILE *in = std::fopen(path.string().c_str(), "rb");
         if (in == nullptr) {
-            log_line("savedata load " + path.generic_string() + ": no data");
+            save_log("savedata load " + path.generic_string() + ": no data");
             return kSavedataNoData;
         }
         std::uint8_t *host = memory.raw_pointer(buffer, buffer_size);
         const std::size_t read = host ? std::fread(host, 1u, buffer_size, in) : 0u;
         std::fclose(in);
         memory.store32(params + 124u, static_cast<std::uint32_t>(read));
-        log_line("savedata load " + path.generic_string() + " " + std::to_string(read) + " bytes");
+        save_log("savedata load " + path.generic_string() + " " + std::to_string(read) + " bytes");
         return 0u;
     }
     if (mode == 1u || mode == 3u || mode == 5u) {  // AUTOSAVE / SAVE / LISTSAVE
         const std::uint32_t size = std::min(memory.load32(params + 124u), buffer_size);
         const std::uint8_t *host = memory.raw_pointer(buffer, size);
         fs::create_directories(path.parent_path(), ec);
+        std::size_t written = 0u;
+        bool opened = false;
         if (std::FILE *out = std::fopen(path.string().c_str(), "wb")) {
-            if (host != nullptr) std::fwrite(host, 1u, size, out);
+            opened = true;
+            if (host != nullptr) written = std::fwrite(host, 1u, size, out);
             std::fclose(out);
         }
-        log_line("savedata save " + path.generic_string() + " " + std::to_string(size) + " bytes");
+        save_log("savedata save mode=" + std::to_string(mode) + " " + path.generic_string() + " " + std::to_string(size) +
+                 " bytes: " + (opened ? std::to_string(written) + " written" : std::string("CANNOT OPEN (") + ec.message() + ")"));
         return 0u;
     }
-    log_line("savedata mode=" + std::to_string(mode) + " (not emulated)");
+    save_log("savedata mode=" + std::to_string(mode) + " (not emulated)");
     return 0u;
 }
 
