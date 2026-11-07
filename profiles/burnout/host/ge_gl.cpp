@@ -659,8 +659,9 @@ bool g_all_probe{std::getenv("PSPRECOMP_BURNOUT_ALL_PROBE") != nullptr};
 std::atomic<std::uint32_t> g_all_probe_mode{0u};
 GLint g_probe_scissor[4]{0, 0, 4096, 4096};
 GLuint g_probe_white{};
-// gl-91 second set (g_probe_set 2): 0 normal, 1 no draws at all, 2 no draws
-// into the effect buffers (narrower than 480), 3 present without its quad.
+// Second set (g_probe_set 2), gl-92: modes alternate 0 normal / 1 no draws
+// at all. (gl-91 also had 2 no effect-buffer draws: as normal; 3 present
+// without its quad: crashed the Vita.)
 int g_probe_set{1};
 GLuint g_probe_fb{};                 // framebuffer id bound on the GL thread
 std::vector<std::uint8_t> g_probe_effect;  // by framebuffer id: an effect buffer
@@ -3338,8 +3339,8 @@ void present_target(GLuint texture_id, int width, float fraction) {
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    const bool probe_no_quad = g_all_probe && g_probe_set == 2 && g_all_probe_mode.load(std::memory_order_relaxed) == 3u;
-    if (texture_id != 0u && !probe_no_quad) {
+    // (gl-91's mode 3, a swap with no scene on the display, crashed the Vita: removed.)
+    if (texture_id != 0u) {
         const float k = g_valid_region && g_dynamic_resolution ? fraction : 1.0f;  // drawn part of a valid-region target
         const float u = 480.0f / static_cast<float>(width) * k, v = k;
         const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
@@ -4005,7 +4006,7 @@ void present(std::uint32_t address) {
     phase = 11u;
     ++g_stats.frames;
     if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 6u), std::memory_order_relaxed);
-    if (g_all_probe) g_all_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 4u), std::memory_order_relaxed);
+    if (g_all_probe) g_all_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % (g_probe_set == 2 ? 2u : 4u)), std::memory_order_relaxed);
     static const char *fixed_probe = std::getenv("PSPRECOMP_BURNOUT_PROBE_MODE");
     if (fixed_probe != nullptr) {
         g_gpu_probe = true;
@@ -4049,7 +4050,7 @@ void present(std::uint32_t address) {
         std::snprintf(line, sizeof(line), "  GL thread busy %.1f ms/frame; textures hashed %.0f KiB/frame; GPU probe mode %d",
                       busy,
                       static_cast<double>(g_stats.texture_bytes_hashed - last.texture_bytes_hashed) / n / 1024.0,
-                      g_all_probe ? 100 * g_probe_set + static_cast<int>(((g_stats.frames - 1u) / 600u) % 4u)
+                      g_all_probe ? 100 * g_probe_set + static_cast<int>(((g_stats.frames - 1u) / 600u) % (g_probe_set == 2 ? 2u : 4u))
                       : g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
         trace(line);
         // GPU work per frame, and the busiest render targets.
