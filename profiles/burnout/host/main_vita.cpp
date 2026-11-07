@@ -76,6 +76,7 @@ constexpr unsigned kDrawBudget = 0;  // gl-74 test: draws past this per frame dr
 constexpr int kForceScale = 0;  // test builds: 4 = 840x476, 3 = 720x408, 1 = 480x272 without the menu (0: settings)
 constexpr bool kSharpen = true;  // sharpen the enlarged picture (render scale below 2)
 constexpr bool kDynamicRes = true;  // gl-89: back on with kValidRegion
+constexpr int kParamBufferMiB = 0;  // gl-89q test: GXM parameter buffer (0: 16 MiB default)
 constexpr bool kValidRegion = true;  // one target per screen buffer, patched vitaGL processes only the drawn tiles
 //constexpr bool kDynamicRes = false;  // gl-88: off. Any dynamic target set (76-87d) made present wait 12-35 ms; one level fixed at creation (87e, static) 0.4 ms
 constexpr bool kOnlyLevel = false;  // test: dynamic targets with the current level alone
@@ -347,6 +348,7 @@ int main() {
         std::fprintf(stderr, "[vita] starting the renderer\n");
         burnout::gl::set_lazy_levels(kLazyLevels);
         burnout::gl::set_valid_region(kValidRegion);
+        burnout::gl::set_param_buffer_mib(kParamBufferMiB);
         burnout::gl::set_only_current_level(kOnlyLevel);
         burnout::gl::set_present_sharpen(kSharpen);
         burnout::gl::set_dynamic_resolution(kDynamicRes, 1.5f, kDynamicPin);

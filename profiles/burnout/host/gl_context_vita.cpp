@@ -7,9 +7,13 @@
 #include <psp2/kernel/sysmem.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 
 namespace burnout::gl {
+
+int g_param_buffer_mib = 0;  // GXM parameter buffer, 0: vitaGL default (16 MiB)
+void set_param_buffer_mib(int mib) { g_param_buffer_mib = mib; }
 
 bool create_context(std::string &error) {
     // The guest heap is reserved at startup, so size each vitaGL pool from
@@ -35,6 +39,14 @@ bool create_context(std::string &error) {
     // back to its frame buffer 5-6 times a frame (effect buffers between), so
     // every new scene on it waited for the GPU to finish the previous one.
     vglSetupRenderTargetScenesNum(1, 8);
+    // gl-89q: a full parameter buffer splits scenes into partial renders
+    // (every tile stored and reloaded), more often the larger the target.
+    if (g_param_buffer_mib > 0) {
+        vglSetParamBufferSize(static_cast<std::uint32_t>(g_param_buffer_mib) * kMiB);
+        char line[64];
+        std::snprintf(line, sizeof(line), "GXM parameter buffer %d MiB", g_param_buffer_mib);
+        trace(line);
+    }
     // The result only says whether the resolution had to fall back (GL_TRUE);
     // vitaGL has no failure return here.
     if (vglInitWithCustomSizes(0, 960, 544, ram, cdram, phycont, 0, SCE_GXM_MULTISAMPLE_NONE))

@@ -26,6 +26,8 @@ void set_render_scale(float scale);
 void set_lazy_levels(bool enabled);
 // gl-89: dynamic resolution in one target per screen buffer, GPU tiles limited to the drawn part.
 void set_valid_region(bool enabled);
+// Vita: GXM parameter buffer size before initialize (0: vitaGL default 16 MiB).
+void set_param_buffer_mib(int mib);
 void set_only_current_level(bool enabled);  // test
 void set_present_sharpen(bool enabled);
 // gl-77: foliage PRIMs past near_distance partly left out (2 in 3 kept), past far_distance more (1 in 3 kept).
