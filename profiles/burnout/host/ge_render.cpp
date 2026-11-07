@@ -566,7 +566,10 @@ std::uint32_t g_scans{};       // ge_scan calls (list submissions and stall upda
 
 } // namespace
 
-void request_capture() { g_capture_requested = true; }
+void request_capture() {
+    g_capture_requested = true;
+    gl::trace_next_frame();
+}
 
 void cpu_wrote_vram(std::uint32_t address, std::uint32_t size) {
     std::lock_guard lock(g_jobs_mutex);

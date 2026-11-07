@@ -148,8 +148,10 @@ void main() {
         screen = vec3(ndc.xy * u_viewport.xy + u_viewport.zw, ndc.z * u_depth.x + u_depth.y);
         if (u_depth.w > 0.5) v_fog = clamp((view.z + u_fog.x) * u_fog.y, 0.0, 1.0);
     }
+    // Depth 0 or 65535 (the car showroom draws with a flat depth range) lands
+    // just inside the clip volume, not on its edge (the Vita clipped it).
     gl_Position = vec4((screen.x / u_target.x * 2.0 - 1.0) * w, (1.0 - screen.y / u_target.y * 2.0) * w,
-                       (screen.z / 65535.0 * 2.0 - 1.0) * w, w);
+                       (screen.z / 65535.0 * 2.0 - 1.0) * 0.99998 * w, w);
     if (u_texgen.w > 0.5)
         color = light(color, (u_world * vec4(position, 1.0)).xyz, unit((u_world * vec4(normal, 0.0)).xyz));
     v_color = color;
@@ -349,8 +351,10 @@ void main() {
     v_fog = clamp((view.z + u_fog.x) * u_fog.y, 0.0, 1.0);
 #endif
 #endif
+    // Depth 0 or 65535 (the car showroom draws with a flat depth range) lands
+    // just inside the clip volume, not on its edge (the Vita clipped it).
     gl_Position = vec4((screen.x / u_target.x * 2.0 - 1.0) * w, (1.0 - screen.y / u_target.y * 2.0) * w,
-                       (screen.z / 65535.0 * 2.0 - 1.0) * w, w);
+                       (screen.z / 65535.0 * 2.0 - 1.0) * 0.99998 * w, w);
 #if LIT
     color = light(color, (u_world * vec4(position, 1.0)).xyz, unit((u_world * vec4(normal, 0.0)).xyz));
 #endif
@@ -1009,6 +1013,8 @@ void bind_texture_object(GLuint name) {
 }
 
 bool g_smooth_2d{std::getenv("PSPRECOMP_BURNOUT_SMOOTH_2D") != nullptr};
+std::atomic<long> g_trace_request{0};
+long g_trace_pad_frame{-1};  // decode thread
 
 // Sampler parameters live in the texture object: only set when they change.
 void set_sampling(GLint (&current)[4], bool linear, bool clamp_u, bool clamp_v, GLint min_filter = 0) {
@@ -1887,10 +1893,14 @@ void flush() {
 
     {
         // Bring-up: PSPRECOMP_BURNOUT_TARGET_TRACE=N lists frame N's draws by target.
-        static const long trace_frame = [] {
+        static const long env_frame = [] {
             const char *v = std::getenv("PSPRECOMP_BURNOUT_TARGET_TRACE");
             return v != nullptr ? std::atol(v) : -1L;
         }();
+        // Or the frame after a pad screenshot (trace_next_frame).
+        const long requested = g_trace_request.exchange(0);
+        if (requested != 0) g_trace_pad_frame = static_cast<long>(g_stats.frames) + 1;
+        const long trace_frame = g_trace_pad_frame >= 0 && g_stats.frames == static_cast<std::uint64_t>(g_trace_pad_frame) ? g_trace_pad_frame : env_frame;
         // PSPRECOMP_BURNOUT_TARGET_SKIP=A-B leaves out that frame's draws A to B.
         static std::uint64_t index_frame = ~0ull;
         static std::uint32_t draw_index = 0u;
@@ -4346,6 +4356,8 @@ void present(std::uint32_t address) {
     submit_frame();
     phase = 0u;
 }
+
+void trace_next_frame() { g_trace_request = 1; }
 
 void capture(std::uint32_t address, std::function<void(std::vector<std::uint8_t> &rgb)> done) {
     flush();

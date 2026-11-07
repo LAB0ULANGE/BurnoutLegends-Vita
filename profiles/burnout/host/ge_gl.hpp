@@ -88,6 +88,8 @@ extern volatile std::uint32_t emulation_phase;
 extern double io_read_ms, io_read_max_ms;
 // One line in the log, flushed at once (bring-up on the Vita).
 void trace(const char *message);
+// The next frame's draws listed in the log ([tt] lines), as TARGET_TRACE does.
+void trace_next_frame();
 // Once the renderer runs, Vita traces are queued and written here (by the
 // phase sampler), so no frame waits on the memory card.
 void flush_traces();
