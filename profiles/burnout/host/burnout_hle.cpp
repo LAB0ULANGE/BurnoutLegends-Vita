@@ -1624,6 +1624,11 @@ void install_io(Runtime &rt) {
             r.memory().store32(out + 0u, 0u);
             r.memory().store32(out + 4u, 0x10u);  // PSP game disc
         }
+        // Memory stick state: the game asks whether it is inserted before each
+        // autosave and turns autosave off when the answer is no (the output
+        // used to stay unwritten, read as "not inserted").
+        if (command == 0x02025806u && out_length >= 4u && r.memory().contains(out, 4u)) r.memory().store32(out, 1u);  // inserted
+        if (command == 0x02025801u && out_length >= 4u && r.memory().contains(out, 4u)) r.memory().store32(out, 4u);  // ready
         if (command == 0x02425818u && arg(ctx, 2) != 0u) {  // ms0 free space
             const std::uint32_t info = r.memory().load32(arg(ctx, 2));
             if (r.memory().contains(info, 20u)) {
