@@ -51,6 +51,9 @@ struct Options {
 };
 
 void configure(const Options &options);
+
+// The CPU wrote VRAM (a movie frame): textures there are uploaded again.
+void cpu_wrote_vram(std::uint32_t address, std::uint32_t size);
 [[nodiscard]] bool active() noexcept;
 // Emulation-thread time spent walking display lists (ge_scan with the hooks).
 void account_scan(double ms) noexcept;

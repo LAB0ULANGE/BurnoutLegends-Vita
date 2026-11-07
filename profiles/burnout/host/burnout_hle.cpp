@@ -9,6 +9,7 @@
 // audio buffer drain). Host time spent between two game frames is therefore the
 // pure CPU cost of that frame, which is what the benchmark measures.
 #include "core_load.hpp"
+#include "movie.hpp"
 #include "burnout_hle.hpp"
 #include "audio_out.hpp"
 #include "burnout_bench.hpp"
@@ -198,6 +199,15 @@ struct MpegRingbuffer {
     bool end_of_stream{};
 };
 
+// A movie played through sceMpeg: decoded on the host from the PSMF file the
+// game last opened (its ringbuffer stream is only drained).
+struct MpegMovie {
+    std::unique_ptr<movie::Movie> movie;
+    std::vector<std::uint8_t> frame;   // last decoded, RGBA8888 480x272
+    std::uint32_t pixel_mode{3u};      // sceMpegAvcDecodeMode: 3 = 8888, 0 = 565, 1 = 5551, 2 = 4444
+    std::uint32_t units{};             // access units handed out
+};
+
 struct Kernel {
     HleOptions options;
     HleObserver observer;
@@ -257,6 +267,8 @@ struct Kernel {
     std::map<std::int32_t, std::vector<GuestCallFrame>> guest_calls;
     std::map<std::uint32_t, MpegRingbuffer> mpeg_ringbuffers;    // by ringbuffer address
     std::map<std::uint32_t, std::uint32_t> mpeg_ringbuffer_of;   // mpeg handle -> ringbuffer
+    std::map<std::uint32_t, MpegMovie> mpeg_movies;              // by mpeg handle
+    std::string movie_path;                                      // host path of the last .pmf opened
 
     std::set<std::pair<std::string, std::uint32_t>> implemented;
     std::map<std::string, std::uint64_t> stub_calls;
@@ -1513,6 +1525,10 @@ void install_io(Runtime &rt) {
         if (file == nullptr) { ret(ctx, kErrorFileNotFound); return; }
         const std::int32_t fd = k.next_fd++;
         k.files[fd] = OpenFile{file, psp_path, 0};
+        {
+            const std::string name = lower(host->generic_string());
+            if (name.size() > 4u && name.compare(name.size() - 4u, 4u, ".pmf") == 0) k.movie_path = host->string();
+        }
         ret(ctx, static_cast<std::uint32_t>(fd));
     });
     reg(rt, lib, 0x810C4BC3u, [](Runtime &, AllegrexContext &ctx) {  // sceIoClose
@@ -2036,6 +2052,91 @@ void install_mpeg(Runtime &rt) {
     });
     reg(rt, lib, 0xD8C5F121u, [](Runtime &, AllegrexContext &ctx) {  // sceMpegCreate
         k.mpeg_ringbuffer_of[arg(ctx, 0)] = arg(ctx, 3);
+        // The game opens the movie's file after creating its decoder: the
+        // file is bound at the first access unit request.
+        k.mpeg_movies[arg(ctx, 0)] = MpegMovie{};
+        k.movie_path.clear();
+        ret(ctx, 0u);
+    });
+    reg(rt, lib, 0x606A4649u, [](Runtime &, AllegrexContext &ctx) {  // sceMpegDelete
+        k.mpeg_movies.erase(arg(ctx, 0));
+        ret(ctx, 0u);
+    });
+    reg(rt, lib, 0xA11C7026u, [](Runtime &r, AllegrexContext &ctx) {  // sceMpegAvcDecodeMode {unknown, pixel mode}
+        const auto it = k.mpeg_movies.find(arg(ctx, 0));
+        if (it != k.mpeg_movies.end() && r.memory().contains(arg(ctx, 1), 8u)) {
+            const std::uint32_t mode = r.memory().load32(arg(ctx, 1) + 4u);
+            if (mode <= 3u) it->second.pixel_mode = mode;
+        }
+        ret(ctx, 0u);
+    });
+    reg(rt, lib, 0x211A057Cu, [](Runtime &r, AllegrexContext &ctx) {  // sceMpegAvcQueryYCbCrSize(mpeg, mode, w, h, &size)
+        const std::uint32_t width = arg(ctx, 2), height = arg(ctx, 3), out = arg(ctx, 4);
+        if (r.memory().contains(out, 4u)) r.memory().store32(out, (width / 2u) * (height / 2u) * 6u + 128u);
+        ret(ctx, 0u);
+    });
+    // sceMpegAvcDecodeYCbCr(mpeg, au, buffer, &init): the next frame, decoded on the host.
+    reg(rt, lib, 0xF0EB1125u, [](Runtime &r, AllegrexContext &ctx) {
+        const auto it = k.mpeg_movies.find(arg(ctx, 0));
+        bool decoded = false;
+        if (it != k.mpeg_movies.end() && it->second.movie) decoded = it->second.movie->next_frame(it->second.frame);
+        static const bool debug = std::getenv("PSPRECOMP_BURNOUT_MOVIE_DEBUG") != nullptr;
+        if (debug && decoded && it->second.units % 60u == 10u) {
+            std::uint64_t sum = 0u;
+            for (std::size_t i = 0; i < it->second.frame.size(); i += 4u) sum += it->second.frame[i + 1u];
+            std::fprintf(stderr, "[movie] frame %u mean green %llu\n", it->second.units,
+                         static_cast<unsigned long long>(sum / (it->second.frame.size() / 4u)));
+        }
+        if (r.memory().contains(arg(ctx, 3), 4u)) r.memory().store32(arg(ctx, 3), decoded ? 1u : 0u);
+        ret(ctx, 0u);
+    });
+    // sceMpegAvcCsc(mpeg, source, range {x, y, w, h}, frame width, destination):
+    // the last decoded frame, in the decode mode's pixel format.
+    reg(rt, lib, 0x31BD0272u, [](Runtime &r, AllegrexContext &ctx) {
+        const auto it = k.mpeg_movies.find(arg(ctx, 0));
+        const std::uint32_t range = arg(ctx, 2), stride = arg(ctx, 3), destination = arg(ctx, 4);
+        if (it == k.mpeg_movies.end() || it->second.frame.empty() || !r.memory().contains(range, 16u)) { ret(ctx, 0u); return; }
+        const auto x0 = static_cast<std::int32_t>(r.memory().load32(range + 0u)), y0 = static_cast<std::int32_t>(r.memory().load32(range + 4u));
+        const auto w = static_cast<std::int32_t>(r.memory().load32(range + 8u)), h = static_cast<std::int32_t>(r.memory().load32(range + 12u));
+        const MpegMovie &state = it->second;
+        const std::uint32_t bpp = state.pixel_mode == 3u ? 4u : 2u;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[movie] csc range %d,%d %dx%d stride %u mode %u -> 0x%08X\n", x0, y0, w, h, stride,
+                         state.pixel_mode, destination);
+        }
+        for (std::int32_t y = 0; y < h && w > 0; ++y) {
+            const std::int32_t sy = y0 + y;
+            if (sy < 0 || sy >= movie::kHeight) continue;
+            std::uint8_t *out = r.memory().raw_pointer(destination + static_cast<std::uint32_t>(y) * stride * bpp,
+                                                       static_cast<std::uint32_t>(w) * bpp);
+            if (out == nullptr) continue;
+            for (std::int32_t x = 0; x < w; ++x) {
+                const std::int32_t sx = x0 + x;
+                const bool inside = sx >= 0 && sx < movie::kWidth;
+                const std::uint8_t *p = inside ? &state.frame[(static_cast<std::size_t>(sy) * movie::kWidth + static_cast<std::size_t>(sx)) * 4u] : nullptr;
+                static const bool white = std::getenv("PSPRECOMP_BURNOUT_MOVIE_WHITE") != nullptr;
+                const std::uint8_t cr = white ? 0xFFu : p ? p[0] : 0u, cg = white ? 0xFFu : p ? p[1] : 0u, cb = white ? 0xFFu : p ? p[2] : 0u;
+                if (bpp == 4u) {
+                    out[x * 4 + 0] = cr;
+                    out[x * 4 + 1] = cg;
+                    out[x * 4 + 2] = cb;
+                    out[x * 4 + 3] = 0xFFu;
+                } else {
+                    std::uint16_t v = 0u;
+                    if (state.pixel_mode == 0u) v = static_cast<std::uint16_t>((cr >> 3) | ((cg >> 2) << 5) | ((cb >> 3) << 11));
+                    else if (state.pixel_mode == 1u) v = static_cast<std::uint16_t>((cr >> 3) | ((cg >> 3) << 5) | ((cb >> 3) << 10) | 0x8000u);
+                    else v = static_cast<std::uint16_t>((cr >> 4) | ((cg >> 4) << 4) | ((cb >> 4) << 8) | 0xF000u);
+                    out[x * 2 + 0] = static_cast<std::uint8_t>(v);
+                    out[x * 2 + 1] = static_cast<std::uint8_t>(v >> 8);
+                }
+            }
+        }
+#if defined(BURNOUT_GE_RENDER)
+        if ((destination & 0x0F000000u) == 0x04000000u && h > 0)
+            render::cpu_wrote_vram(destination, static_cast<std::uint32_t>(h) * stride * bpp);
+#endif
         ret(ctx, 0u);
     });
     reg(rt, lib, 0xB5F6DC87u, [](Runtime &r, AllegrexContext &ctx) {  // RingbufferAvailableSize
@@ -2070,12 +2171,35 @@ void install_mpeg(Runtime &rt) {
         if (mapping == k.mpeg_ringbuffer_of.end()) { ret(ctx, 0x80618001u); return; }
         const std::uint32_t rb = mapping->second;
         const std::uint32_t packets = r.memory().load32(rb + 0u);
-        if (r.memory().load32(rb + 12u) < packets) {
-            r.memory().store32(rb + 12u, packets);
+        const bool streamed = r.memory().load32(rb + 12u) < packets;
+        if (streamed) r.memory().store32(rb + 12u, packets);  // the stream itself is only drained
+        auto movie = k.mpeg_movies.find(arg(ctx, 0));
+        if (movie != k.mpeg_movies.end() && !movie->second.movie && !k.movie_path.empty()) {
+            std::string error;
+            movie->second.movie = movie::open(k.movie_path, error);
+            const std::string what = movie->second.movie ? std::to_string(movie->second.movie->frame_count()) + " frames" : error;
+            std::fprintf(stderr, "[movie] %s: %s\n", k.movie_path.c_str(), what.c_str());
+            k.movie_path.clear();
+        }
+        if (movie != k.mpeg_movies.end() && movie->second.movie) {
+            // SceMpegAu: pts (hi, lo), dts (hi, lo), es buffer, es size; 29.97 fps at 90 kHz.
+            MpegMovie &state = movie->second;
+            if (state.units >= state.movie->frame_count()) { ret(ctx, 0x80618001u); return; }
+            const std::uint32_t au = arg(ctx, 2);
+            const std::uint64_t pts = 90000u + static_cast<std::uint64_t>(state.units) * 3003u;
+            ++state.units;
+            if (r.memory().contains(au, 24u)) {
+                r.memory().store32(au + 0u, static_cast<std::uint32_t>(pts >> 32u));
+                r.memory().store32(au + 4u, static_cast<std::uint32_t>(pts));
+                r.memory().store32(au + 8u, static_cast<std::uint32_t>(pts >> 32u));
+                r.memory().store32(au + 12u, static_cast<std::uint32_t>(pts));
+                r.memory().store32(au + 20u, 1u);
+            }
+            if (r.memory().contains(arg(ctx, 3), 4u)) r.memory().store32(arg(ctx, 3), 1u);
             ret(ctx, 0u);
             return;
         }
-        ret(ctx, 0x80618001u);  // SCE_MPEG_ERROR_NO_DATA
+        ret(ctx, streamed ? 0u : 0x80618001u);  // SCE_MPEG_ERROR_NO_DATA
     });
 }
 

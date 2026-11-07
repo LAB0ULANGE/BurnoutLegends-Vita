@@ -267,6 +267,9 @@ struct Job {
 SyncMutex g_jobs_mutex{"ge_jobs"};
 SyncCondition g_jobs_cv{"ge_jobs", g_jobs_mutex};
 std::deque<Job> g_jobs;
+// VRAM ranges the CPU wrote (sceMpegAvcCsc movie frames): the textures there
+// are uploaded again. Guarded by g_jobs_mutex, drained by the worker.
+std::vector<std::pair<std::uint32_t, std::uint32_t>> g_cpu_vram_writes;
 std::size_t g_queued_command_jobs{};
 bool g_worker_busy{};
 bool g_worker_ready{};
@@ -364,6 +367,7 @@ void worker_loop() {
         g_jobs_cv.notify_all();
         if (!ok) return;
     }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> cpu_writes;
     for (;;) {
         Job job;
         const double waiting = host_now_ms();
@@ -374,7 +378,10 @@ void worker_loop() {
             job = std::move(g_jobs.front());
             g_jobs.pop_front();
             g_worker_busy = true;
+            cpu_writes.swap(g_cpu_vram_writes);
         }
+        for (const auto &[address, size] : cpu_writes) gl::invalidate_textures(address, size);
+        cpu_writes.clear();
         const double started = host_now_ms();
         gl::phase = 0u;
         switch (job.kind) {
@@ -550,6 +557,15 @@ double g_scan_ms{};            // emulation thread walking display lists
 double g_cached_ms{}, g_submit_ms{};
 std::uint64_t g_snapshot_vertex_bytes{}, g_snapshot_record_bytes{}, g_forwarded_words{};
 std::uint32_t g_scans{};       // ge_scan calls (list submissions and stall updates)
+
+} // namespace
+
+void cpu_wrote_vram(std::uint32_t address, std::uint32_t size) {
+    std::lock_guard lock(g_jobs_mutex);
+    g_cpu_vram_writes.emplace_back(address & 0x0FFFFFFFu, size);
+}
+
+namespace {
 
 void push_job(Job job) {
     std::unique_lock lock(g_jobs_mutex);

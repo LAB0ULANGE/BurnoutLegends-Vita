@@ -1187,6 +1187,19 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     const std::uint32_t row_bytes = std::max<std::uint32_t>(buffer_width, width) * bits / 8u;
     const std::uint32_t bytes = row_bytes * height;
     const std::uint8_t *source = memory.raw_pointer(address, bytes);
+    if (source == nullptr && (address & 0x0F000000u) == 0x04000000u) {
+        // A texture declared past the end of VRAM (the 512x512 movie frame
+        // at 0x04176000 uses 272 rows): the rows that exist, the rest zero.
+        static std::vector<std::uint8_t> padded;
+        const std::uint32_t available = 0x04200000u - (address & 0x0FFFFFFFu);
+        if (available < bytes) {
+            if (const std::uint8_t *part = memory.raw_pointer(address, available)) {
+                padded.assign(bytes, 0u);
+                std::memcpy(padded.data(), part, available);
+                source = padded.data();
+            }
+        }
+    }
     const bool paletted = format >= 4u && format <= 7u;
     std::uint64_t key = (static_cast<std::uint64_t>(address) << 32u) ^ (static_cast<std::uint64_t>(format) << 28u) ^
                         (static_cast<std::uint64_t>(width) << 16u) ^ (static_cast<std::uint64_t>(height) << 4u) ^
@@ -2116,12 +2129,24 @@ std::string trace_batch_box() {
                     const std::uint8_t *p = vertices + i * g_layout.stride + g_layout.pos;
                     float x = 0.0f, y = 0.0f;
                     if (format == 3u) { std::memcpy(&x, p, 4); std::memcpy(&y, p + 4, 4); }
-                    else if (format == 2u) { std::int16_t v[2]; std::memcpy(v, p, 4); x = v[0]; y = v[1]; }
+                    else if (format == 2u) {
+                        std::int16_t v[3];
+                        std::memcpy(v, p, 6);
+                        x = v[0];
+                        y = v[1];
+                        if (i == 0u) std::fprintf(stderr, "[tt]    first z %u\n", static_cast<unsigned>(static_cast<std::uint16_t>(v[2])));
+                    }
                     else { x = static_cast<std::int8_t>(p[0]); y = static_cast<std::int8_t>(p[1]); }
                     x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y);
                 }
-                char text[96];
-                std::snprintf(text, sizeof(text), "[tt]    box %.0f,%.0f-%.0f,%.0f (format %u)\n", x0, y0, x1, y1, format);
+                std::uint32_t colour = 0xFFFFFFFFu;  // first vertex colour (none: material)
+                if (g_layout.col_size != 0u) {
+                    colour = 0u;
+                    std::memcpy(&colour, vertices + g_layout.col, std::min<std::uint32_t>(g_layout.col_size, 4u));
+                }
+                char text[128];
+                std::snprintf(text, sizeof(text), "[tt]    box %.0f,%.0f-%.0f,%.0f (format %u) colour %08X size %u vtype %06X\n", x0, y0, x1, y1,
+                              format, colour, g_layout.col_size, g_batch_vtype & 0xFFFFFFu);
                 return std::string(text);
             }
 
