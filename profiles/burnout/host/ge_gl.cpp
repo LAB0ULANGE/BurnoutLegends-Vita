@@ -639,6 +639,10 @@ bool g_dynamic_resolution{std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_RES") != nullpt
 int g_dynamic_min{12};
 int g_dynamic_q{0};  // 0 until the first frame: the render scale
 bool g_lazy_levels{false};
+// gl-89: one target per screen buffer at the render scale; a lower level is
+// drawn in its lower-left part and the Vita's GPU told to process only the
+// tiles there (patched vitaGL: vglSetFramebufferValidRegion).
+bool g_valid_region{std::getenv("PSPRECOMP_BURNOUT_VALID_REGION") != nullptr};
 bool g_only_current_level{std::getenv("PSPRECOMP_BURNOUT_ONLY_LEVEL") != nullptr};  // dynamic levels not cleared at creation
 int g_dynamic_pin{0};  // test: this level always (no recreation), 0: by GPU load
 bool g_stencil_ab{};
@@ -1013,7 +1017,12 @@ RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
     // ones are the game's effect buffers, which offscreen_1x keeps at 1x.
     target.dynamic = g_dynamic_resolution && target.width >= 480;
     int scale = g_offscreen_1x && target.width < 480 ? 8 : g_scale;
-    if (target.dynamic) {
+    if (target.dynamic && g_valid_region) {
+        // Allocated at the render scale, drawn at draw_q (see flush).
+        record(Op::CreateTarget, {target.framebuffer, target.texture, static_cast<std::uint32_t>(target.width),
+                                  static_cast<std::uint32_t>(target.height), static_cast<std::uint32_t>(g_scale) | 0x200u});
+        scale = g_dynamic_q != 0 ? g_dynamic_q : g_scale;
+    } else if (target.dynamic) {
         const int current = g_dynamic_q != 0 ? g_dynamic_q : g_scale;
         for (int i = 0; i < 4 && g_scale - 2 * i >= g_dynamic_min; ++i) {
             const int q = g_scale - 2 * i;
@@ -1129,8 +1138,10 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
             ++g_gpu.targets[target_key(address)].sampled;
             bind_texture_object(it->second.texture);
             set_sampling(it->second.sampling, linear, true, true);
-            return {static_cast<float>(width) / static_cast<float>(it->second.width),
-                    -static_cast<float>(height) / static_cast<float>(it->second.height), 0.0f, 1.0f};
+            // Valid-region targets drawn below the render scale fill the lower-left part.
+            const float f = it->second.dynamic && g_valid_region ? static_cast<float>(it->second.draw_q) / static_cast<float>(g_scale) : 1.0f;
+            return {static_cast<float>(width) / static_cast<float>(it->second.width) * f,
+                    -static_cast<float>(height) / static_cast<float>(it->second.height) * f, 0.0f, f};
         }
     }
 
@@ -1519,9 +1530,11 @@ void flush() {
         // Drawn into this level's framebuffer from now on (sampled before
         // that, the previous level's texture is still the one used), bound
         // with its viewport and scissor.
-        const int level = std::clamp((g_scale - frame_q) / 2, 0, 3);
-        target.framebuffer = target.level_framebuffer[level];
-        target.texture = target.level_texture[level];
+        if (!g_valid_region) {
+            const int level = std::clamp((g_scale - frame_q) / 2, 0, 3);
+            target.framebuffer = target.level_framebuffer[level];
+            target.texture = target.level_texture[level];
+        }
         target.draw_q = frame_q;
         for (GLint &value : target.sampling) value = -1;
         g_state.framebuffer = ~0u;
@@ -2896,6 +2909,7 @@ GLuint gl_texture(GLuint id) {
 // viewport are recorded in PSP pixels).
 std::vector<int> g_framebuffer_scales;  // allocated, in eighths as g_scale
 std::vector<int> g_framebuffer_drawn;   // drawn at (dynamic resolution), 0: allocated
+std::vector<std::uint32_t> g_framebuffer_region;  // valid-region targets: PSP width << 16 | height, 0: others
 int g_bound_scale{8};
 
 std::vector<GLuint> g_gl_depths;  // depth/stencil renderbuffer by framebuffer id
@@ -3276,7 +3290,8 @@ void present_target(GLuint texture_id, int width, float fraction) {
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     if (texture_id != 0u) {
-        const float u = 480.0f / static_cast<float>(width), v = 1.0f;
+        const float k = g_valid_region && g_dynamic_resolution ? fraction : 1.0f;  // drawn part of a valid-region target
+        const float u = 480.0f / static_cast<float>(width) * k, v = k;
         const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
         // Sharpened only when the picture is enlarged.
         const Program &present = fraction * static_cast<float>(g_scale) < 15.5f && g_present_sharp.id != 0u ? g_present_sharp : g_present;
@@ -3386,6 +3401,14 @@ void replay(const Frame &frame) {
                             : op[0] < g_framebuffer_scales.size() ? g_framebuffer_scales[op[0]] : g_scale;
             if (op[0] >= g_framebuffer_drawn.size()) g_framebuffer_drawn.resize(op[0] + 1u, 0);
             g_framebuffer_drawn[op[0]] = static_cast<int>(op[1]);
+#if defined(__vita__)
+            if (op[0] < g_framebuffer_region.size() && g_framebuffer_region[op[0]] != 0u) {
+                // Only the tiles of the part drawn at this level are processed.
+                const int q = op[1] != 0u ? static_cast<int>(op[1]) : g_scale;
+                const std::uint32_t region = g_framebuffer_region[op[0]];
+                vglSetFramebufferValidRegion(scaled(static_cast<int>(region >> 16), q), scaled(static_cast<int>(region & 0xFFFFu), q));
+            }
+#endif
             op += 2;
             break;
         case Op::BindTexture:
@@ -3426,6 +3449,8 @@ void replay(const Frame &frame) {
             if (op[0] >= g_framebuffer_scales.size()) g_framebuffer_scales.resize(op[0] + 1u, g_scale);
             g_framebuffer_scales[op[0]] = scale;
             g_bound_scale = scale;  // create_target leaves it bound
+            if (op[0] >= g_framebuffer_region.size()) g_framebuffer_region.resize(op[0] + 1u, 0u);
+            g_framebuffer_region[op[0]] = (op[4] & 0x200u) != 0u ? op[2] << 16 | op[3] : 0u;
             op += 5;
             break;
         }
@@ -3582,6 +3607,7 @@ void set_dynamic_resolution(bool enabled, float min_scale, float pinned) {
     }
 }
 void set_lazy_levels(bool enabled) { g_lazy_levels = enabled; }
+void set_valid_region(bool enabled) { g_valid_region = g_valid_region || enabled; }
 void set_only_current_level(bool enabled) { g_only_current_level = g_only_current_level || enabled; }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
 void set_thin_foliage(bool enabled, float near_distance, float far_distance) {
