@@ -70,10 +70,15 @@ DialogParam g_param;
 SceAppUtilSaveDataSlotEmptyParam g_empty;
 SceWChar16 g_empty_title[32];
 
+// The slot texts are UTF-8 although vitasdk declares them SceWChar16 (the
+// system read "LB - PSP" written as UTF-16 as "L"): `size` wide characters
+// are 2 * size bytes of UTF-8.
 void wide(SceWChar16 *out, int size, const std::string &text) {
-    int i = 0;
-    for (; i < static_cast<int>(text.size()) && i < size - 1; ++i) out[i] = static_cast<SceWChar16>(static_cast<unsigned char>(text[i]));
-    out[i] = 0;
+    auto *bytes = reinterpret_cast<char *>(out);
+    const std::size_t room = static_cast<std::size_t>(size) * 2u - 1u;
+    const std::size_t n = text.size() < room ? text.size() : room;
+    std::memcpy(bytes, text.data(), n);
+    bytes[n] = '\0';
 }
 
 void local_time(std::time_t utc, SceDateTime &out) {
