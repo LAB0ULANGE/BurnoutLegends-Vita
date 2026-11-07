@@ -3557,13 +3557,14 @@ void present_target(GLuint texture_id, int width, float fraction) {
 #endif
 }
 
-void capture_target(GLuint framebuffer_id, int height, const std::function<void(std::vector<std::uint8_t> &)> &done) {
+void capture_target(GLuint framebuffer_id, int height, const std::function<void(std::vector<std::uint8_t> &)> &done, int drawn_q) {
     std::vector<std::uint8_t> rgb;
     if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_gl_framebuffers[framebuffer_id]);
         // The visible 480x272 at the render scale, averaged back to PSP size.
         int scale = framebuffer_id < g_framebuffer_scales.size() ? g_framebuffer_scales[framebuffer_id] : g_scale;
         if (framebuffer_id < g_framebuffer_drawn.size() && g_framebuffer_drawn[framebuffer_id] != 0) scale = g_framebuffer_drawn[framebuffer_id];
+        if (drawn_q != 0) scale = drawn_q;  // the scale the frame was drawn at (dynamic resolution)
         // (scale in eighths: each PSP pixel is the box [x * s / 8, (x + 1) * s / 8).)
         const auto s = static_cast<std::uint32_t>(scale);
         const std::uint32_t w = 480u * s / 8u, h = 272u * s / 8u;
@@ -3712,7 +3713,7 @@ void replay(const Frame &frame) {
             op += 3;
             break;
         }
-        case Op::Capture: capture_target(op[0], static_cast<int>(op[1]), frame.captures[op[2]]); op += 3; break;
+        case Op::Capture: capture_target(op[0], static_cast<int>(op[1]), frame.captures[op[2]], static_cast<int>(op[3])); op += 4; break;
         case Op::ValidRegion:
 #if defined(__vita__)
             vglSetFramebufferValidRegion(static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]));
@@ -4315,7 +4316,8 @@ void capture(std::uint32_t address, std::function<void(std::vector<std::uint8_t>
     end_scene();
     record(Op::Capture, {it != g_targets.end() ? it->second.framebuffer : 0u,
                          it != g_targets.end() ? static_cast<std::uint32_t>(it->second.height) : 272u,
-                         static_cast<std::uint32_t>(g_frame.captures.size())});
+                         static_cast<std::uint32_t>(g_frame.captures.size()),
+                         it != g_targets.end() && it->second.dynamic ? static_cast<std::uint32_t>(it->second.draw_q) : 0u});
     g_frame.captures.push_back(std::move(done));
     forget_state();
 }

@@ -267,6 +267,7 @@ struct Job {
 SyncMutex g_jobs_mutex{"ge_jobs"};
 SyncCondition g_jobs_cv{"ge_jobs", g_jobs_mutex};
 std::deque<Job> g_jobs;
+std::atomic<bool> g_capture_requested{false};
 // VRAM ranges the CPU wrote (sceMpegAvcCsc movie frames): the textures there
 // are uploaded again. Guarded by g_jobs_mutex, drained by the worker.
 std::vector<std::pair<std::uint32_t, std::uint32_t>> g_cpu_vram_writes;
@@ -559,6 +560,8 @@ std::uint64_t g_snapshot_vertex_bytes{}, g_snapshot_record_bytes{}, g_forwarded_
 std::uint32_t g_scans{};       // ge_scan calls (list submissions and stall updates)
 
 } // namespace
+
+void request_capture() { g_capture_requested = true; }
 
 void cpu_wrote_vram(std::uint32_t address, std::uint32_t size) {
     std::lock_guard lock(g_jobs_mutex);
@@ -1272,10 +1275,17 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
             g_emulation_wait_ms = 0.0;
         }
     }
-    if (g_options.capture_vblanks.empty()) return;
-    const auto next = g_options.capture_vblanks.begin();
-    if (vblank < *next) return;
-    g_options.capture_vblanks.erase(next);
+    // A capture asked for from the pad (request_capture), else the planned ones.
+    const bool requested = g_capture_requested.exchange(false);
+    if (requested) {
+        std::error_code ec;
+        std::filesystem::create_directories(g_options.capture_dir, ec);
+    } else {
+        if (g_options.capture_vblanks.empty()) return;
+        const auto next = g_options.capture_vblanks.begin();
+        if (vblank < *next) return;
+        g_options.capture_vblanks.erase(next);
+    }
     if (address == 0u || stride == 0u) return;
     if (g_options.backend == Backend::OpenGL) {
         Job capture;

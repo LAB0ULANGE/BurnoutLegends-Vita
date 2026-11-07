@@ -50,7 +50,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x86d4] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x8d48] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -64,7 +64,7 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-99c";
+constexpr const char *kBuild = "gl-100b";
 constexpr bool kAllProbe = false;  // gl-90/91 tests: GPU probe on every draw, 600 frames per mode
 constexpr int kProbeSet = 1;  // 1: pixels (gl-90), 2: draws (gl-92), 3: geometry (gl-93)
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
@@ -222,6 +222,12 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
     options.live_buttons = [] {
         SceCtrlData pad{};
         sceCtrlPeekBufferPositive(0, &pad, 1);
+        // L + R + SELECT: a screenshot in ux0:data/burnout-frames (one per press).
+        static bool held = false;
+        const bool combo = (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT)) ==
+                           (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT);
+        if (combo && !held) burnout::render::request_capture();
+        held = combo;
         return static_cast<std::uint32_t>(pad.buttons) & 0xF3F9u;  // PSP-compatible bits
     };
     options.live_analog = [] {
@@ -329,6 +335,7 @@ int main() {
         burnout::render::Options render;
         render.enabled = true;
         render.backend = burnout::render::Backend::OpenGL;
+        render.capture_dir = "ux0:data/burnout-frames";  // L + R + SELECT screenshots too
         if (scripted) {
             render.capture_vblanks = {2101u, 3001u};
             render.capture_dir = "ux0:data/burnout-frames";
