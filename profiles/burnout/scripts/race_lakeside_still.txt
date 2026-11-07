@@ -1,0 +1,11 @@
+# User's path to Lakeside (2026-11-07): Start, X, Down, X, Down, Down, X, X, X.
+hold   120   126  START      # intro movie skipped (free play does it too)
+hold   420   426  START      # title
+hold   600   606  CROSS
+hold   900   906  DOWN
+hold  1050  1056  CROSS
+hold  1200  1206  DOWN
+hold  1350  1356  DOWN
+hold  1500  1506  CROSS
+hold  1650  1656  CROSS
+hold  1800  1806  CROSS
