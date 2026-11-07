@@ -3647,6 +3647,13 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
     const std::uint32_t op = word >> 24u;
     // Most of a list re-sends state that is already set: nothing to do.
     if (g_commands[op] == word && !kActsWhenRepeated[op]) return;
+    // Sampled phase 14 (15 for PRIMs before decode_prim takes over).
+    const std::uint32_t outer_phase = phase;
+    phase = op == 0x04u ? 15u : 14u;
+    struct RestorePhase {
+        std::uint32_t value;
+        ~RestorePhase() { phase = value; }
+    } restore_phase{outer_phase};
     g_memory = &memory;
     const std::uint32_t data = word & 0x00FFFFFFu;
     // Matrix uploads only end the batch when they change an element: games
@@ -3805,9 +3812,56 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
 
 void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uint32_t count, std::uint32_t base,
             std::uint32_t offset, const Snapshot &snapshot, const std::uint32_t *records, std::size_t &next_record) {
+#if !defined(__vita__)
+    static const bool op_stats = std::getenv("PSPRECOMP_BURNOUT_OP_STATS") != nullptr;
+    static std::array<std::uint64_t, 256> seen{}, called{};
+    static std::uint64_t last_frame = 0u, runs = 0u;
+    ++runs;
+    if (op_stats && g_stats.frames != last_frame && g_stats.frames % 300u == 0u) {
+        last_frame = g_stats.frames;
+        std::uint64_t total = 0u, total_called = 0u;
+        for (int o = 0; o < 256; ++o) total += seen[o], total_called += called[o];
+        std::fprintf(stderr, "[ops] frame %llu: %llu words/frame in %llu runs, %llu to ge_command:", static_cast<unsigned long long>(g_stats.frames),
+                     static_cast<unsigned long long>(total / 300u), static_cast<unsigned long long>(runs / 300u),
+                     static_cast<unsigned long long>(total_called / 300u));
+        runs = 0u;
+        for (int o = 0; o < 256; ++o)
+            if (seen[o] / 300u >= 200u)
+                std::fprintf(stderr, " %02X=%llu/%llu", o, static_cast<unsigned long long>(seen[o] / 300u),
+                             static_cast<unsigned long long>(called[o] / 300u));
+        std::fprintf(stderr, "\n");
+        seen.fill(0u);
+        called.fill(0u);
+    }
+#endif
+    phase = 10u;  // the loop itself
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint32_t word = words[i];
         const std::uint32_t op = word >> 24u;
+#if !defined(__vita__)
+        if (op_stats) {
+            ++seen[op];
+            if (op == 0xC4u || op == 0x04u || g_commands[op] != word || kActsWhenRepeated[op]) ++called[op];
+        }
+#endif
+        // Matrix data, the most frequent words (bones ~9k, world ~6k a frame),
+        // without the general path: what ge_command does for them.
+        if (op == 0x2Bu) {
+            g_commands[op] = word;
+            if (g_bone_cursor < g_bones.size()) g_bones[g_bone_cursor++] = float24(word & 0x00FFFFFFu);
+            continue;
+        }
+        if (op == 0x3Bu) {
+            const float value = float24(word & 0x00FFFFFFu);
+            if (!(g_batch_world && g_batch_count != 0u) &&
+                ((g_world_cursor < 12u && g_world[g_world_cursor] != value) || g_commands[op] != word)) {
+                g_memory = &memory;
+                flush();
+            }
+            g_commands[op] = word;
+            if (g_world_cursor < 12u) g_world[g_world_cursor++] = value;
+            continue;
+        }
         if (op == 0xC4u || (op == 0x04u && prim_has_record())) {
             use_snapshot(&snapshot, records[next_record++]);
             ge_command(memory, word, base, offset);
@@ -3817,6 +3871,7 @@ void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uin
             ge_command(memory, word, base, offset);
         }
     }
+    phase = 0u;
 }
 
 bool prim_has_record() noexcept {

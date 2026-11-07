@@ -323,7 +323,7 @@ void trace_op_costs() {
     std::string line = "worker phases (% of samples):";
     std::uint32_t total = 0;
     for (auto &n : g_phase_samples) total += n.load();
-    for (int i = 0; i < 14; ++i) {
+    for (int i = 0; i < 16; ++i) {
         char item[24];
         std::snprintf(item, sizeof(item), " %d:%.1f", i, total ? 100.0 * g_phase_samples[i].load() / total : 0.0);
         line += item;
