@@ -71,6 +71,8 @@ int sceSaveDataDialogInit(SaveDataDialogParam *param);
 int sceSaveDataDialogGetStatus(void);
 int sceSaveDataDialogGetResult(SaveDataDialogResult *result);
 int sceSaveDataDialogTerm(void);
+int sceSaveDataDialogGetSubStatus(void);
+int sceSaveDataDialogFinish(const void *finish_param);
 }
 
 int main() {
@@ -112,21 +114,36 @@ int main() {
     param.listParam = &list;
     log_line("sceSaveDataDialogInit", sceSaveDataDialogInit(&param));
 
-    // Up to 60 s: the dialog draws itself over the frames vitaGL swaps.
+    // Up to 60 s: the dialog draws itself over the frames vitaGL swaps. A
+    // choice in the list leaves the dialog running with its sub-status
+    // finished: the application reads the result, then continues the dialog
+    // (message, progress) or closes it (sceSaveDataDialogFinish).
     int status = 0;
+    bool finishing = false;
+    SaveDataDialogResult result{};
     for (int frame = 0; frame < 3600; ++frame) {
         glClearColor(0.05f, 0.1f, 0.2f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         status = sceSaveDataDialogGetStatus();
-        if (status == 2) break;  // finished
+        if (status == 2) break;  // finished (closed)
+        if (!finishing && sceSaveDataDialogGetSubStatus() == 2) {
+            log_line("sub-status finished at frame", frame);
+            log_line("sceSaveDataDialogGetResult", sceSaveDataDialogGetResult(&result));
+            log_line("  result (0 ok, 1 cancel)", result.result);
+            log_line("  slotId", result.slotId);
+            log_line("  buttonId", result.buttonId);
+            char finish[40]{};  // SceSaveDataDialogFinishParam: flag 0
+            log_line("sceSaveDataDialogFinish", sceSaveDataDialogFinish(finish));
+            finishing = true;
+        }
         vglSwapBuffers(GL_TRUE);
     }
     log_line("final status", status);
-    SaveDataDialogResult result{};
-    log_line("sceSaveDataDialogGetResult", sceSaveDataDialogGetResult(&result));
-    log_line("  result (0 ok, 1 cancel)", result.result);
-    log_line("  slotId", result.slotId);
-    log_line("  buttonId", result.buttonId);
+    if (!finishing) {
+        log_line("sceSaveDataDialogGetResult", sceSaveDataDialogGetResult(&result));
+        log_line("  result (0 ok, 1 cancel)", result.result);
+        log_line("  slotId", result.slotId);
+    }
     log_line("sceSaveDataDialogTerm", sceSaveDataDialogTerm());
     std::fclose(g_log);
 
