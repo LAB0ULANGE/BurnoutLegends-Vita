@@ -8,7 +8,7 @@ namespace burnout::boot_menu {
 // ux0:data/burnout/settings.txt between launches.
 struct Settings {
     bool auto_race{};       // scripted menus up to a World Tour race (measurements)
-    int render_scale{2};    // 2 = 960x544, 4 = 840x476, 3 = 720x408, 1 = the PSP's 480x272
+    int render_scale{3};    // default 720x408 (gl-88); 2 = 960x544, 4 = 840x476, 3 = 720x408, 1 = the PSP's 480x272
     bool sound{true};
     bool frame_skip{};      // drop a frame when the GPU side falls behind (off: the user wants every frame)
     bool async_ge{};        // display lists walked on another core (no longer offered: crashed)
