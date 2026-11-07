@@ -81,7 +81,8 @@ int main() {
                  static_cast<unsigned>(sizeof(SaveDataDialogResult)), static_cast<unsigned>(sizeof(SceCommonDialogParam)),
                  static_cast<unsigned>(sizeof(SceAppUtilSaveDataSlot)), static_cast<unsigned>(sizeof(SceAppUtilSaveDataSlotParam)));
 
-    vglInit(0x800000);
+    // The common dialog memory budget is left to the system (vglInit takes it: no dialog drawn).
+    vglInitWithCustomSizes(0x800000, 960, 544, 32 * 1024 * 1024, 64 * 1024 * 1024, 4 * 1024 * 1024, 0, SCE_GXM_MULTISAMPLE_NONE);
     log_line("vglInit", 0);
 
     SceAppUtilInitParam init{};
