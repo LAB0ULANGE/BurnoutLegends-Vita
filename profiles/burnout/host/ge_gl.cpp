@@ -665,6 +665,10 @@ GLuint g_probe_white{};
 int g_probe_set{1};
 GLuint g_probe_fb{};                 // framebuffer id bound on the GL thread
 std::vector<std::uint8_t> g_probe_effect;  // by framebuffer id: an effect buffer
+// Third set (g_probe_set 3), gl-93: 0 normal, 1 first triangle of each draw
+// only (state and draw calls kept, geometry gone), 2 viewport 1x1 (every
+// vertex shaded, the triangles binned into one tile), 3 normal.
+GLint g_probe_viewport[2]{960, 544};
 // Test F: deferred cut-outs (drawn after the opaque scenery) blend with a 0/1 alpha instead of discarding.
 bool g_blend_deferred_cutouts{std::getenv("PSPRECOMP_BURNOUT_BLEND_DEFERRED") != nullptr};
 // Test: cut-out draws (alpha-tested, not blended: trees, hedges, fences) are not drawn.
@@ -3289,7 +3293,19 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
         return;
     }
 #endif
-    if (g_all_probe && g_probe_set == 2) {
+    if (g_all_probe && g_probe_set == 3) {
+        const std::uint32_t mode = g_all_probe_mode.load(std::memory_order_relaxed);
+        if (mode == 1u) {
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(std::min<std::size_t>(index_count, 3u)), GL_UNSIGNED_SHORT, indices);
+            return;
+        }
+        if (mode == 2u) {
+            glViewport(0, 0, 1, 1);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
+            glViewport(0, 0, g_probe_viewport[0], g_probe_viewport[1]);
+            return;
+        }
+    } else if (g_all_probe && g_probe_set == 2) {
         const std::uint32_t mode = g_all_probe_mode.load(std::memory_order_relaxed);
         if (mode == 1u) return;
         if (mode == 2u && g_probe_fb < g_probe_effect.size() && g_probe_effect[g_probe_fb] != 0u) return;
@@ -3447,6 +3463,8 @@ void replay(const Frame &frame) {
             break;
         case Op::Viewport:
             glViewport(0, 0, scaled(static_cast<int>(op[0]), g_bound_scale), scaled(static_cast<int>(op[1]), g_bound_scale));
+            g_probe_viewport[0] = scaled(static_cast<int>(op[0]), g_bound_scale);
+            g_probe_viewport[1] = scaled(static_cast<int>(op[1]), g_bound_scale);
             op += 2;
             break;
         case Op::UseProgram: use_program(probe_key(op[0])); op += 1; break;
