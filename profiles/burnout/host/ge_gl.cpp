@@ -4071,6 +4071,14 @@ void present(std::uint32_t address) {
                       g_all_probe ? 100 * g_probe_set + static_cast<int>(((g_stats.frames - 1u) / 600u) % (g_probe_set == 2 ? 2u : 4u))
                       : g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
         trace(line);
+#if defined(__vita__)
+        {
+            // vitaGL scenes (render passes) begun, by target size (patched vitaGL).
+            char scenes[320];
+            vglGetSceneStats(scenes, static_cast<int>(sizeof(scenes)));
+            trace((std::string("  vitaGL scenes over ") + scenes).c_str());
+        }
+#endif
         // GPU work per frame, and the busiest render targets.
         std::snprintf(line, sizeof(line),
                       "gpu: %.0f prepassed, %.1f target switches, %.0f draws (%.0f blended, %.0f alpha/colour test, %.0f tests dropped, %.0f as blending, %.0f deferred in %.0f runs, %.0f 2D), %.1f target samples, %.0f textured (%.0f with mip levels, %.0f mip filter), %.0f skinned vertices (%.0f weights, %.0f calls, %.0f reused, %.2f ms), %.0f KiB re-copied per frame",

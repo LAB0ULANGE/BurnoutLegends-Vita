@@ -27,13 +27,65 @@ index 15e59ea..4673a30 100644
  	THREAD_SAFE()
  
 diff --git a/source/gxm.c b/source/gxm.c
-index 7bcce62..0deba24 100644
+index 7bcce62..dd2149b 100644
 --- a/source/gxm.c
 +++ b/source/gxm.c
-@@ -661,6 +661,13 @@ void scene_reset(void) {
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "shared.h"
++#include <stdio.h>
+ 
+ #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
+ 
+@@ -566,6 +567,34 @@ void start_shader_patcher(void) {
+ #endif
+ }
+ 
++// burnout patch: scenes begun, by target size, since the last vglGetSceneStats.
++#define VGL_SCENE_STAT_SLOTS 12
++static struct { int w, h; uint32_t scenes; } vgl_scene_stats[VGL_SCENE_STAT_SLOTS];
++static uint32_t vgl_scene_frames;
++static void vgl_count_scene(int w, int h) {
++	for (int i = 0; i < VGL_SCENE_STAT_SLOTS; i++) {
++		if (vgl_scene_stats[i].scenes == 0 && vgl_scene_stats[i].w == 0) {
++			vgl_scene_stats[i].w = w;
++			vgl_scene_stats[i].h = h;
++		}
++		if (vgl_scene_stats[i].w == w && vgl_scene_stats[i].h == h) {
++			vgl_scene_stats[i].scenes++;
++			return;
++		}
++	}
++}
++int vglGetSceneStats(char *buf, int size) {
++	int n = snprintf(buf, size, "%lu frames:", (unsigned long)vgl_scene_frames);
++	for (int i = 0; i < VGL_SCENE_STAT_SLOTS && n < size; i++) {
++		if (vgl_scene_stats[i].w == 0)
++			break;
++		n += snprintf(buf + n, size - n, " %dx%d %lu", vgl_scene_stats[i].w, vgl_scene_stats[i].h, (unsigned long)vgl_scene_stats[i].scenes);
++	}
++	vgl_memset(vgl_scene_stats, 0, sizeof(vgl_scene_stats));
++	vgl_scene_frames = 0;
++	return n;
++}
++
+ static inline __attribute__((always_inline)) void scene_end(void) {
+ 	// Ends current gxm scene
+ 	query_fence.value++;
+@@ -616,6 +645,7 @@ void scene_reset(void) {
+ 				shared_fb_info.vsync = vsync_interval;
+ 				gxm_back_buffer_index = (shared_fb_info.index + 1) % 2;
+ 			}
++			vgl_count_scene(DISPLAY_WIDTH, DISPLAY_HEIGHT);
+ 			int r = sceGxmBeginScene(gxm_context, 0, gxm_render_target,
+ 				NULL, NULL,
+ 				gxm_sync_objects[gxm_back_buffer_index],
+@@ -661,6 +691,14 @@ void scene_reset(void) {
  				}
  			}
  #endif
++			vgl_count_scene(active_write_fb->width, active_write_fb->height);
 +			SceGxmValidRegion valid_region;
 +			const SceGxmValidRegion *valid_ptr = NULL;
 +			if (active_write_fb->valid_w > 0 && active_write_fb->valid_h > 0) {
@@ -44,7 +96,7 @@ index 7bcce62..0deba24 100644
  #ifdef HAVE_SHARED_RENDERTARGETS
  			render_target *fbo_rt = (render_target *)active_write_fb->target;
  #ifdef RECYCLE_RENDERTARGETS
-@@ -670,7 +677,7 @@ void scene_reset(void) {
+@@ -670,7 +708,7 @@ void scene_reset(void) {
  #else
  			int r = sceGxmBeginScene(gxm_context, 0, active_write_fb->target,
  #endif
@@ -53,6 +105,14 @@ index 7bcce62..0deba24 100644
  					&active_write_fb->colorbuffer,
  					active_write_fb->depthbuffer_ptr);
  #ifdef LOG_ERRORS
+@@ -784,6 +822,7 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ #endif
+ 
+ 	vgl_framecount++;
++	vgl_scene_frames++;
+ #if !defined(DISABLE_CIRCULAR_POOL) && !defined(CIRCULAR_POOL_SPEEDHACK)
+ #ifdef HAVE_DEBUG_INTERFACE
+ 	vgl_circular_pool_frame_peak = (uint32_t)circular_data_pool_ptr[vgl_circular_idx] - (uint32_t)circular_data_pool[vgl_circular_idx];
 diff --git a/source/shared.h b/source/shared.h
 index 6954fa3..2cfdf5c 100644
 --- a/source/shared.h
@@ -66,13 +126,14 @@ index 6954fa3..2cfdf5c 100644
  	SceGxmDepthStencilSurface depthbuffer;
  	SceGxmDepthStencilSurface *depthbuffer_ptr;
 diff --git a/source/vitaGL.h b/source/vitaGL.h
-index eeec610..b1f4340 100644
+index eeec610..fb1e453 100644
 --- a/source/vitaGL.h
 +++ b/source/vitaGL.h
-@@ -1280,6 +1280,7 @@ void vglSetupGarbageCollector(int priority, int affinity);
+@@ -1280,6 +1280,8 @@ void vglSetupGarbageCollector(int priority, int affinity);
  
  // Change the scenes per frame value to use for the display and fbos rendertargets. Default value: 1, 1.
  void vglSetupRenderTargetScenesNum(uint8_t display_size, uint8_t fbo_size);
++int vglGetSceneStats(char *buf, int size); // burnout patch: "N frames: WxH scenes ..." since the last call (resets)
 +void vglSetFramebufferValidRegion(GLsizei w, GLsizei h); // burnout patch: tiles of the bound FBO's top-left w x h only (0: all)
  
  // Change what kind of vertex buffer objects are considered eligible for scratch memory usage in order to reduce allocation costs. Requires USE_SCRATCH_MEMORY.
