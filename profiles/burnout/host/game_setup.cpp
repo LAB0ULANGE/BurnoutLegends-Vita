@@ -154,108 +154,153 @@ void put32(std::vector<std::uint8_t> &out, std::uint32_t v) {
 
 } // namespace
 
-bool convert_music(const std::string &mus, const std::string &ima) {
-    std::vector<std::uint8_t> data;
-    {
-        std::FILE *file = std::fopen(mus.c_str(), "rb");
-        if (file == nullptr) return false;
-        std::fseek(file, 0, SEEK_END);
-        const long size = std::ftell(file);
-        std::fseek(file, 0, SEEK_SET);
-        data.resize(static_cast<std::size_t>(std::max(size, 0L)));
-        const bool ok = std::fread(data.data(), 1u, data.size(), file) == data.size();
-        std::fclose(file);
-        if (!ok || data.size() < 12u || std::memcmp(data.data(), "RIFF", 4) != 0) return false;
-    }
-    const auto u32 = [&](std::size_t at) {
-        std::uint32_t v = 0u;
-        std::memcpy(&v, &data[at], 4u);
-        return v;
-    };
-    const std::uint32_t riff_size = u32(4);
-    std::uint32_t start = 0u, loop_start = 0u, loop_end = 0u, channels = 2u, block_align = 0u;
-    bool looped = false;
-    std::size_t data_at = 0u, data_size = 0u;
-    for (std::size_t pos = 12u; pos + 8u <= data.size();) {
-        const std::uint32_t size = u32(pos + 4);
-        const std::uint8_t *body = &data[pos + 8];
-        if (std::memcmp(&data[pos], "fmt ", 4) == 0 && size >= 14u) {
-            channels = body[2] | body[3] << 8u;
-            block_align = body[12] | body[13] << 8u;
-        } else if (std::memcmp(&data[pos], "fact", 4) == 0 && size >= 8u) {
-            std::memcpy(&start, body + 4, 4u);
-        } else if (std::memcmp(&data[pos], "smpl", 4) == 0 && size >= 60u) {
+namespace {
+
+struct MusInfo {
+    std::uint32_t riff_size{}, start{}, loop_start{}, loop_end{}, channels{2u}, block_align{};
+    bool looped{};
+    std::uint32_t data_at{}, data_size{};
+};
+
+// The RIFF chunks before the audio data (read piece by piece: the files are
+// up to 10 MB and the Vita's heap is shared with everything else).
+bool read_mus_info(std::FILE *file, MusInfo &info) {
+    std::uint8_t head[12];
+    if (std::fread(head, 1u, 12u, file) != 12u || std::memcmp(head, "RIFF", 4) != 0) return false;
+    std::memcpy(&info.riff_size, head + 4, 4u);
+    std::uint32_t pos = 12u;
+    for (int guard = 0; guard < 64; ++guard) {
+        std::uint8_t chunk[8];
+        if (std::fseek(file, static_cast<long>(pos), SEEK_SET) != 0 || std::fread(chunk, 1u, 8u, file) != 8u) return false;
+        std::uint32_t size = 0u;
+        std::memcpy(&size, chunk + 4, 4u);
+        if (std::memcmp(chunk, "data", 4) == 0) {
+            info.data_at = pos + 8u;
+            info.data_size = size;
+            return info.block_align != 0u && info.channels != 0u && info.channels <= 2u;
+        }
+        std::vector<std::uint8_t> body(std::min<std::uint32_t>(size, 4096u));
+        if (!body.empty() && std::fread(body.data(), 1u, body.size(), file) != body.size()) return false;
+        if (std::memcmp(chunk, "fmt ", 4) == 0 && body.size() >= 14u) {
+            info.channels = body[2] | body[3] << 8u;
+            info.block_align = body[12] | body[13] << 8u;
+        } else if (std::memcmp(chunk, "fact", 4) == 0 && body.size() >= 8u) {
+            std::memcpy(&info.start, &body[4], 4u);
+        } else if (std::memcmp(chunk, "smpl", 4) == 0 && body.size() >= 60u) {
             std::uint32_t loops = 0u;
-            std::memcpy(&loops, body + 28, 4u);
+            std::memcpy(&loops, &body[28], 4u);
             if (loops != 0u) {
-                std::memcpy(&loop_start, body + 44, 4u);
-                std::memcpy(&loop_end, body + 48, 4u);
-                looped = true;
+                std::memcpy(&info.loop_start, &body[44], 4u);
+                std::memcpy(&info.loop_end, &body[48], 4u);
+                info.looped = true;
             }
-        } else if (std::memcmp(&data[pos], "data", 4) == 0) {
-            data_at = pos + 8u;
-            data_size = std::min<std::size_t>(size, data.size() - data_at);
-            break;
         }
         pos += 8u + size + (size & 1u);
     }
-    if (data_at == 0u || block_align == 0u || channels == 0u || channels > 2u) return false;
+    return false;
+}
 
-    int align = static_cast<int>(block_align);
-    ATRAC3PContext *decoder = atrac3p_alloc(static_cast<int>(channels), &align);
-    if (decoder == nullptr) return false;
-    std::vector<std::int16_t> left, right;
+std::uint64_t file_size(const std::string &path) {
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec);
+    return ec ? 0u : static_cast<std::uint64_t>(size);
+}
+
+} // namespace
+
+// Expected .ima size for a .mus (0 when unreadable): an existing track of that
+// size was finished by an earlier, interrupted install.
+std::uint64_t expected_ima_size(const std::string &mus) {
+    std::FILE *file = std::fopen(mus.c_str(), "rb");
+    if (file == nullptr) return 0u;
+    MusInfo info;
+    const bool ok = read_mus_info(file, info);
+    std::fclose(file);
+    if (!ok) return 0u;
+    const std::uint64_t total = static_cast<std::uint64_t>(info.data_size / info.block_align) * 2048u;
+    const std::uint64_t blocks = (total + kBlock - 1u) / kBlock;
+    return 36u + blocks * (8u + kBlock);
+}
+
+bool convert_music(const std::string &mus, const std::string &ima) {
+    std::FILE *in = std::fopen(mus.c_str(), "rb");
+    if (in == nullptr) return false;
+    MusInfo info;
+    if (!read_mus_info(in, info) || std::fseek(in, static_cast<long>(info.data_at), SEEK_SET) != 0) {
+        std::fclose(in);
+        return false;
+    }
+    int align = static_cast<int>(info.block_align);
+    ATRAC3PContext *decoder = atrac3p_alloc(static_cast<int>(info.channels), &align);
+    std::FILE *out = std::fopen(ima.c_str(), "wb");
+    if (decoder == nullptr || out == nullptr) {
+        if (decoder != nullptr) atrac3p_free(decoder);
+        if (out != nullptr) std::fclose(out);
+        std::fclose(in);
+        return false;
+    }
+    // Header first (patched at the end with the real counts), then blocks of
+    // 2048 samples per channel as the frames are decoded.
+    std::vector<std::uint8_t> header;
+    header.insert(header.end(), {'B', 'I', 'M', 'A'});
+    for (int i = 0; i < 8; ++i) put32(header, 0u);
+    bool ok = std::fwrite(header.data(), 1u, header.size(), out) == header.size();
+
+    std::vector<std::uint8_t> frame(info.block_align);
     std::vector<float> buffer_l(4096), buffer_r(4096);
-    for (std::size_t at = data_at; at + block_align <= data_at + data_size; at += block_align) {
-        float *out[2]{buffer_l.data(), buffer_r.data()};
-        int samples = 0;
-        if (atrac3p_decode_frame(decoder, out, &samples, &data[at], static_cast<int>(block_align)) < 0) continue;
-        const auto to16 = [](float v) {
-            const long s = std::lrintf(v * 32768.0f);
-            return static_cast<std::int16_t>(std::clamp<long>(s, -32768, 32767));
+    std::int16_t pending_l[kBlock], pending_r[kBlock];
+    std::uint32_t pending = 0u, total = 0u, blocks = 0u;
+    ImaState state_l, state_r;
+    std::uint8_t block[8u + kBlock];
+    const auto flush = [&](std::uint32_t count) {
+        for (std::uint32_t i = count; i < kBlock; ++i) pending_l[i] = pending_r[i] = 0;
+        const auto put_state = [](std::uint8_t *at, const ImaState &s) {
+            const auto p = static_cast<std::uint16_t>(static_cast<std::int16_t>(s.predicted));
+            at[0] = static_cast<std::uint8_t>(p);
+            at[1] = static_cast<std::uint8_t>(p >> 8u);
+            at[2] = static_cast<std::uint8_t>(s.index);
+            at[3] = 0u;
         };
+        put_state(block, state_l);
+        put_state(block + 4, state_r);
+        ima_encode(pending_l, kBlock, state_l, block + 8);
+        ima_encode(pending_r, kBlock, state_r, block + 8 + kBlock / 2u);
+        ok = ok && std::fwrite(block, 1u, sizeof(block), out) == sizeof(block);
+        ++blocks;
+    };
+    const auto to16 = [](float v) {
+        const long s = std::lrintf(v * 32768.0f);
+        return static_cast<std::int16_t>(std::clamp<long>(s, -32768, 32767));
+    };
+    for (std::uint32_t at = 0u; ok && at + info.block_align <= info.data_size; at += info.block_align) {
+        if (std::fread(frame.data(), 1u, frame.size(), in) != frame.size()) break;
+        float *planes[2]{buffer_l.data(), buffer_r.data()};
+        int samples = 0;
+        if (atrac3p_decode_frame(decoder, planes, &samples, frame.data(), static_cast<int>(info.block_align)) < 0) continue;
         for (int i = 0; i < samples; ++i) {
-            left.push_back(to16(buffer_l[static_cast<std::size_t>(i)]));
-            right.push_back(to16(channels == 2u ? buffer_r[static_cast<std::size_t>(i)] : buffer_l[static_cast<std::size_t>(i)]));
+            pending_l[pending] = to16(buffer_l[static_cast<std::size_t>(i)]);
+            pending_r[pending] = to16(info.channels == 2u ? buffer_r[static_cast<std::size_t>(i)] : buffer_l[static_cast<std::size_t>(i)]);
+            ++total;
+            if (++pending == kBlock) {
+                flush(kBlock);
+                pending = 0u;
+            }
         }
     }
+    if (pending != 0u) flush(pending);
     atrac3p_free(decoder);
-    const auto total = static_cast<std::uint32_t>(left.size());
-    if (total == 0u) return false;
-    if (!looped) {
-        loop_start = start;
-        loop_end = total - 1u;
+    std::fclose(in);
+    if (total == 0u) ok = false;
+    if (!info.looped) {
+        info.loop_start = info.start;
+        info.loop_end = total - 1u;
     }
-    loop_end = std::min(loop_end, total - 1u);
-    const std::uint32_t blocks = (total + kBlock - 1u) / kBlock;
-    left.resize(static_cast<std::size_t>(blocks) * kBlock, 0);
-    right.resize(static_cast<std::size_t>(blocks) * kBlock, 0);
-
-    std::vector<std::uint8_t> out;
-    out.reserve(36u + static_cast<std::size_t>(blocks) * (8u + kBlock));
-    out.insert(out.end(), {'B', 'I', 'M', 'A'});
-    for (const std::uint32_t v : {1u, riff_size, total, start, loop_start, loop_end, kBlock, blocks}) put32(out, v);
-    ImaState state_l, state_r;
-    std::vector<std::uint8_t> codes(kBlock / 2u);
-    for (std::uint32_t b = 0; b < blocks; ++b) {
-        const auto header = [&](const ImaState &s) {
-            const auto p = static_cast<std::uint16_t>(static_cast<std::int16_t>(s.predicted));
-            out.push_back(static_cast<std::uint8_t>(p));
-            out.push_back(static_cast<std::uint8_t>(p >> 8u));
-            out.push_back(static_cast<std::uint8_t>(s.index));
-            out.push_back(0u);
-        };
-        header(state_l);
-        header(state_r);
-        ima_encode(&left[static_cast<std::size_t>(b) * kBlock], kBlock, state_l, codes.data());
-        out.insert(out.end(), codes.begin(), codes.end());
-        ima_encode(&right[static_cast<std::size_t>(b) * kBlock], kBlock, state_r, codes.data());
-        out.insert(out.end(), codes.begin(), codes.end());
-    }
-    std::FILE *file = std::fopen(ima.c_str(), "wb");
-    if (file == nullptr) return false;
-    const bool ok = std::fwrite(out.data(), 1u, out.size(), file) == out.size();
-    return (std::fclose(file) == 0) && ok;
+    info.loop_end = std::min(info.loop_end, total - 1u);
+    header.resize(4u);
+    for (const std::uint32_t v : {1u, info.riff_size, total, info.start, info.loop_start, info.loop_end, kBlock, blocks}) put32(header, v);
+    ok = ok && std::fseek(out, 0, SEEK_SET) == 0 && std::fwrite(header.data(), 1u, header.size(), out) == header.size();
+    ok = (std::fclose(out) == 0) && ok;
+    return ok;
 }
 
 bool installed(const std::string &root) {
@@ -324,6 +369,10 @@ Outcome install_from(const std::string &root, const std::string &image_path, con
         }
         fs::create_directories(fs::path(host).parent_path(), ec);
         const std::uint64_t before = copied;
+        if (file_size(host) == entry.size && exists(host)) {  // copied by an interrupted install
+            copied += entry.size;
+            continue;
+        }
         if (!image->copy_file(entry, host, [&](std::uint64_t done) {
                 report("Copying the game files", entry.path.substr(usrdir_prefix), static_cast<double>(before + done) / std::max<double>(total, 1.0));
             })) {
@@ -383,6 +432,8 @@ Outcome install_from(const std::string &root, const std::string &image_path, con
     for (std::size_t i = 0; i < tracks.size(); ++i) {
         report("Converting the music", tracks[i], static_cast<double>(i) / static_cast<double>(tracks.size()));
         const std::string name = tracks[i].substr(0, tracks[i].size() - 4u) + ".ima";
+        const std::uint64_t expected = expected_ima_size(music + "/" + tracks[i]);
+        if (expected != 0u && file_size(root + "music_ima/" + name) == expected) continue;  // done before an interruption
         if (!convert_music(music + "/" + tracks[i], root + "music_ima/" + name)) {
             outcome.result = Result::Failed;
             outcome.message = "Cannot convert " + tracks[i];
