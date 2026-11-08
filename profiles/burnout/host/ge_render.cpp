@@ -874,9 +874,46 @@ struct CachedCall {
     std::vector<std::uint32_t> record_offsets;
     gl::SnapshotState exit{};                // pointer state after the RET
     std::uint32_t exit_base{}, exit_offset{};
+    std::uint64_t used{};                    // last flip it was looked up
 };
 std::unordered_map<CallKey, CachedCall, CallKeyHash> g_calls;
 std::uint64_t g_call_hits{}, g_call_walked{}, g_call_hit_words{};
+// Bytes held by g_calls. gl-104: with only an entry count bound (32768), the
+// cache kept every sub-list ever seen with its vertex records; on the long
+// tracks new ones keep coming (~200 per 10 s, ~12 KiB each) and the heap ran
+// out after ~5 min (bad_alloc). Now bounded in bytes, least recently used
+// entries going first.
+std::size_t g_call_bytes{};
+std::uint64_t g_call_evicted{};
+constexpr std::size_t kCallBudget = 8u << 20u;
+constexpr std::size_t kCallMax = 4096u;
+
+std::size_t call_bytes(const CachedCall &call) noexcept {
+    return 96u + (call.words != nullptr ? call.words->capacity() * 4u : 0u) + call.segments.capacity() * sizeof(CallSegment) +
+           call.records.capacity() + call.record_offsets.capacity() * 4u;
+}
+
+// Drops the entries not looked up for a while; everything if that is not
+// enough (queued jobs keep the words they use through their shared_ptr).
+void evict_calls() {
+    const std::size_t before = g_calls.size();
+    for (std::uint64_t idle : {600u, 120u, 8u}) {
+        for (auto it = g_calls.begin(); it != g_calls.end();) {
+            if (it->second.used + idle < g_flips) {
+                g_call_bytes -= std::min(g_call_bytes, call_bytes(it->second));
+                it = g_calls.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (g_call_bytes <= kCallBudget / 2u && g_calls.size() <= kCallMax / 2u) break;
+    }
+    if (g_call_bytes > kCallBudget * 3u / 4u || g_calls.size() > kCallMax * 3u / 4u) {
+        g_calls.clear();
+        g_call_bytes = 0u;
+    }
+    g_call_evicted += before - g_calls.size();
+}
 
 // memcmp(...) == 0 for the sub-list check: both sides are usually cold (the
 // sub-lists are scattered), so the lines a few iterations ahead are fetched
@@ -1010,11 +1047,12 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
     if (!g_options.enabled || g_options.backend != Backend::OpenGL || !g_async || !g_options.cache_sublists) return false;
     target &= 0x0FFFFFFCu;
     if (!static_range(target)) return false;
-    // Each entry state of each sub-list is a key: bounded, in case some state
-    // never repeats.
-    if (g_calls.size() > 32768u) g_calls.clear();
+    // Each entry state of each sub-list is a key: bounded in bytes and count.
+    if (g_call_bytes > kCallBudget || g_calls.size() > kCallMax) evict_calls();
     auto [it, inserted] = g_calls.try_emplace(CallKey{target, base, offset, gl::g_scan});
     CachedCall &call = it->second;
+    call.used = g_flips;
+    if (inserted) g_call_bytes += call_bytes(call);
     if (!inserted && !call.cacheable) return false;
     const auto bytes = static_cast<std::uint32_t>(call.words != nullptr ? call.words->size() * 4u : 0u);
     // A stall address inside the sub-list: the GE stops there, walk it.
@@ -1036,13 +1074,18 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
         }
         // Rewritten: a sub-list the game rebuilds is not worth caching.
         if (++call.changes > 4u) {
+            g_call_bytes -= std::min(g_call_bytes, call_bytes(call));
             call.cacheable = false;
             forget_words(call);
+            g_call_bytes += call_bytes(call);
             return false;
         }
     }
     ++g_call_walked;
-    if (!classify_call(memory, target, base, offset, call)) return false;
+    g_call_bytes -= std::min(g_call_bytes, call_bytes(call));
+    const bool classified = classify_call(memory, target, base, offset, call);
+    g_call_bytes += call_bytes(call);
+    if (!classified) return false;
     forward_cached(call);
     base = call.exit_base;
     offset = call.exit_offset;
@@ -1257,7 +1300,7 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         worst_flip = std::max(worst_flip, now - last_flip);
         last_flip = now;
         if (++g_flips % 300u == 0u) {
-            char line[640];
+            char line[900];
             std::uint64_t early_used = 0u, early_missed = 0u;
             {
                 std::lock_guard lock(g_early_mutex);
@@ -1267,12 +1310,13 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
             std::snprintf(line, sizeof(line),
                           "emulation: list scan %.1f ms/flip in %.0f scans, waited %.1f ms/flip for the worker, %llu of 300 frames skipped; "
                           "worst flip %.0f ms; file reads %.0f ms (longest %.0f); early transfers %llu used, %llu missed; %llu skipped when behind; "
-                          "sub-lists %.0f cached (%.0f words), %.1f walked anew per flip; in the scan: cached sub-lists %.1f ms, submit %.1f ms, "
+                          "sub-lists %.0f cached (%.0f words), %.1f walked anew per flip, cache %lu entries %lu KiB %lu evicted; in the scan: cached sub-lists %.1f ms, submit %.1f ms, "
                           "%.0f words forwarded, %.0f KiB vertices and %.0f KiB records copied per flip",
                           g_scan_ms / 300.0, g_scans / 300.0, g_emulation_wait_ms / 300.0, static_cast<unsigned long long>(g_skipped_frames),
                           worst_flip, gl::io_read_ms, gl::io_read_max_ms, static_cast<unsigned long long>(early_used),
                           static_cast<unsigned long long>(early_missed), static_cast<unsigned long long>(g_behind_skips),
-                          g_call_hits / 300.0, g_call_hit_words / 300.0, g_call_walked / 300.0, g_cached_ms / 300.0, g_submit_ms / 300.0,
+                          g_call_hits / 300.0, g_call_hit_words / 300.0, g_call_walked / 300.0, static_cast<unsigned long>(g_calls.size()),
+                          static_cast<unsigned long>(g_call_bytes / 1024u), static_cast<unsigned long>(g_call_evicted), g_cached_ms / 300.0, g_submit_ms / 300.0,
                           g_forwarded_words / 300.0, g_snapshot_vertex_bytes / 300.0 / 1024.0, g_snapshot_record_bytes / 300.0 / 1024.0);
             g_cached_ms = g_submit_ms = 0.0;
             g_snapshot_vertex_bytes = g_snapshot_record_bytes = g_forwarded_words = 0u;
