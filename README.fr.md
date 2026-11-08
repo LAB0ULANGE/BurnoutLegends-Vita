@@ -1,5 +1,7 @@
 # Burnout Legends sur PS Vita (recompilation native)
 
+![Burnout Legends sur PS Vita](docs/images/livearea.png)
+
 Un portage natif de **Burnout Legends** (PSP) sur PS Vita, obtenu en recompilant
 statiquement l'exécutable PSP du jeu en code ARM avec [PSPRecomp](docs/PSPRecomp.md).
 Ce n'est pas un émulateur : le code du jeu tourne nativement, avec un rendu
