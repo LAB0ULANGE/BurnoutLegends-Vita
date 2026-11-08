@@ -1,9 +1,12 @@
-# Burnout Legends profile (headless benchmark)
+# Burnout Legends profile
 
-This profile answers one question: can a static recompilation of Burnout Legends
-(PSP, PAL, ULES00125 v1.01) run its race loop within 33 ms per frame on a PS Vita?
-It is deliberately headless: display lists are accepted and discarded, audio is
-silent but paced, movies are not decoded. No renderer exists in this profile.
+Static recompilation of Burnout Legends (PSP, PAL, ULES00125 v1.01) for the PS
+Vita, with its own GE renderer on vitaGL (`host/ge_gl.cpp`), sound (SAS,
+music, movies), native save dialog and PSP savedata encryption. The player's
+guide is the [repository README](../../README.md); this page is for building.
+
+The PC target (`burnout_headless`) runs the same game headless or with an
+OpenGL window, for tests and profiling.
 
 ## Supported executable
 
@@ -22,12 +25,14 @@ ignored by `profiles/burnout/.gitignore`.
 
 ```bash
 psp_analyze ../original/EBOOT_DECRYPTED.ELF profiles/burnout/analysis/ULES00125_report.json 0x08804000
-psp_recomp  ../original/EBOOT_DECRYPTED.ELF --auto profiles/burnout/generated 0x08804000 0x4000
+PSPRECOMP_NO_RETURN_HINTS=1 psp_recomp ../original/EBOOT_DECRYPTED.ELF --auto out/gen 0x08804000 16384
+python profiles/burnout/tools/patch_libc_loops.py out/gen
 ```
 
-The unit span must be 16 KiB (`0x4000`): the runtime's fast unit index and the
-dense entry dispatch assume it. Expected output: 167 units, 234 import wrappers,
-no unsupported instruction (`burnout_opcode_census` reports the census).
+The unit span must be 16 KiB (16384): the runtime's fast unit index and the
+dense entry dispatch assume it. `patch_libc_loops.py` replaces the game's
+byte-per-iteration memcpy/memset loops with host calls. Point the build at the
+corpus with `-DBURNOUT_GENERATED_DIR=out/gen`.
 
 ## Build
 
@@ -38,28 +43,37 @@ cmake -S . -B out/burnout -G "Visual Studio 17 2022" -A x64 -DPSPRECOMP_PROFILE=
 cmake --build out/burnout --config Release --target burnout_headless
 ```
 
-PS Vita (VitaSDK, Ninja):
+PS Vita (VitaSDK, Ninja). vitaGL must be built from source with
+`tools/vitagl-2bdbe89-valid-region.patch` applied (commit 2bdbe89; it adds
+`vglSetFramebufferValidRegion` and `vglSetFramebufferDepthKeep`) and installed
+into VitaSDK:
 
 ```bash
-cmake -S . -B out/vita -G Ninja -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard" \
-  -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" -DPSPRECOMP_PROFILE=burnout \
-  -DPSPRECOMP_BUILD_TOOLS=OFF -DPSPRECOMP_BUILD_TESTS=OFF
-ninja -C out/vita -j10      # produces profiles/burnout/burnout-bench.vpk
+cmake -S . -B out/vita -G Ninja -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake   -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard"   -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" -DPSPRECOMP_PROFILE=burnout   -DPSPRECOMP_BUILD_TOOLS=OFF -DPSPRECOMP_BUILD_TESTS=OFF -DPSPRECOMP_GENERATED_OPT_LEVEL=3   -DBURNOUT_GENERATED_DIR=out/gen -DBURNOUT_VITA_GL=ON   "-DBURNOUT_GENERATED_EXTRA_FLAGS=-fno-gcse;-fira-loop-pressure;-fno-tree-pre;-fno-code-hoisting;-fno-unswitch-loops;-fno-peel-loops"
+ninja -C out/vita profiles/burnout/CMakeFiles/burnout-gl.vpk-vpk   # out/vita/profiles/burnout/burnout-gl.vpk
 ```
 
-## Game data layout
+The LiveArea pictures, the bubble icon and the save icons are read from
+`../original/` (`vita_icon0.png`, `vita_livearea/`, `save_icons/`); set
+`BURNOUT_VITA_ICON`, `BURNOUT_VITA_LIVEAREA` and `BURNOUT_VITA_SAVE_ICONS` to
+use others. `kRelease` in `host/main_vita.cpp` selects the public build (no
+launch menu, no debug combos); set it to `false` for the test menu.
 
-The benchmark needs the user's own files and a profile save. The save must be
-unencrypted: create a profile in PPSSPP with `EncryptSave = False` in
-`[SystemParam]` of `ppsspp.ini`.
+If `vita-elf-create` fails or the VPK will not install (error 0x800F1727), the
+size of `burnout_text_pad` in `host/main_vita.cpp` has to move the end of the
+text segment: keep it between 0x300 and 0x600 into its 4 KiB page.
+
+## Game data layout
 
 | PC (default paths, run from the repo root) | Vita |
 |---|---|
 | `../original/EBOOT_DECRYPTED.ELF` | `ux0:data/burnout/EBOOT_DECRYPTED.ELF` |
 | `../original/PARAM.SFO` | `ux0:data/burnout/PARAM.SFO` |
 | `../original/USRDIR/` | `ux0:data/burnout/USRDIR/` |
-| `out/burnout-ms0/PSP/SAVEDATA/ULES00125SAVE000/` | `ux0:data/burnout/ms0/PSP/SAVEDATA/ULES00125SAVE000/` |
+| (music converted by `tools/convert_music.py`) | `ux0:data/burnout/music_ima/` |
+
+Saves: on the Vita the PSP memory stick is `ux0:pspemu` (Adrenaline's), saves
+are encrypted like a PSP's; the PC uses `out/burnout-ms0`.
 
 ## Running the benchmark
 
@@ -90,9 +104,6 @@ HLE and the display-list scan), with no idle time included.
 
 ## Known limitations
 
-- Graphics: display lists are only walked for SIGNAL/FINISH callbacks; GE work
-  (vertex processing, rasterisation) is not part of the measurement.
-- Audio: SAS/ATRAC produce silence; the Media Engine work is not measured.
-- Movies end as soon as the game has streamed the file in.
-- Savedata loads/saves plain files under ms0:; list dialogs pick the first save.
-- Network, ad-hoc and the remaining sceMpeg/sceUtility calls are logging stubs.
+- Only ULES00125 v1.01.
+- Network and ad-hoc play are stubs.
+- Some long flips on the largest tracks when new track sections stream in.
