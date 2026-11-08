@@ -1298,6 +1298,17 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
         static double last_flip = host_now_ms(), worst_flip = 0.0;
         const double now = host_now_ms();
         worst_flip = std::max(worst_flip, now - last_flip);
+        // Hitch probe (gl-106): where a long flip went on this thread.
+        static double prev_scan = 0.0, prev_wait = 0.0, prev_io = 0.0;
+        static int hitch_lines = 0;
+        if (now - last_flip > 120.0 && hitch_lines < 400) {
+            ++hitch_lines;
+            const double scan = g_scan_ms - prev_scan, wait = g_emulation_wait_ms - prev_wait, io = gl::io_read_ms - prev_io;
+            char hitch[200];
+            std::snprintf(hitch, sizeof(hitch), "hitch emulation: flip %llu took %.0f ms: list scan %.0f, waited for the worker %.0f, file reads %.0f, game code %.0f",
+                          static_cast<unsigned long long>(g_flips), now - last_flip, scan, wait, io, now - last_flip - scan - wait - io);
+            gl::trace(hitch);
+        }
         last_flip = now;
         if (++g_flips % 300u == 0u) {
             char line[900];
@@ -1336,6 +1347,9 @@ void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t addres
 #endif
             g_emulation_wait_ms = 0.0;
         }
+        prev_scan = g_scan_ms;
+        prev_wait = g_emulation_wait_ms;
+        prev_io = gl::io_read_ms;
     }
     // A capture asked for from the pad (request_capture), else the planned ones.
     const bool requested = g_capture_requested.exchange(false);

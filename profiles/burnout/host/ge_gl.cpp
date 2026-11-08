@@ -3799,11 +3799,39 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
     done(rgb);
 }
 
+// Hitch probe (gl-106), GL thread: the slowest heavy op of the frame and the
+// texture uploads' total.
+struct HitchOps {
+    double slowest_ms{}, textures_ms{};
+    std::uint32_t slowest{}, a{}, b{}, textures{};
+};
+HitchOps g_hitch_ops;
+
 void replay(const Frame &frame) {
     const std::uint32_t *op = frame.ops.data();
     const std::uint32_t *end = op + frame.ops.size();
     const auto floats = [&](std::uint32_t at) { return reinterpret_cast<const float *>(frame.data.data() + at); };
     while (op < end) {
+        const Op kind = static_cast<Op>(*op);
+        const bool timed = kind == Op::TexImage || kind == Op::TexImageP8 || kind == Op::CreateTarget || kind == Op::Present ||
+                           kind == Op::Capture || kind == Op::DeleteTexture || kind == Op::BindFramebuffer;
+        const double op_started = timed ? host_now_ms() : 0.0;
+        const std::uint32_t arg0 = op + 1 < end ? op[1] : 0u, arg1 = op + 2 < end ? op[2] : 0u;
+        struct TimeOp {
+            bool timed;
+            Op kind;
+            double started;
+            std::uint32_t a, b;
+            ~TimeOp() {
+                if (!timed) return;
+                const double took = host_now_ms() - started;
+                if (kind == Op::TexImage || kind == Op::TexImageP8) {
+                    g_hitch_ops.textures_ms += took;
+                    ++g_hitch_ops.textures;
+                }
+                if (took > g_hitch_ops.slowest_ms) g_hitch_ops = {took, g_hitch_ops.textures_ms, static_cast<std::uint32_t>(kind), a, b, g_hitch_ops.textures};
+            }
+        } time_op{timed, kind, op_started, arg0, arg1};
         switch (static_cast<Op>(*op++)) {
         case Op::Enable: glEnable(op[0]); op += 1; break;
         case Op::Disable: glDisable(op[0]); op += 1; break;
@@ -4001,7 +4029,20 @@ void gl_thread_main() {
             g_gl.busy = true;
         }
         const double started = host_now_ms();
+        g_hitch_ops = {};
         replay(frame);
+        {
+            static int hitch_lines = 0;
+            const double took = host_now_ms() - started;
+            if (took > 100.0 && hitch_lines < 400) {
+                ++hitch_lines;
+                char hitch[220];
+                std::snprintf(hitch, sizeof(hitch), "hitch GL: frame replay %.0f ms; slowest op %u (%u, %u) %.0f ms; %u texture uploads %.0f ms",
+                              took, g_hitch_ops.slowest, g_hitch_ops.a, g_hitch_ops.b, g_hitch_ops.slowest_ms, g_hitch_ops.textures,
+                              g_hitch_ops.textures_ms);
+                trace(hitch);
+            }
+        }
         // Test knob: a slow GPU side (PC runs of the Vita pacing paths).
         static const int delay_ms = [] {
             const char *value = std::getenv("PSPRECOMP_BURNOUT_GL_DELAY_MS");
@@ -4468,6 +4509,29 @@ void present(std::uint32_t address) {
     evict_textures();
     phase = 11u;
     ++g_stats.frames;
+    {
+        // Hitch probe (gl-106), decode thread: a frame much longer than 33 ms.
+        static double last_wall = host_now_ms(), last_list = 0.0, last_idle = 0.0, last_draw = 0.0;
+        static std::uint64_t last_uploads = 0u, last_prims = 0u;
+        static int hitch_lines = 0;
+        const double wall = host_now_ms();
+        if (wall - last_wall > 120.0 && hitch_lines < 400) {
+            ++hitch_lines;
+            char hitch[220];
+            std::snprintf(hitch, sizeof(hitch), "hitch decode: frame %llu took %.0f ms: decode %.0f, record %.0f, idle %.0f; %llu PRIM, %llu texture uploads",
+                          static_cast<unsigned long long>(g_stats.frames), wall - last_wall,
+                          g_stats.list_ms - last_list - (g_stats.draw_ms - last_draw), g_stats.draw_ms - last_draw, g_stats.idle_ms - last_idle,
+                          static_cast<unsigned long long>(g_stats.primitives - last_prims),
+                          static_cast<unsigned long long>(g_stats.texture_uploads - last_uploads));
+            trace(hitch);
+        }
+        last_wall = wall;
+        last_list = g_stats.list_ms;
+        last_idle = g_stats.idle_ms;
+        last_draw = g_stats.draw_ms;
+        last_uploads = g_stats.texture_uploads;
+        last_prims = g_stats.primitives;
+    }
     if (g_gpu_probe) g_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % 6u), std::memory_order_relaxed);
     if (g_all_probe) g_all_probe_mode.store(static_cast<std::uint32_t>((g_stats.frames / 600u) % (g_probe_set == 2 ? 2u : 4u)), std::memory_order_relaxed);
     static const char *fixed_probe = std::getenv("PSPRECOMP_BURNOUT_PROBE_MODE");
