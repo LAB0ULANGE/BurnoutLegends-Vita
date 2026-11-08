@@ -4,6 +4,7 @@
 // software rasterizer and --capture writes PNG frames.
 #include "audio_out.hpp"
 #include "texture_pack.hpp"
+#include "game_setup.hpp"
 #include "music.hpp"
 #include "sas_worker.hpp"
 #include "burnout_run.hpp"
@@ -101,6 +102,19 @@ Cli parse(int argc, char **argv) {
             burnout::gl::set_filters(active);
         }
         else if (key == "--texture-pack") burnout::texture_pack::open(value());  // PPSSPP pack folder (textures.ini)
+        else if (key == "--install-from-iso") {  // ISO OUTDIR: the Vita first-launch install, then exit
+            const std::string image = value();
+            std::string out = value();
+            if (!out.empty() && out.back() != '/') out += '/';
+            int last = -1;
+            const auto outcome = burnout::setup::install_from(out, image, [&](const std::string &step, const std::string &detail, double f) {
+                const int pct = static_cast<int>(f * 100.0);
+                if (pct != last || step != "Copying the game files") std::fprintf(stderr, "[setup] %s %s %d%%\n", step.c_str(), detail.c_str(), pct);
+                last = pct;
+            });
+            std::fprintf(stderr, "[setup] result %d: %s\n", static_cast<int>(outcome.result), outcome.message.c_str());
+            std::exit(outcome.result == burnout::setup::Result::Ready ? 0 : 1);
+        }
         else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
             cli.render.enabled = true;
             const std::string range = value();

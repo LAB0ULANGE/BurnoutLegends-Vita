@@ -31,4 +31,9 @@ void save(const std::string &root, const Settings &settings);
 // Must run before the renderer takes the display (its frame buffer stays).
 [[nodiscard]] Settings run(const std::string &root, const std::string &build);
 
+// First launch: installs the game from the player's ISO / CSO (game_setup)
+// with a progress screen. False (after showing why and waiting for a button)
+// when the game cannot start: no image, wrong version, error.
+[[nodiscard]] bool install(const std::string &root);
+
 } // namespace burnout::boot_menu

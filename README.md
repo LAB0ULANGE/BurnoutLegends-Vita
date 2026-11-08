@@ -36,51 +36,29 @@ recompiled code only matches this executable.
 
 ## Requirements
 
-- A PS Vita / PS TV on HENkaku / Ensō (any firmware supported by h-encore or Ensō)
-- [VitaShell](https://github.com/TheOfficialFloW/VitaShell)
+- A PS Vita / PS TV on HENkaku / Ensō, with [VitaShell](https://github.com/TheOfficialFloW/VitaShell)
 - `libshacccg.suprx` (the Vita's shader compiler) in `ur0:data/external/`.
-  Extract it with [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D) if you
-  do not have it; copy it to `ur0:data/external/libshacccg.suprx`.
-- Your own Burnout Legends UMD (ULES00125), dumped to an ISO
-- On a PC: [PPSSPP](https://www.ppsspp.org/) (to decrypt the game's executable) and
-  Python 3 with [PyAV](https://pypi.org/project/av/) (`pip install av`, plus
-  `pip install audioop-lts` on Python 3.13 or newer) to convert the music
+  If you do not have it, extract it with
+  [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D) and copy it to
+  `ur0:data/external/libshacccg.suprx`.
+- Your own Burnout Legends disc image (**ULES00125**), ISO or CSO, the one you
+  play with Adrenaline
+- About 700 MB free on `ux0:`
 
 ## Installation
 
-### 1. Prepare the game files on a PC
+1. Put your Burnout Legends ISO or CSO in **`ux0:pspemu/ISO/`** (where Adrenaline
+   looks for it; `uma0:`, `imc0:` and `xmc0:` work too). Any file name.
+2. Install the VPK with VitaShell.
+3. Start **Burnout recomp GL**. The first launch installs the game from your
+   ISO by itself (copies the game files, decrypts the game, converts the music):
+   a few minutes, only once. Then the game starts.
 
-1. **Decrypt the executable.** In PPSSPP, open `memstick/PSP/SYSTEM/ppsspp.ini`
-   and set `DumpDecryptedEboots = True` in the `[General]` section (PPSSPP
-   closed). Start the game once in PPSSPP: the decrypted executable is written to
-   `memstick/PSP/SYSTEM/DUMP/ULES00125_Burnout.BIN`. Rename it `EBOOT_DECRYPTED.ELF`.
-2. **Extract the disc.** Open the ISO with 7-Zip and extract `PSP_GAME/PARAM.SFO`
-   and the whole `PSP_GAME/USRDIR` folder.
-3. **Convert the music** (the Vita cannot decode the game's ATRAC3plus music):
+If no ISO is found, the game tells you so: copy it to `ux0:pspemu/ISO/` and start
+again. Once installed, the port no longer needs the ISO (it has its own copy in
+`ux0:data/burnout/`); keep it if you also play the game in Adrenaline.
 
-   ```bash
-   python profiles/burnout/tools/convert_music.py USRDIR/music music_ima
-   ```
-
-You now have:
-
-```text
-burnout/
-  EBOOT_DECRYPTED.ELF
-  PARAM.SFO
-  USRDIR/
-  music_ima/
-```
-
-### 2. Copy them to the Vita
-
-Copy that `burnout` folder to `ux0:data/burnout/` (VitaShell FTP or USB).
-
-### 3. Install the VPK
-
-Install the VPK with VitaShell and start **Burnout recomp GL** from the LiveArea.
-
-The first launch takes about a minute on the logo screen: the shaders are
+Each launch then spends about a minute on the logo screen while the shaders are
 compiled for your console.
 
 ## Controls
@@ -92,7 +70,7 @@ The PSP controls, on the same buttons. **START + SELECT** quits the game.
 - Short slowdowns can happen on the largest tracks (Waterfront, Downtown) when a
   new part of the track streams in.
 - About a minute of loading at each start (shader compilation).
-- Only ULES00125 v1.01 is supported.
+- Only ULES00125 v1.01 is supported (the install checks it).
 
 ## Reporting a bug
 
@@ -115,6 +93,9 @@ then build the Vita target with VitaSDK.
 - PSP savedata encryption (`profiles/burnout/host/psp_savedata.cpp`) is ported
   from [PPSSPP](https://github.com/hrydgard/ppsspp) and is **GPL-2.0-or-later**;
   a Vita build that includes it is therefore distributed under the GPL.
+- First-launch install: PPSSPP's PRX decrypter and libkirk (GPL-2.0) decrypt
+  the game's executable, and the FFmpeg ATRAC3plus decoder (LGPL-2.1, PPSSPP's
+  `at3_standalone`) converts the music.
 - [stb_image](https://github.com/nothings/stb) (public domain).
 - The rest of this repository is under the MIT licence ([LICENSE](LICENSE)).
 

@@ -38,54 +38,32 @@ charge : le code recompilé correspond à cet exécutable précis.
 
 ## Prérequis
 
-- Une PS Vita / PS TV sous HENkaku / Ensō
-- [VitaShell](https://github.com/TheOfficialFloW/VitaShell)
+- Une PS Vita / PS TV sous HENkaku / Ensō, avec [VitaShell](https://github.com/TheOfficialFloW/VitaShell)
 - `libshacccg.suprx` (le compilateur de shaders de la Vita) dans
   `ur0:data/external/`. Si vous ne l'avez pas, extrayez-le avec
   [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D) puis copiez-le en
   `ur0:data/external/libshacccg.suprx`.
-- Votre propre UMD de Burnout Legends (ULES00125), copié en ISO
-- Sur PC : [PPSSPP](https://www.ppsspp.org/) (pour déchiffrer l'exécutable du jeu)
-  et Python 3 avec [PyAV](https://pypi.org/project/av/) (`pip install av`, plus
-  `pip install audioop-lts` à partir de Python 3.13) pour convertir les musiques
+- Votre propre image de Burnout Legends (**ULES00125**), ISO ou CSO, celle
+  que vous utilisez avec Adrenaline
+- Environ 700 Mo libres sur `ux0:`
 
 ## Installation
 
-### 1. Préparer les fichiers du jeu sur PC
+1. Mettez votre ISO ou CSO de Burnout Legends dans **`ux0:pspemu/ISO/`** (là où
+   Adrenaline la cherche ; `uma0:`, `imc0:` et `xmc0:` marchent aussi). Le nom du
+   fichier n'a pas d'importance.
+2. Installez le VPK avec VitaShell.
+3. Lancez **Burnout recomp GL**. Le premier lancement installe le jeu tout seul
+   depuis votre ISO (copie des fichiers, déchiffrement du jeu, conversion des
+   musiques) : quelques minutes, une seule fois. Ensuite le jeu démarre.
 
-1. **Déchiffrer l'exécutable.** PPSSPP fermé, ouvrez
-   `memstick/PSP/SYSTEM/ppsspp.ini` et mettez `DumpDecryptedEboots = True` dans
-   la section `[General]`. Lancez le jeu une fois dans PPSSPP : l'exécutable
-   déchiffré est écrit dans `memstick/PSP/SYSTEM/DUMP/ULES00125_Burnout.BIN`.
-   Renommez-le `EBOOT_DECRYPTED.ELF`.
-2. **Extraire le disque.** Ouvrez l'ISO avec 7-Zip et extrayez
-   `PSP_GAME/PARAM.SFO` et tout le dossier `PSP_GAME/USRDIR`.
-3. **Convertir les musiques** (la Vita ne sait pas décoder l'ATRAC3plus du jeu) :
+Si aucune ISO n'est trouvée, le jeu vous le dit : copiez-la dans
+`ux0:pspemu/ISO/` et relancez. Une fois installé, le portage n'a plus besoin de
+l'ISO (il a sa propre copie dans `ux0:data/burnout/`) ; gardez-la si vous jouez
+aussi au jeu dans Adrenaline.
 
-   ```bash
-   python profiles/burnout/tools/convert_music.py USRDIR/music music_ima
-   ```
-
-Vous obtenez :
-
-```text
-burnout/
-  EBOOT_DECRYPTED.ELF
-  PARAM.SFO
-  USRDIR/
-  music_ima/
-```
-
-### 2. Les copier sur la Vita
-
-Copiez ce dossier `burnout` en `ux0:data/burnout/` (FTP ou USB de VitaShell).
-
-### 3. Installer le VPK
-
-Installez le VPK avec VitaShell et lancez **Burnout recomp GL** depuis la LiveArea.
-
-Le premier lancement reste environ une minute sur le logo : les shaders sont
-compilés pour votre console.
+Chaque lancement reste ensuite environ une minute sur le logo, le temps de
+compiler les shaders pour votre console.
 
 ## Commandes
 
@@ -120,6 +98,9 @@ reste sur votre PC), puis compiler la cible Vita avec VitaSDK.
 - Le chiffrement des sauvegardes PSP (`profiles/burnout/host/psp_savedata.cpp`)
   est porté de [PPSSPP](https://github.com/hrydgard/ppsspp) et est sous
   **GPL-2.0-or-later** ; une version Vita qui l'inclut est donc distribuée sous GPL.
+- Installation au premier lancement : le déchiffreur PRX et libkirk de PPSSPP
+  (GPL-2.0) déchiffrent l'exécutable du jeu, et le décodeur ATRAC3plus de FFmpeg
+  (LGPL-2.1, `at3_standalone` de PPSSPP) convertit les musiques.
 - [stb_image](https://github.com/nothings/stb) (domaine public).
 - Le reste du dépôt est sous licence MIT ([LICENSE](LICENSE)).
 

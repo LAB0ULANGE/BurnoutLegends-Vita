@@ -5,10 +5,12 @@
 #include "font8x8.hpp"
 #include "bonus.hpp"
 #include "filters.hpp"
+#include "game_setup.hpp"
 
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include <algorithm>
@@ -276,6 +278,92 @@ Settings run(const std::string &root, const std::string &build) {
     // own frame buffers (2 MiB of CDRAM).
     sceDisplayWaitVblankStart();
     return settings;
+}
+
+} // namespace burnout::boot_menu
+
+namespace burnout::boot_menu {
+
+bool install(const std::string &root) {
+    if (setup::installed(root)) return true;
+    Screen screen;
+    if (!screen.open()) return false;
+    const auto header = [&]() {
+        screen.clear();
+        screen.text(40, 40, "BURNOUT LEGENDS", kAccent, 4);
+        screen.text(40, 90, "Premier lancement / First launch", kDim, 2);
+    };
+    header();
+    screen.text(40, 160, "Recherche de votre ISO... / Looking for your ISO...", kText, 2);
+    screen.show();
+
+    std::uint64_t last_draw = 0u;
+    std::string last_step;
+    const auto progress = [&](const std::string &step, const std::string &detail, double fraction) {
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+        const std::uint64_t now = sceKernelGetProcessTimeWide();
+        if (step == last_step && now - last_draw < 100000u && fraction < 1.0) return;
+        last_step = step;
+        last_draw = now;
+        header();
+        static const std::pair<const char *, const char *> kSteps[]{
+            {"Copying the game files", "Copie des fichiers du jeu"},
+            {"Decrypting the game", "Dechiffrement du jeu"},
+            {"Converting the music", "Conversion des musiques"},
+            {"Done", "Termine"},
+        };
+        const char *french = step.c_str();
+        for (const auto &[english, translated] : kSteps)
+            if (step == english) french = translated;
+        screen.text(40, 160, std::string(french) + " / " + step, kText, 2);
+        screen.text(40, 196, detail.substr(0, 56), kDim, 2);
+        screen.fill(40, 250, 880, 28, kHighlight);
+        screen.fill(40, 250, static_cast<int>(880.0 * std::clamp(fraction, 0.0, 1.0)), 28, kAccent);
+        screen.text(40, 320, "Une seule fois : quelques minutes. Ne quittez pas.", kDim, 2);
+        screen.text(40, 350, "Only once: a few minutes. Please do not quit.", kDim, 2);
+        screen.show();
+    };
+    const setup::Outcome outcome = setup::install(
+        root, {"ux0:pspemu/ISO", "uma0:pspemu/ISO", "imc0:pspemu/ISO", "xmc0:pspemu/ISO", "ur0:pspemu/ISO", "grw0:pspemu/ISO"}, progress);
+    std::fprintf(stderr, "[setup] result %d: %s (%s)\n", static_cast<int>(outcome.result), outcome.message.c_str(), outcome.image.c_str());
+    if (outcome.result == setup::Result::Ready) return true;
+
+    header();
+    int y = 160;
+    const auto line = [&](const std::string &text, std::uint32_t colour) {
+        screen.text(40, y, text.substr(0, 56), colour, 2);
+        y += 28;
+    };
+    switch (outcome.result) {
+    case setup::Result::NoImage:
+        line("Aucune ISO de Burnout Legends trouvee.", kSelected);
+        line("Copiez votre ISO ou CSO (ULES00125) dans", kText);
+        line("ux0:pspemu/ISO/ puis relancez le jeu.", kText);
+        y += 20;
+        line("No Burnout Legends ISO found.", kSelected);
+        line("Put your ISO or CSO (ULES00125) in", kText);
+        line("ux0:pspemu/ISO/ and start the game again.", kText);
+        break;
+    case setup::Result::WrongVersion:
+        line("Version non prise en charge / Unsupported version", kSelected);
+        line(outcome.image, kDim);
+        line("Seule la version europeenne ULES00125 v1.01", kText);
+        line("Only the European version ULES00125 v1.01", kText);
+        break;
+    default:
+        line("L'installation a echoue / Install failed", kSelected);
+        line(outcome.message, kText);
+        line(outcome.image, kDim);
+        break;
+    }
+    screen.text(40, 470, "Appuyez sur une touche pour quitter / Press a button to exit", kDim, 2);
+    screen.show();
+    SceCtrlData pad{};
+    do {
+        sceKernelDelayThread(50000);
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+    } while (pad.buttons == 0u);
+    return false;
 }
 
 } // namespace burnout::boot_menu

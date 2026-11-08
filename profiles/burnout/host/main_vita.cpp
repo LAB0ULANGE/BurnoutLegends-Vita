@@ -55,7 +55,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x16364] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x16894] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -343,6 +343,12 @@ int main() {
 #if defined(BURNOUT_VITA_GL)
     const std::string label = std::string(BURNOUT_VITA_LABEL).empty() ? std::string(kBuild)
                                                                       : std::string(kBuild) + " " + BURNOUT_VITA_LABEL;
+    // First launch: the game files are made from the player's own ISO / CSO.
+    if (!burnout::boot_menu::install(kRoot)) {
+        std::fflush(stderr);
+        sceKernelExitProcess(0);
+        return 0;
+    }
     g_settings = kRelease ? burnout::boot_menu::Settings{} : burnout::boot_menu::run(kRoot, label);
     if (kForceScale != 0) g_settings.render_scale = kForceScale;
     if (kSoundCore2) g_settings.sound_core1 = false;  // test: SAS mixer and audio beside the GL thread

@@ -55,7 +55,29 @@ set(BURNOUT_HOST_SOURCES
     host/psp_savedata.cpp
     host/filters.cpp
     host/bonus.cpp
-    host/texture_pack.cpp)
+    host/texture_pack.cpp
+    host/iso_reader.cpp
+    host/game_setup.cpp)
+
+# First-launch install from the player's disc image: PPSSPP's PRX decrypter
+# and libkirk (GPL-2.0), and the FFmpeg ATRAC3plus decoder (LGPL) as
+# extracted by PPSSPP (at3_standalone). Compiled with stand-in headers for
+# PPSSPP's Common/ (host/third_party/ppsspp_shim).
+enable_language(C)
+file(GLOB BURNOUT_KIRK_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/libkirk/*.c")
+file(GLOB BURNOUT_AT3_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/at3/*.cpp")
+add_library(burnout_thirdparty STATIC ${BURNOUT_KIRK_SOURCES} ${BURNOUT_AT3_SOURCES}
+    host/third_party/PrxDecrypter.cpp)
+target_include_directories(burnout_thirdparty
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/host" "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/ppsspp_shim"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/at3")
+if(MSVC)
+    target_compile_options(burnout_thirdparty PRIVATE /w)
+    target_compile_definitions(burnout_thirdparty PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(burnout_thirdparty PRIVATE -w -O2)
+    target_compile_definitions(burnout_thirdparty PRIVATE _GNU_SOURCE M_PI=3.14159265358979323846 M_SQRT1_2=0.70710678118654752440 M_SQRT2=1.41421356237309504880)
+endif()
 
 if(VITA)
     # PS Vita: the same headless runtime packaged as a VPK that benchmarks the
@@ -69,6 +91,7 @@ if(VITA)
         target_compile_definitions(burnout_vita PRIVATE BURNOUT_VITA_PROFILE=1)
     endif()
     target_include_directories(burnout_vita PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+    target_link_libraries(burnout_vita PRIVATE burnout_thirdparty)
     target_link_libraries(burnout_vita PRIVATE burnout_generated
         SceDisplay_stub SceSysmem_stub ScePower_stub SceKernelThreadMgr_stub
         SceProcessmgr_stub SceLibKernel_stub SceAudio_stub SceVideodec_stub SceAppUtil_stub SceRtc_stub SceCommonDialog_stub SceSysmodule_stub pthread)
@@ -99,6 +122,7 @@ if(VITA)
             target_compile_definitions(burnout_vita_gl PRIVATE BURNOUT_VITA_PROFILE=1)
         endif()
         target_include_directories(burnout_vita_gl PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+    target_link_libraries(burnout_vita_gl PRIVATE burnout_thirdparty)
         target_link_libraries(burnout_vita_gl PRIVATE burnout_generated
             vitaGL vitashark SceShaccCgExt mathneon taihen_stub SceShaccCg_stub SceKernelDmacMgr_stub
             SceGxm_stub SceDisplay_stub SceCommonDialog_stub SceAppMgr_stub SceSysmodule_stub SceIme_stub
@@ -160,6 +184,7 @@ add_executable(burnout_headless host/main_headless.cpp host/ge_render.cpp host/g
 target_link_libraries(burnout_headless PRIVATE burnout_generated burnout_ge_render opengl32)
 target_compile_definitions(burnout_headless PRIVATE BURNOUT_GE_RENDER=1 BURNOUT_GE_SOFTWARE=1)
 target_include_directories(burnout_headless PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+target_link_libraries(burnout_headless PRIVATE burnout_thirdparty)
 if(MSVC)
     # Guest code runs on the host stack only one dispatch deep, but generated
     # units chain natively; keep the same headroom as the VCS profile.
