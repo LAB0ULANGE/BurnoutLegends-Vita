@@ -79,7 +79,10 @@ if(VITA)
     option(BURNOUT_VITA_GL "Also build the vitaGL rendering VPK" ON)
     if(BURNOUT_VITA_GL)
         add_executable(burnout_vita_gl host/main_vita.cpp host/boot_menu_vita.cpp host/ge_render.cpp host/ge_gl.cpp
-            host/gl_context_vita.cpp ${BURNOUT_HOST_SOURCES})
+            host/gl_context_vita.cpp host/alloc_stats_vita.cpp ${BURNOUT_HOST_SOURCES})
+        # Memory diagnostics: every malloc/free counted (alloc_stats_vita.cpp).
+        target_link_options(burnout_vita_gl PRIVATE
+            -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=memalign)
         # A second build (other generated-code flags) installs next to this
         # one under its own title ID; the label shows on the launch screen.
         set(BURNOUT_VITA_GL_TITLE_ID "BRNG00001" CACHE STRING "Title ID of the rendering VPK")

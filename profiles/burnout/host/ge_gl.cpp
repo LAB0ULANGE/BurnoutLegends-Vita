@@ -1,6 +1,9 @@
 #include "core_load.hpp"
 #include "ge_gl.hpp"
 #include "ge_render.hpp"
+#if defined(__vita__)
+#include "alloc_stats.hpp"
+#endif
 
 #include "gl_api.hpp"
 
@@ -4425,6 +4428,7 @@ void present(std::uint32_t address) {
                           texture_bytes / 1024u, static_cast<unsigned long>(g_textures_evicted), static_cast<unsigned long>(g_targets.size()),
                           static_cast<unsigned long>(g_skin_cache.size()), static_cast<unsigned long>(render::early_queue_size()));
             trace(memory_line);
+            trace(("  " + alloc_stats::report()).c_str());
         }
 #endif
         if (g_tight_regions && g_scene_count != 0u) {
