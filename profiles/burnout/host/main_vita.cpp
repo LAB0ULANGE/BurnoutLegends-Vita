@@ -8,6 +8,7 @@
 // writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
 // solid status colour: blue running, green done, red error.
 #include "burnout_hle.hpp"
+#include "texture_pack.hpp"
 #include "bonus.hpp"
 #include "filters.hpp"
 #include <filesystem>
@@ -54,7 +55,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x16000] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x16364] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -68,7 +69,10 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-106";
+// Public release: no launch menu (default settings), no Bonus filters, no
+// debug pad combos, no texture packs (not finished yet).
+constexpr bool kRelease = true;
+constexpr const char *kBuild = kRelease ? "0.0.1" : "gl-106";
 
 // Bonus filters (bonus.hpp): state from unlocks.bin, applied to the renderer.
 burnout::bonus::State g_bonus;
@@ -265,7 +269,7 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
         static bool held = false;
         const bool combo = (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_DOWN)) ==
                            (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_DOWN);
-        if (combo && !held) burnout::render::request_capture();
+        if (combo && !held && !kRelease) burnout::render::request_capture();
         held = combo;
         // Bonus filters, live: L + R + RIGHT / LEFT = next / previous filter
         // in slot 1, L + R + UP = all off (saved to unlocks.bin on change).
@@ -274,7 +278,7 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
         const std::uint32_t arrows = (pad.buttons & lr) == lr ? pad.buttons & (SCE_CTRL_RIGHT | SCE_CTRL_LEFT | SCE_CTRL_UP) : 0u;
         const std::uint32_t pressed = arrows & ~filter_held;
         filter_held = arrows;
-        if (pressed != 0u) {
+        if (pressed != 0u && !kRelease) {
             if (pressed & SCE_CTRL_RIGHT) burnout::bonus::cycle(g_bonus, 0, 1);
             else if (pressed & SCE_CTRL_LEFT) burnout::bonus::cycle(g_bonus, 0, -1);
             else g_bonus.active = {};
@@ -283,7 +287,7 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
         }
         // While L + R are held the arrows drive the filters, not the game.
         std::uint32_t buttons = static_cast<std::uint32_t>(pad.buttons);
-        if ((buttons & lr) == lr) buttons &= ~static_cast<std::uint32_t>(SCE_CTRL_RIGHT | SCE_CTRL_LEFT | SCE_CTRL_UP | SCE_CTRL_DOWN);
+        if ((buttons & lr) == lr && !kRelease) buttons &= ~static_cast<std::uint32_t>(SCE_CTRL_RIGHT | SCE_CTRL_LEFT | SCE_CTRL_UP | SCE_CTRL_DOWN);
         return buttons & 0xF3F9u;  // PSP-compatible bits
     };
     options.live_analog = [] {
@@ -339,7 +343,7 @@ int main() {
 #if defined(BURNOUT_VITA_GL)
     const std::string label = std::string(BURNOUT_VITA_LABEL).empty() ? std::string(kBuild)
                                                                       : std::string(kBuild) + " " + BURNOUT_VITA_LABEL;
-    g_settings = burnout::boot_menu::run(kRoot, label);
+    g_settings = kRelease ? burnout::boot_menu::Settings{} : burnout::boot_menu::run(kRoot, label);
     if (kForceScale != 0) g_settings.render_scale = kForceScale;
     if (kSoundCore2) g_settings.sound_core1 = false;  // test: SAS mixer and audio beside the GL thread
     std::fprintf(stderr, "[vita] %s: %s, scale %d, sound %d, frame skip %d, shader cache %d\n", kBuild,
@@ -423,8 +427,16 @@ int main() {
         burnout::gl::set_fbo_scenes(kFboScenes);
         burnout::gl::set_only_current_level(kOnlyLevel);
         burnout::gl::set_present_sharpen(kSharpen);
-        g_bonus = burnout::bonus::load(std::string(kRoot) + "unlocks.bin");
-        apply_bonus();
+        if (kRelease) {
+            burnout::gl::set_filters({});
+        } else {
+            g_bonus = burnout::bonus::load(std::string(kRoot) + "unlocks.bin");
+            apply_bonus();
+        }
+        // PPSSPP texture pack: ux0:data/burnout/textures/<game id>/textures.ini.
+        for (const char *id : {"ULES00125", "ULUS10025", ""})
+            if (!kRelease)
+            if (burnout::texture_pack::open(std::string(kRoot) + "textures/" + id)) break;
         burnout::gl::set_dynamic_resolution(kDynamicRes, 1.5f, kDynamicPin);
         burnout::gl::set_thin_foliage(kThinFoliage, kThinNear, kThinFar);
         burnout::render::configure(render);

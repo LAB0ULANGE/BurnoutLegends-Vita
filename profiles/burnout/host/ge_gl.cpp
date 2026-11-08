@@ -10,6 +10,7 @@
 #include "burnout_bench.hpp"
 #include "thread_sync.hpp"
 #include "filters.hpp"
+#include "texture_pack.hpp"
 
 #include <algorithm>
 #include <array>
@@ -562,6 +563,9 @@ struct Texture {
     std::uint32_t uploaded_w{}, uploaded_h{};  // size of the GL texture's level 0 (0: none yet)
     std::uint32_t rewrites{};      // uploads after a CPU or transfer write (a movie: every frame)
     std::uint64_t last_frame{};    // last frame it was bound in (unused ones are deleted)
+    // Texture pack: the PNG matching the current contents and its decode.
+    const std::string *pack_path{};
+    std::shared_ptr<texture_pack::Pending> pack_pending;
 };
 
 // Uniforms are recorded by slot; the GL thread keeps the latest value of each
@@ -591,6 +595,9 @@ std::uint32_t g_world_cursor{}, g_view_cursor{}, g_projection_cursor{}, g_texgen
 std::uint32_t g_vertex_address{}, g_index_address{};
 std::array<std::uint8_t, 1024> g_clut{};   // palette cached by LOAD_CLUT, as on the GE
 std::uint64_t g_clut_hash{};
+// Texture packs hash the palette as PPSSPP does: the last load's bytes plus
+// the start offset, at most the largest load seen.
+std::uint32_t g_clut_loaded{}, g_clut_max{};
 // Pending batch: vertices in the PSP component formats (see BatchLayout),
 // all of one vertex type.
 // Scratch buffers that are always written after they grow: no zero fill.
@@ -1263,7 +1270,35 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
         texture.probe = probe;
         if (full) g_stats.texture_bytes_hashed += bytes;
         const std::uint64_t hash = full ? fnv(source, bytes) : texture.hash;
-        if (written || fresh || reformat || hash != texture.hash) {
+        bool changed = written || fresh || reformat || hash != texture.hash;
+        if (changed && texture_pack::active() && texture.rewrites < 2u) {
+            texture_pack::TextureInfo info;
+            info.address = address;
+            info.format = format;
+            info.buffer_width = buffer_width;
+            info.width = width;
+            info.height = height;
+            info.dim = cmd(0xB8u) & 0xF0Fu;
+            info.clut_format = 0xC5000000u | cmd(0xC5u);
+            info.bytes = source;
+            if (paletted) {
+                const std::uint32_t entry = (cmd(0xC5u) & 3u) == 3u ? 4u : 2u;
+                const std::uint32_t start = ((cmd(0xC5u) >> 16u) & 0x1Fu) << 4u;
+                info.clut = g_clut.data();
+                info.clut_bytes = std::min<std::uint32_t>({g_clut_loaded + start * entry, g_clut_max, 1024u});
+            }
+            const std::string *pack = texture_pack::match(info);
+            if (pack != nullptr && pack == texture.pack_path) {
+                // Its replacement is already drawn (or decoding): the game's
+                // texture is not uploaded again.
+                texture.hash = hash;
+                changed = false;
+            } else {
+                texture.pack_path = pack;
+                texture.pack_pending = pack != nullptr ? texture_pack::request(*pack) : nullptr;
+            }
+        }
+        if (changed) {
             texture.hash = hash;
             texture.upload_mode = upload_mode;
             std::vector<std::uint8_t> linear_bytes;
@@ -1381,6 +1416,25 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 g_frame.blobs.push_back(std::move(rgba));
             }
             ++g_stats.texture_uploads;
+        }
+    }
+    if (texture.pack_pending != nullptr) {
+        // The pack's picture once decoded, in place of the game's texture.
+        if (auto image = texture_pack::take(*texture.pack_pending)) {
+            texture.pack_pending.reset();
+            texture.mipmapped = g_mipmaps && levels != 0u && image->width >= 8u && image->height >= 8u;
+            texture.uploaded_w = image->width;
+            texture.uploaded_h = image->height;
+            const bool deferred = g_recording_deferred;
+            g_recording_deferred = false;
+            if (deferred) record(Op::BindTexture, {texture.name});
+            record(Op::TexImage, {image->width, image->height, static_cast<std::uint32_t>(g_frame.blobs.size()), texture.mipmapped ? 1u : 0u});
+            g_recording_deferred = deferred;
+            if (deferred) g_state.texture = ~0u;
+            g_frame.blobs.push_back(std::move(image->rgba));
+            texture.sampling[0] = texture.sampling[1] = texture.sampling[2] = texture.sampling[3] = -1;
+        } else if (texture_pack::failed(*texture.pack_pending)) {
+            texture.pack_pending.reset();
         }
     }
     // PSP minification modes 4-7: nearest/linear texel, nearest/linear level.
@@ -4289,6 +4343,10 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
         const std::uint32_t clut = (cmd(0xB0u) & 0xFFFFF0u) | ((cmd(0xB1u) << 8u) & 0x0F000000u);
         const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
         if (const std::uint8_t *p = guest_bytes(memory, clut, bytes, false)) std::memcpy(g_clut.data(), p, bytes);
+        if (bytes != 0u) {
+            g_clut_loaded = bytes;
+            g_clut_max = std::max(g_clut_max, bytes);
+        }
         // The loaded entries only (16-colour palettes are 32-64 bytes): the
         // whole 1 KiB took ~1000 cycles a load on the Vita.
         g_clut_hash = fnv(g_clut.data(), bytes, 0xCBF29CE484222325ull ^ bytes);
@@ -4607,6 +4665,7 @@ void present(std::uint32_t address) {
             trace(("  " + alloc_stats::report()).c_str());
         }
 #endif
+        if (texture_pack::active()) trace(("  " + texture_pack::report()).c_str());
         if (g_tight_regions && g_scene_count != 0u) {
             char text[128];
             std::snprintf(text, sizeof(text), "  tight regions: %.1f scenes/frame, %.0f%% of their full area processed, %.2f depth reloads/frame",

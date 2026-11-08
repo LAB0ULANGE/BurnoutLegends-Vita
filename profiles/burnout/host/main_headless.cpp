@@ -3,6 +3,7 @@
 // per logical game frame. No audio output; --render draws the GE lists with the
 // software rasterizer and --capture writes PNG frames.
 #include "audio_out.hpp"
+#include "texture_pack.hpp"
 #include "music.hpp"
 #include "sas_worker.hpp"
 #include "burnout_run.hpp"
@@ -99,6 +100,7 @@ Cli parse(int argc, char **argv) {
                 if (const int index = burnout::filters::find(list.substr(at, comma - at)); index >= 0) active.push_back(index);
             burnout::gl::set_filters(active);
         }
+        else if (key == "--texture-pack") burnout::texture_pack::open(value());  // PPSSPP pack folder (textures.ini)
         else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
             cli.render.enabled = true;
             const std::string range = value();
