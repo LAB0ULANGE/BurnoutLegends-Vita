@@ -54,7 +54,7 @@ recompiled code only matches this executable.
 2. Install the VPK with VitaShell.
 3. Start **Burnout recomp GL**. The first launch installs the game from your
    ISO by itself (copies the game files, decrypts the game, converts the music):
-   a few minutes, only once. Then the game starts.
+   about 10 minutes, only once. If it is interrupted, it resumes where it stopped. Then the game starts.
 
 If no ISO is found, the game tells you so: copy it to `ux0:pspemu/ISO/` and start
 again. Once installed, the port no longer needs the ISO (it has its own copy in

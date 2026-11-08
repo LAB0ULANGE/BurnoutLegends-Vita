@@ -319,8 +319,8 @@ bool install(const std::string &root) {
         screen.text(40, 196, detail.substr(0, 56), kDim, 2);
         screen.fill(40, 250, 880, 28, kHighlight);
         screen.fill(40, 250, static_cast<int>(880.0 * std::clamp(fraction, 0.0, 1.0)), 28, kAccent);
-        screen.text(40, 320, "Une seule fois : quelques minutes. Ne quittez pas.", kDim, 2);
-        screen.text(40, 350, "Only once: a few minutes. Please do not quit.", kDim, 2);
+        screen.text(40, 320, "Une seule fois : environ 10 minutes. Ne quittez pas.", kDim, 2);
+        screen.text(40, 350, "Only once: about 10 minutes. Please do not quit.", kDim, 2);
         screen.show();
     };
     const setup::Outcome outcome = setup::install(

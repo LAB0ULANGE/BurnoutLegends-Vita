@@ -57,7 +57,8 @@ charge : le code recompilé correspond à cet exécutable précis.
 2. Installez le VPK avec VitaShell.
 3. Lancez **Burnout recomp GL**. Le premier lancement installe le jeu tout seul
    depuis votre ISO (copie des fichiers, déchiffrement du jeu, conversion des
-   musiques) : quelques minutes, une seule fois. Ensuite le jeu démarre.
+   musiques) : environ 10 minutes, une seule fois. Si elle est interrompue, elle
+   reprend là où elle s'était arrêtée. Ensuite le jeu démarre.
 
 Si aucune ISO n'est trouvée, le jeu vous le dit : copiez-la dans
 `ux0:pspemu/ISO/` et relancez. Une fois installé, le portage n'a plus besoin de
