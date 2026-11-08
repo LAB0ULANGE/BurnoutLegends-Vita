@@ -9,6 +9,7 @@
 
 #include "burnout_bench.hpp"
 #include "thread_sync.hpp"
+#include "filters.hpp"
 
 #include <algorithm>
 #include <array>
@@ -625,6 +626,17 @@ bool g_drawing{true};         // false while a frame is skipped
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
 Program g_uber, g_present, g_present_sharp;  // GL thread (sharp: enlarged pictures)
+// Bonus filters (filters.hpp): while some are on, their generated program
+// replaces g_present in the present pass (no other target or pass). The
+// request comes from any thread; the GL thread builds it at the next present.
+Program g_filter;
+GLint g_filter_extent{-1}, g_filter_pixels{-1}, g_filter_time{-1};
+SyncMutex g_filter_mutex{"gl_filters"};
+std::vector<int> g_filter_request;
+std::atomic<std::uint32_t> g_filter_version{0};
+std::uint32_t g_filter_built{0};  // GL thread
+std::vector<GLuint> g_framebuffer_texture;   // GL thread: colour texture id of each framebuffer id
+std::vector<std::uint32_t> g_framebuffer_psp_width;  // GL thread: its width in PSP pixels
 #if defined(__vita__)
 GLuint g_vertex_buffer{}, g_index_buffer{};  // wrap per-draw scratch memory (vglBufferData)
 #endif
@@ -3617,7 +3629,70 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_SHORT, indices);
 }
 
+// GL thread: (re)builds the filter program when the request changed.
+void update_filter_program() {
+    const std::uint32_t version = g_filter_version.load(std::memory_order_acquire);
+    if (version == g_filter_built) return;
+    g_filter_built = version;
+    std::vector<int> active;
+    {
+        std::lock_guard lock(g_filter_mutex);
+        active = g_filter_request;
+    }
+    if (g_filter.id != 0u) {
+        glDeleteProgram(g_filter.id);
+        g_filter = Program{};
+    }
+    const std::string fragment = filters::fragment_shader(active);
+    if (fragment.empty()) {
+        trace("filters: none");
+        return;
+    }
+    const double started = host_now_ms();
+    std::string error;
+    if (!link(g_filter, kPresentVertexShader, fragment.c_str(), true, error)) {
+        g_filter = Program{};
+        trace(("filters: " + filters::describe(active) + " FAILED: " + error).c_str());
+        return;
+    }
+    g_filter_extent = glGetUniformLocation(g_filter.id, "u_extent");
+    g_filter_pixels = glGetUniformLocation(g_filter.id, "u_pixels");
+    g_filter_time = glGetUniformLocation(g_filter.id, "u_time");
+    char line[256];
+    std::snprintf(line, sizeof(line), "filters: %s (built in %.0f ms)", filters::describe(active).c_str(), host_now_ms() - started);
+    trace(line);
+}
+
+// The picture (u, v = texture coordinates of its far corner; pixels = its
+// size in its own pixels) drawn over the bound framebuffer, through the
+// filter program when there is one.
+void draw_picture(const Program &plain, GLuint texture, float u, float v, float pixels_x, float pixels_y) {
+    const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
+    const Program &program = g_filter.id != 0u ? g_filter : plain;
+    glUseProgram(program.id);
+    g_bound = nullptr;
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(program.texture, 0);
+    if (&program == &g_filter) {
+        static const double start = host_now_ms();
+        if (g_filter_extent >= 0) glUniform2f(g_filter_extent, u, v);
+        if (g_filter_pixels >= 0) glUniform2f(g_filter_pixels, pixels_x, pixels_y);
+        if (g_filter_time >= 0) glUniform1f(g_filter_time, static_cast<float>((host_now_ms() - start) / 1000.0));
+    }
+    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(3);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 void present_target(GLuint texture_id, int width, float fraction) {
+    update_filter_program();
 #if defined(__vita__)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, 960, 544);
@@ -3631,23 +3706,10 @@ void present_target(GLuint texture_id, int width, float fraction) {
     if (texture_id != 0u) {
         const float k = g_valid_region && g_dynamic_resolution ? fraction : 1.0f;  // drawn part of a valid-region target
         const float u = 480.0f / static_cast<float>(width) * k, v = k;
-        const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
         // Sharpened only when the picture is enlarged.
         const Program &present = fraction * static_cast<float>(g_scale) < 15.5f && g_present_sharp.id != 0u ? g_present_sharp : g_present;
-        glUseProgram(present.id);
-        g_bound = nullptr;
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, gl_texture(texture_id));
-        glUniform1i(present.texture, 0);
-        glDisableVertexAttribArray(2);
-        glDisableVertexAttribArray(3);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        glEnableVertexAttribArray(0);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        const float q = fraction * static_cast<float>(g_scale);  // eighths the picture was drawn at
+        draw_picture(present, gl_texture(texture_id), u, v, 60.0f * q, 34.0f * q);
     }
     swap_buffers();
 #else
@@ -3659,6 +3721,41 @@ void present_target(GLuint texture_id, int width, float fraction) {
 
 void capture_target(GLuint framebuffer_id, int height, const std::function<void(std::vector<std::uint8_t> &)> &done, int drawn_q) {
     std::vector<std::uint8_t> rgb;
+    update_filter_program();
+    if (g_filter.id != 0u && framebuffer_id < g_framebuffer_texture.size() && g_framebuffer_texture[framebuffer_id] != 0u) {
+        // Through the filters: drawn into a 960x544 target and read back.
+        static GLuint fbo = 0u, color = 0u;
+        if (fbo == 0u) {
+            glGenTextures(1, &color);
+            glBindTexture(GL_TEXTURE_2D, color);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 960, 544, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glGenFramebuffers(1, &fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+        }
+        int scale = framebuffer_id < g_framebuffer_scales.size() ? g_framebuffer_scales[framebuffer_id] : g_scale;
+        if (framebuffer_id < g_framebuffer_drawn.size() && g_framebuffer_drawn[framebuffer_id] != 0) scale = g_framebuffer_drawn[framebuffer_id];
+        if (drawn_q != 0) scale = drawn_q;
+        const float k = g_valid_region && g_dynamic_resolution ? static_cast<float>(scale) / static_cast<float>(g_scale) : 1.0f;
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, 960, 544);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        draw_picture(g_present, gl_texture(g_framebuffer_texture[framebuffer_id]), 480.0f / static_cast<float>(g_framebuffer_psp_width[framebuffer_id]) * k,
+                     k, 60.0f * static_cast<float>(scale), 34.0f * static_cast<float>(scale));
+        std::vector<std::uint8_t> rgba(960u * 544u * 4u);
+        glReadPixels(0, 0, 960, 544, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        rgb.resize(960u * 544u * 3u);
+        for (std::uint32_t y = 0; y < 544u; ++y)
+            for (std::uint32_t x = 0; x < 960u; ++x)
+                for (int c = 0; c < 3; ++c) rgb[(y * 960u + x) * 3u + c] = rgba[((543u - y) * 960u + x) * 4u + c];
+        done(rgb);
+        return;
+    }
     if (framebuffer_id < g_gl_framebuffers.size() && g_gl_framebuffers[framebuffer_id] != 0u) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_gl_framebuffers[framebuffer_id]);
         // The visible 480x272 at the render scale, averaged back to PSP size.
@@ -3823,6 +3920,12 @@ void replay(const Frame &frame) {
                           (op[4] & 0x100u) == 0u);
             if (op[0] >= g_framebuffer_scales.size()) g_framebuffer_scales.resize(op[0] + 1u, g_scale);
             g_framebuffer_scales[op[0]] = scale;
+            if (op[0] >= g_framebuffer_texture.size()) {
+                g_framebuffer_texture.resize(op[0] + 1u, 0u);
+                g_framebuffer_psp_width.resize(op[0] + 1u, 512u);
+            }
+            g_framebuffer_texture[op[0]] = op[1];
+            g_framebuffer_psp_width[op[0]] = op[2];
             g_bound_scale = scale;  // create_target leaves it bound
             if (op[0] >= g_framebuffer_region.size()) g_framebuffer_region.resize(op[0] + 1u, 0u);
             g_framebuffer_region[op[0]] = (op[4] & 0x200u) != 0u ? op[2] << 16 | op[3] : 0u;
@@ -3997,6 +4100,15 @@ void set_tight_regions(bool enabled) { g_tight_regions = g_tight_regions || enab
 void set_valid_region(bool enabled) { g_valid_region = g_valid_region || enabled; }
 void set_only_current_level(bool enabled) { g_only_current_level = g_only_current_level || enabled; }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
+
+void set_filters(const std::vector<int> &active) {
+    {
+        std::lock_guard lock(g_filter_mutex);
+        if (active == g_filter_request) return;
+        g_filter_request = active;
+    }
+    g_filter_version.fetch_add(1u, std::memory_order_release);
+}
 void set_thin_foliage(bool enabled, float near_distance, float far_distance) {
     if (!enabled) return;
     g_thin_foliage = true;

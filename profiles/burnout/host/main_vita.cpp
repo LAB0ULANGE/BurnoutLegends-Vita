@@ -8,6 +8,8 @@
 // writes the per-frame statistics to ux0:data/burnout-bench.txt. The screen only shows a
 // solid status colour: blue running, green done, red error.
 #include "burnout_hle.hpp"
+#include "bonus.hpp"
+#include "filters.hpp"
 #include <filesystem>
 #include "core_load.hpp"
 #include "audio_out.hpp"
@@ -52,7 +54,7 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 // its copy of the text segment, so it corrupts its heap (exit 0xC0000374)
 // unless the segment ends early in a page. When it crashes again, grow this
 // pad until `readelf -l` shows the first LOAD memsz ending in 0x000-0x400.
-__attribute__((used)) const unsigned char burnout_text_pad[0x14784] = {1};
+__attribute__((used)) const unsigned char burnout_text_pad[0x14b94] = {1};
 unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 }
 
@@ -66,7 +68,20 @@ constexpr const char *kRoot = "ux0:data/burnout/";
 #if defined(BURNOUT_VITA_GL)
 // Rendering build: the game on screen with the real pad (the scripted race
 // inputs are still OR-ed in), paced to real time; START+SELECT quits.
-constexpr const char *kBuild = "gl-103k";
+constexpr const char *kBuild = "gl-104";
+
+// Bonus filters (bonus.hpp): state from unlocks.bin, applied to the renderer.
+burnout::bonus::State g_bonus;
+void apply_bonus() {
+    static burnout::bonus::State saved = g_bonus;
+    burnout::gl::set_filters(burnout::bonus::applied(g_bonus));
+    std::fprintf(stderr, "[bonus] %s, filters: %s\n", g_bonus.enabled ? "on" : "off",
+                 burnout::filters::describe(burnout::bonus::applied(g_bonus)).c_str());
+    if (!(saved == g_bonus)) {
+        burnout::bonus::save(std::string(kRoot) + "unlocks.bin", g_bonus);
+        saved = g_bonus;
+    }
+}
 constexpr bool kAllProbe = false;  // gl-90/91 tests: GPU probe on every draw, 600 frames per mode
 constexpr int kProbeSet = 1;  // 1: pixels (gl-90), 2: draws (gl-92), 3: geometry (gl-93)
 constexpr bool kGpuProbe = false;  // diagnostic: GPU probe modes, 600 frames each
@@ -252,7 +267,24 @@ std::string run_pass(int arm_mhz, const burnout::InputScript &script, bool timed
                            (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_DOWN);
         if (combo && !held) burnout::render::request_capture();
         held = combo;
-        return static_cast<std::uint32_t>(pad.buttons) & 0xF3F9u;  // PSP-compatible bits
+        // Bonus filters, live: L + R + RIGHT / LEFT = next / previous filter
+        // in slot 1, L + R + UP = all off (saved to unlocks.bin on change).
+        const std::uint32_t lr = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER;
+        static std::uint32_t filter_held = 0u;
+        const std::uint32_t arrows = (pad.buttons & lr) == lr ? pad.buttons & (SCE_CTRL_RIGHT | SCE_CTRL_LEFT | SCE_CTRL_UP) : 0u;
+        const std::uint32_t pressed = arrows & ~filter_held;
+        filter_held = arrows;
+        if (pressed != 0u) {
+            if (pressed & SCE_CTRL_RIGHT) burnout::bonus::cycle(g_bonus, 0, 1);
+            else if (pressed & SCE_CTRL_LEFT) burnout::bonus::cycle(g_bonus, 0, -1);
+            else g_bonus.active = {};
+            g_bonus.enabled = true;
+            apply_bonus();
+        }
+        // While L + R are held the arrows drive the filters, not the game.
+        std::uint32_t buttons = static_cast<std::uint32_t>(pad.buttons);
+        if ((buttons & lr) == lr) buttons &= ~static_cast<std::uint32_t>(SCE_CTRL_RIGHT | SCE_CTRL_LEFT | SCE_CTRL_UP | SCE_CTRL_DOWN);
+        return buttons & 0xF3F9u;  // PSP-compatible bits
     };
     options.live_analog = [] {
         SceCtrlData pad{};
@@ -391,6 +423,8 @@ int main() {
         burnout::gl::set_fbo_scenes(kFboScenes);
         burnout::gl::set_only_current_level(kOnlyLevel);
         burnout::gl::set_present_sharpen(kSharpen);
+        g_bonus = burnout::bonus::load(std::string(kRoot) + "unlocks.bin");
+        apply_bonus();
         burnout::gl::set_dynamic_resolution(kDynamicRes, 1.5f, kDynamicPin);
         burnout::gl::set_thin_foliage(kThinFoliage, kThinNear, kThinFar);
         burnout::render::configure(render);

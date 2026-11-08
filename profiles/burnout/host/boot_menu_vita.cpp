@@ -3,6 +3,8 @@
 #include "boot_menu_vita.hpp"
 
 #include "font8x8.hpp"
+#include "bonus.hpp"
+#include "filters.hpp"
 
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
@@ -176,9 +178,21 @@ Settings run(const std::string &root, const std::string &build) {
     int sound_core = flag(!settings.sound_core1);
     int profile = settings.save_slot;
     int start = 0;
+    // Bonus filters (unlocks.bin): global switch and the 3 filter slots.
+    const std::string bonus_path = root + "unlocks.bin";
+    const bonus::State bonus_before = bonus::load(bonus_path);
+    bonus::State bonus_state = bonus_before;
+    int bonus_on = bonus_state.enabled ? 0 : 1;
+    std::vector<const char *> filter_names{"Aucun"};
+    for (const auto &filter : filters::all()) filter_names.push_back(filter.name);
+    int slot_choice[3];
+    for (int i = 0; i < 3; ++i) slot_choice[i] = filters::find(bonus_state.active[static_cast<std::size_t>(i)]) + 1;
     const std::vector<Item> items = {
         {"Mode", {"Jeu libre", "Course test auto"}, &mode, "Course test: menus joues seuls jusqu'a une course."},
-        {"Profil", {"1", "2", "3", "4"}, &profile, "Profil charge par le jeu (un nouveau profil prend une place libre)."},
+        {"Bonus", {"Active", "Desactive"}, &bonus_on, "Desactive: le jeu d'origine, aucun filtre."},
+        {"Filtre 1", filter_names, &slot_choice[0], "En jeu: L+R+Droite / L+R+Gauche changent ce filtre."},
+        {"Filtre 2", filter_names, &slot_choice[1], "Filtres cumules: resolution, puis couleur, puis ecran."},
+        {"Filtre 3", filter_names, &slot_choice[2], "3 filtres au plus. L+R+Haut en jeu: tout enlever."},
         {"Resolution", {"960x544 (Vita)", "840x476", "720x408", "480x272 (PSP)"}, &resolution, "Plafond: baisse seule si le jeu ralentit (30 fps tenus)."},
         {"Son/musique", {"Oui", "Non"}, &sound, "Sans le son, le jeu tourne un peu plus vite."},
         {"Saut d'images", {"Oui", "Non"}, &skip, "Saute une image si le rendu prend du retard."},
@@ -190,7 +204,7 @@ Settings run(const std::string &root, const std::string &build) {
         {"> LANCER LE JEU <", {}, &start, "X ou START pour lancer."},
     };
 
-    constexpr int kTop = 88, kRow = 26;
+    constexpr int kTop = 84, kRow = 22;
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
     int cursor = static_cast<int>(items.size()) - 1;
     std::uint32_t held = 0xFFFFFFFFu;  // ignore buttons already down at launch
@@ -207,11 +221,11 @@ Settings run(const std::string &root, const std::string &build) {
                 const std::uint32_t colour = selected ? kSelected : kText;
                 if (selected) screen.fill(0, y - 2, kWidth, kRow, kHighlight);
                 if (selected) screen.text(8, y, ">", kSelected, 3);
-                screen.text(40, y, item.label, colour, 3);
+                screen.text(40, y, item.label, colour, 2);
                 if (!item.choices.empty())
-                    screen.text(390, y, std::string("< ") + item.choices[*item.value] + " >", colour, 3);
+                    screen.text(330, y, std::string("< ") + item.choices[*item.value] + " >", colour, 2);
             }
-            screen.text(32, 384, items[cursor].help, kDim, 2);
+            screen.text(32, 420, items[cursor].help, kDim, 2);
             screen.text(32, 456, "Haut/Bas: option  Gauche/Droite: changer  START: lancer", kDim, 2);
             screen.text(32, 488, "En jeu: START+SELECT ensemble pour quitter", kDim, 2);
             screen.show();
@@ -249,6 +263,11 @@ Settings run(const std::string &root, const std::string &build) {
     settings.sound_core1 = sound_core == 0;
     settings.save_slot = profile;
     save(root, settings);
+    bonus_state.enabled = bonus_on == 0;
+    for (int i = 0; i < 3; ++i)
+        bonus_state.active[static_cast<std::size_t>(i)] =
+            slot_choice[i] > 0 ? std::string(filters::all()[static_cast<std::size_t>(slot_choice[i] - 1)].id) : std::string();
+    if (!(bonus_state == bonus_before)) bonus::save(bonus_path, bonus_state);
 
     screen.clear();
     screen.text(32, 220, "Chargement...", kAccent, 4);

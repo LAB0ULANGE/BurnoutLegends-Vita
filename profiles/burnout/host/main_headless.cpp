@@ -7,6 +7,8 @@
 #include "sas_worker.hpp"
 #include "burnout_run.hpp"
 #include "ge_render.hpp"
+#include "ge_gl.hpp"
+#include "filters.hpp"
 
 #include "psprecomp/common.hpp"
 
@@ -90,6 +92,13 @@ Cli parse(int argc, char **argv) {
             burnout::audio::start(0, value(), error);
         }
         else if (key == "--scale") cli.render.render_scale = std::stof(value());  // internal resolution x480x272
+        else if (key == "--filters") {  // bonus filters by id, comma-separated (captures show them)
+            std::vector<int> active;
+            std::string list = value() + ",";
+            for (std::size_t at = 0, comma; (comma = list.find(',', at)) != std::string::npos; at = comma + 1u)
+                if (const int index = burnout::filters::find(list.substr(at, comma - at)); index >= 0) active.push_back(index);
+            burnout::gl::set_filters(active);
+        }
         else if (key == "--trace-draws") {  // FROM-TO vblanks; implies --render
             cli.render.enabled = true;
             const std::string range = value();

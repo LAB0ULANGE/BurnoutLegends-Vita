@@ -52,7 +52,9 @@ set(BURNOUT_HOST_SOURCES
     host/core_load.cpp
     host/movie.cpp
     host/save_dialog.cpp
-    host/psp_savedata.cpp)
+    host/psp_savedata.cpp
+    host/filters.cpp
+    host/bonus.cpp)
 
 if(VITA)
     # PS Vita: the same headless runtime packaged as a VPK that benchmarks the

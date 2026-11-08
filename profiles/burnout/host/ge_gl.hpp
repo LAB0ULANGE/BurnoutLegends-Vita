@@ -39,6 +39,9 @@ void set_all_probe(bool enabled);
 void set_probe_set(int set);
 void set_only_current_level(bool enabled);  // test
 void set_present_sharpen(bool enabled);
+// Bonus filters (indices into filters::all(), at most 3): applied by the
+// present pass from the next frame; empty = the plain present pass.
+void set_filters(const std::vector<int> &active);
 // gl-77: foliage PRIMs past near_distance partly left out (2 in 3 kept), past far_distance more (1 in 3 kept).
 void set_thin_foliage(bool enabled, float near_distance, float far_distance);
 // Screen-sized targets drawn between min_scale and the render scale, by GPU load.
