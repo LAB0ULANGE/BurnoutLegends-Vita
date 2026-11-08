@@ -17,6 +17,8 @@ Ce n'est pas un émulateur : le code du jeu tourne nativement, avec un rendu
 
 Prises sur PS Vita :
 
+![Départ de course](docs/images/race.jpg)
+
 | | |
 |---|---|
 | ![Wall takedown](docs/images/takedown.jpg) | ![Menu principal](docs/images/menu.jpg) |

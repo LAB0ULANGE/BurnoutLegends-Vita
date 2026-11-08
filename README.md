@@ -16,6 +16,8 @@ movies and saves rebuilt for the Vita.
 
 Taken on a PS Vita:
 
+![Race start](docs/images/race.jpg)
+
 | | |
 |---|---|
 | ![Wall takedown](docs/images/takedown.jpg) | ![Main menu](docs/images/menu.jpg) |
