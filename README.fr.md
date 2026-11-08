@@ -13,6 +13,14 @@ Ce n'est pas un émulateur : le code du jeu tourne nativement, avec un rendu
 > du jeu, aucun exécutable du disque et aucun code du jeu recompilé. Faites une
 > copie de votre propre UMD.
 
+## Captures
+
+Prises sur PS Vita :
+
+| | |
+|---|---|
+| ![Wall takedown](docs/images/takedown.jpg) | ![Menu principal](docs/images/menu.jpg) |
+
 ## Fonctionnalités (0.0.1)
 
 - Courses à 30 fps en 960x544 (la résolution dynamique tient la cadence sur les

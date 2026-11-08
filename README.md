@@ -12,6 +12,14 @@ movies and saves rebuilt for the Vita.
 > **You need your own copy of the game.** This repository contains no game file,
 > no executable from the disc and no recompiled game code. Dump your own UMD.
 
+## Screenshots
+
+Taken on a PS Vita:
+
+| | |
+|---|---|
+| ![Wall takedown](docs/images/takedown.jpg) | ![Main menu](docs/images/menu.jpg) |
+
 ## Features (0.0.1)
 
 - 30 fps races at 960x544 (dynamic resolution keeps the frame rate on the
