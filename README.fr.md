@@ -13,6 +13,10 @@ Ce n'est pas un émulateur : le code du jeu tourne nativement, avec un rendu
 > du jeu, aucun exécutable du disque et aucun code du jeu recompilé. Faites une
 > copie de votre propre UMD.
 
+## Bande-annonce
+
+*La vidéo est compressée pour GitHub : le jeu est bien plus net sur l'écran de la Vita.*
+
 ## Captures
 
 Prises sur PS Vita :

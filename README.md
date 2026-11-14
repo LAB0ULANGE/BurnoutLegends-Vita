@@ -12,6 +12,10 @@ movies and saves rebuilt for the Vita.
 > **You need your own copy of the game.** This repository contains no
 > game file, no executable from the disc and no recompiled game code. Dump your own UMD.
 
+## Trailer
+
+*The video is compressed for GitHub: the game looks much sharper on the Vita's screen.*
+
 ## Screenshots
 
 Taken on a PS Vita:
