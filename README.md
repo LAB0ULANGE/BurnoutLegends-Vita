@@ -1,7 +1,5 @@
 
 
-https://github.com/user-attachments/assets/51a728fd-207b-4fc6-ad68-10b4aa05ae6b
-
 # Burnout Legends for PS Vita (native recompilation)
 
 ![Burnout Legends on PS Vita](docs/images/livearea.png)
