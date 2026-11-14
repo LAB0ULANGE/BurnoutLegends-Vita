@@ -29,4 +29,9 @@ int poll();
 // The display swaps must let the dialog draw itself while this is true.
 bool drawing();
 
+// The console's language as a PSP language code (0 Japanese, 1 English,
+// 2 French, 3 Spanish, 4 German, 5 Italian, 6 Dutch, 7 Portuguese, 8 Russian,
+// 9 Korean, 10/11 Chinese); English elsewhere.
+int system_language();
+
 } // namespace burnout::save_dialog

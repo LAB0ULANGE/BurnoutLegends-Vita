@@ -1,0 +1,39 @@
+BURNOUT LEGENDS 2.0 - PC (Windows 10/11)
+========================================
+
+Burnout Legends (PSP) recompilé pour Windows : le jeu tourne nativement, en haute
+définition, avec le son, les vidéos, la manette et le clavier. Mêmes ajouts que la
+version Vita 2.0 (BONUS 2.0, filtres, peintures, récompenses Takedown Signature).
+
+IL FAUT VOTRE PROPRE JEU
+  Aucun fichier du jeu n'est fourni. Mettez votre image disque de Burnout Legends
+  européen (ULES00125, fichier .iso ou .cso) à côté de burnout_legends.exe, puis
+  lancez burnout_legends.exe. Au premier lancement, les fichiers du jeu sont faits
+  depuis votre image (quelques secondes) dans le dossier data\.
+  Ensuite l'image disque n'est plus nécessaire.
+
+COMMANDES
+  Manette (Xbox ou compatible XInput) :
+    A = croix   X = carré   B = rond   Y = triangle
+    LB / LT = L   RB / RT = R   Start = START   Back = SELECT
+    croix directionnelle et stick gauche
+  Clavier (modifiable dans controls.ini) :
+    Espace / Z = croix   X = carré   Retour arrière / C = rond   V = triangle
+    A / Q = L   E / Maj = R   Entrée / Échap = START   Tab = SELECT
+    flèches = croix directionnelle
+  F11 ou Alt+Entrée : plein écran / fenêtre      F12 : capture d'écran (screenshots\)
+
+RÉGLAGES (settings.ini, créé au premier lancement)
+  resolution = 4   (2 = 960x544 comme la Vita, 3 = 1440x816, 4 = 1920x1088,
+                    6 = 2880x1632, 8 = 3840x2176)
+  fullscreen = 1   (0 = fenêtre)
+  fxaa = 1         (lissage des contours en course)
+  sound = 1
+
+FICHIERS
+  data\                        fichiers du jeu, faits depuis votre image
+  data\memstick\PSP\SAVEDATA\  vos sauvegardes (format PSP : copiables vers une
+                               PSP, une Vita Adrenaline ou PPSSPP, et inversement)
+  data\unlocks.bin             progression du BONUS 2.0
+  burnout_pc.log               journal de la dernière session (à joindre à un
+                               rapport de bug)

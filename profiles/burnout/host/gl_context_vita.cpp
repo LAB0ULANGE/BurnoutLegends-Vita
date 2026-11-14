@@ -16,6 +16,8 @@ namespace burnout::gl {
 int g_param_buffer_mib = 0;  // GXM parameter buffer, 0: vitaGL default (16 MiB)
 void set_param_buffer_mib(int mib) { g_param_buffer_mib = mib; }
 int g_fbo_scenes = 8;  // GXM scenes per frame of each FBO render target
+bool g_large_rings = true;  // GXM command rings enlarged (the THUG Vita port's sizes)
+void set_large_rings(bool large) { g_large_rings = large; }
 void set_fbo_scenes(int scenes) { g_fbo_scenes = scenes; }
 
 bool create_context(std::string &error) {
@@ -55,6 +57,20 @@ bool create_context(std::string &error) {
         std::snprintf(line, sizeof(line), "GXM parameter buffer %d MiB", g_param_buffer_mib);
         trace(line);
     }
+    // 2026-11-11, from the THUG Vita port (Code/Gfx/Vita/p_nx.cpp:553-561,
+    // COMPARAISON_THUG.md #1): vitaGL's rings are small by default (vertex
+    // 2 MiB, fragment 512 KiB, VDM 128 KiB); when the vertex ring fills with
+    // the draws' uniforms, sceGxm waits for the GPU in the middle of a frame.
+    // Ours push ~20 uniform slots a draw (lighting, 3 matrices). Off with
+    // ux0:data/burnout/anneaux_gxm_normaux.txt, to compare.
+    if (g_large_rings) {
+        vglSetVertexBufferSize(8 * kMiB);
+        vglSetFragmentBufferSize(2 * kMiB);
+        vglSetVDMBufferSize(512 * 1024);
+        trace("GXM rings: vertex 8 MiB, fragment 2 MiB, VDM 512 KiB");
+    } else {
+        trace("GXM rings: vitaGL defaults");
+    }
     // The result only says whether the resolution had to fall back (GL_TRUE);
     // vitaGL has no failure return here.
     if (vglInitWithCustomSizes(0, 960, 544, ram, cdram, phycont, 0, SCE_GXM_MULTISAMPLE_NONE))
@@ -64,6 +80,16 @@ bool create_context(std::string &error) {
     // The emulation paces itself on PSP vblanks; waiting for the Vita's vblank
     // in the swap only stalls the worker.
     vglWaitVblankStart(GL_FALSE);
+    // Our vitaGL patch (2026-11-13): GXM programs and textures equal to the
+    // previous draw's are not set again. Off with
+    // ux0:data/burnout/no_state_cache.txt, to compare.
+    if (std::FILE *f = std::fopen("ux0:data/burnout/no_state_cache.txt", "rb")) {
+        std::fclose(f);
+        vglEnableStateCache(GL_FALSE);
+        trace("GXM state cache off (no_state_cache.txt)");
+    } else {
+        trace("GXM state cache on");
+    }
     return true;
 }
 

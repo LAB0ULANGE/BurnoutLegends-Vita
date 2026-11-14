@@ -33,8 +33,10 @@ using GLsizeiptr = std::ptrdiff_t;
 #define GL_DEPTH24_STENCIL8 0x88F0
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #define GL_TEXTURE0 0x84C0
+#define GL_TEXTURE1 0x84C1
 #define GL_ARRAY_BUFFER 0x8892
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#define GL_STATIC_DRAW 0x88E4
 #define GL_CLAMP_TO_EDGE 0x812F
 #define GL_FUNC_ADD 0x8006
 #define GL_MIN 0x8007
@@ -54,7 +56,7 @@ using GLsizeiptr = std::ptrdiff_t;
     X(void, glLinkProgram, (GLuint program))                                                             \
     X(void, glGetProgramiv, (GLuint program, GLenum name, GLint *value))                                 \
     X(void, glGetProgramInfoLog, (GLuint program, GLsizei size, GLsizei *length, GLchar *log))           \
-    X(void, glUseProgram, (GLuint program))                                                                  X(void, glDeleteProgram, (GLuint program))                                                               X(void, glBindBuffer, (GLenum target, GLuint buffer))                                                \
+    X(void, glUseProgram, (GLuint program))                                                                  X(void, glDeleteProgram, (GLuint program))                                                               X(void, glBindBuffer, (GLenum target, GLuint buffer)) X(void, glGenBuffers, (GLsizei n, GLuint *buffers)) X(void, glDeleteBuffers, (GLsizei n, const GLuint *buffers)) X(void, glBufferData, (GLenum target, GLsizeiptr size, const void *data, GLenum usage))                                                \
     X(GLint, glGetUniformLocation, (GLuint program, const GLchar *name))                                 \
     X(void, glUniform1i, (GLint location, GLint v0))                                                     \
     X(void, glUniform1f, (GLint location, GLfloat v0))                                                   \
@@ -97,5 +99,15 @@ bool create_context(std::string &error);
 void swap_buffers();
 // Free memory of the GL pools, for the log (empty where unknown).
 std::string memory_report();
+
+#if !defined(__vita__)
+// The playable PC build: a visible window (called before the renderer
+// starts), the presented picture shown in it, letterboxed.
+void set_window(const std::string &title, int width, int height, bool fullscreen);
+bool window_visible();
+bool window_closed();   // the player closed it
+bool window_focused();  // keyboard input only then
+void window_size(int &width, int &height);
+#endif
 
 } // namespace burnout::gl

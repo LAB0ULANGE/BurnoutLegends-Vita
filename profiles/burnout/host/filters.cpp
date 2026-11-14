@@ -143,6 +143,48 @@ const Entry kFilters[] = {
       "vec2 r = vec2(0.5 / 320.0, 0.5 / 240.0); c = (fetch(s + r) + fetch(s - r) + fetch(s + vec2(r.x, -r.y)) + fetch(s + vec2(-r.x, r.y))) * 0.25;",
       nullptr, nullptr}},
     {{"ds", "DS", Family::Console}, {nullptr, CONSOLE(1.3333, 256.0, 192.0), "c = quantize(c, 64.0);", nullptr, nullptr}},
+    // Added after the first 40 (unlocks.bin keys the unlocked ones by index).
+    // Shadow Stingdom: a night drive, the scene lit by the headlights' cone
+    // ahead of the car and by its own bright lights.
+    {{"shadow_stingdom", "Shadow Stingdom", Family::Film},
+     {nullptr, nullptr, nullptr,
+      "vec2 d = (screen - vec2(0.5, 0.3)) * vec2(1.0, 1.7); float beam = smoothstep(0.62, 0.05, length(d));"
+      "float glow = smoothstep(0.88, 1.0, luma(c)) * (1.0 - smoothstep(0.4, 0.6, screen.y)); c = c * (0.08 + 0.95 * beam) + c * glow * 0.7;",
+      nullptr}},
+    // D.I.S.C.O: coloured lights sweeping the screen to the beat.
+    {{"disco", "D.I.S.C.O", Family::Film},
+     {nullptr, nullptr, nullptr,
+      "float beat = 0.75 + 0.25 * sin(u_time * 8.0);"
+      "vec3 light = 0.5 + 0.5 * cos(u_time * 2.0 + vec3(0.0, 2.1, 4.2) + screen.x * 7.0 - screen.y * 4.0);"
+      "c = clamp(c * (0.45 + 0.85 * light * beat), 0.0, 1.0);",
+      nullptr}},
+    // Chameleon Colours: the picture's hue follows the car's speed (a full
+    // turn of the colour wheel from standstill to 180 mph).
+    {{"chameleon", "Chameleon Colours", Family::Film},
+     {nullptr, nullptr, nullptr, "c = clamp(hue(c, u_speed * 0.0349), 0.0, 1.0);", nullptr}},
+    // Newspaper (the 1st Special Event, 2026-11-09: the Crash Headlines'
+    // front pages): ink dots on yellowed paper, each dot as large as the
+    // picture is dark (a halftone screen), a little paper grain.
+    {{"newspaper", "Newspaper", Family::Film},
+     {nullptr, nullptr, nullptr,
+      "float l = clamp((luma(c) - 0.5) * 1.3 + 0.6, 0.0, 1.0); vec2 g = fract(screen * vec2(170.0, 96.0)) - 0.5;"
+      "float ink = 1.0 - smoothstep(-0.06, 0.06, length(g) - (1.0 - l) * 0.62);"
+      "c = mix(vec3(0.93, 0.90, 0.80), vec3(0.12, 0.11, 0.10), ink);"
+      "c *= 0.96 + 0.04 * hash(screen * 960.0);",
+      nullptr}},
+    // Cel Shading (the 10th Special Event, 2026-11-09: "Borderlands", lines
+    // thinner and smoother than Cartoony's): soft colour bands, and thin dark
+    // lines where the brightness changes (four neighbours, one pixel away:
+    // half the Sobel filters' reads).
+    {{"cel", "Cel Shading", Family::Outline},
+     {nullptr, nullptr, nullptr,
+      "float l = luma(c); vec2 d = 1.0 / u_pixels;"
+      "float e = abs(luma(fetch(s + vec2(d.x, 0.0))) + luma(fetch(s - vec2(d.x, 0.0)))"
+      " + luma(fetch(s + vec2(0.0, d.y))) + luma(fetch(s - vec2(0.0, d.y))) - 4.0 * l);"
+      "vec3 band = c / max(l, 0.05) * (floor(l * 4.0 + 0.5) / 4.0 * 0.85 + 0.12);"
+      "c = mix(c, clamp(band, 0.0, 1.0), 0.6);"
+      "c = mix(c, vec3(0.06), smoothstep(0.22, 0.5, e) * 0.8);",
+      nullptr}},
 };
 
 #undef CONSOLE
@@ -152,6 +194,7 @@ uniform sampler2D u_texture;
 uniform vec2 u_extent;
 uniform vec2 u_pixels;
 uniform float u_time;
+uniform float u_speed;  // the player's car, mph (0 when unknown)
 varying vec2 v_texcoord;
 vec3 fetch(vec2 s) { return texture2D(u_texture, clamp(s, 0.0, 1.0) * u_extent).rgb; }
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }

@@ -1,8 +1,11 @@
+#include "trax.hpp"
 #include "burnout_run.hpp"
 
 #include "burnout_hle.hpp"
+#include "movie.hpp"
 #include "sas_worker.hpp"
 #include "workload_stats.hpp"
+#include "perf_counters.hpp"
 #if defined(BURNOUT_GE_RENDER)
 #include "ge_render.hpp"
 #endif
@@ -62,6 +65,8 @@ BenchResult run_benchmark(const BenchOptions &options) {
     for (const auto &table : options.nid_tables)
         if (std::filesystem::exists(table)) runtime.nids().load_csv(table);
     (void)elf.load_and_relocate(runtime.memory(), psprecomp::kDefaultPspUserLoadBase);
+    // The player's own music in EA Trax (trax.cpp): the bigger table before the game runs.
+    trax::after_load(runtime.memory());
     std::uint64_t image_end = 0u;
     for (std::size_t i = 0; i < elf.segments().size(); ++i) {
         const auto &segment = elf.segments()[i];
@@ -94,16 +99,21 @@ BenchResult run_benchmark(const BenchOptions &options) {
     observer.on_wait_vblank = [&](std::int32_t uid, std::uint64_t vblank) { clock.on_wait_vblank(uid, vblank); };
     observer.on_set_frame_buffer = [&](std::uint32_t, std::uint64_t vblank) { clock.on_set_frame_buffer(vblank); };
     observer.controller_buttons = [&](std::uint64_t vblank) {
-        return options.script.buttons_at(vblank) | (options.live_buttons ? options.live_buttons() : 0u);
+        const std::uint32_t buttons = options.script.buttons_at(vblank) | (options.live_buttons ? options.live_buttons() : 0u);
+        return options.button_filter ? options.button_filter(buttons) : buttons;
     };
     if (options.live_analog) observer.controller_analog = options.live_analog;
+    observer.guest_call = options.guest_call;
     observer.on_file_open = [&](const std::string &path) {
         const std::string key = lower(path);
         const std::uint64_t vblank = vblank_count();
         if (opened.insert(key).second && options.trace_files)
             std::cerr << "[file] vblank=" << vblank << " " << path << "\n";
         // Every track's data as it loads: the log's per-track sections.
-        if (key.find(marker) != std::string::npos) std::cerr << "[track] vblank " << vblank << ": " << path << "\n";
+        if (key.find(marker) != std::string::npos) {
+            std::cerr << "[track] vblank " << vblank << ": " << path << "\n";
+            movie::release_cache();  // the menus' movies are not needed in a race (2026-11-13: up to 16 MiB)
+        }
         if (race_vblank == 0u && key.find(marker) != std::string::npos) {
             race_vblank = vblank;
             std::cerr << "[bench] race data first opened at vblank " << vblank << ": " << path << "\n";
@@ -116,7 +126,10 @@ BenchResult run_benchmark(const BenchOptions &options) {
     std::uint64_t pace_vblank = 0u;
     observer.on_vblank = [&](std::uint64_t vblank) {
         if (options.measuring != nullptr) options.measuring->store(clock.window_open(vblank), std::memory_order_relaxed);
-        if (vblank % 600u == 0u) {
+        // Not in real time (the Vita): unbuffered writes to the memory card
+        // from the emulation thread stalled the game 150-190 ms every 10 s
+        // (0.0.1 hitch probe).
+        if (vblank % 600u == 0u && !options.realtime) {
             std::cerr << "[bench] vblank " << vblank << " (" << vblank / 60u << " s PSP) host "
                       << (host_now_ms() - started) / 1000.0 << " s"
                       << (clock.window_open(vblank) ? " [measuring]" : "") << std::endl;
@@ -131,7 +144,9 @@ BenchResult run_benchmark(const BenchOptions &options) {
                 pace_start = now;
                 pace_vblank = vblank;
             }
+            PERF_ONLY(const double paced = now);
             for (; now < due; now = host_now_ms()) host_sleep_ms(due - now);
+            PERF_ONLY(perf::emulation_blocked(now - paced));
         }
         if (options.quit_requested && options.quit_requested()) runtime.stop("quit requested");
         else if (!options.realtime && clock.window_done(vblank)) runtime.stop("benchmark window complete");
@@ -149,6 +164,16 @@ BenchResult run_benchmark(const BenchOptions &options) {
             for (const auto block : blocks) hash_trace << " " << hex64(block);
             hash_trace << "\n" << std::flush;
         }
+        if (options.per_vblank) options.per_vblank(runtime.memory());
+        for (const std::uint64_t at : options.ram_dump_vblanks)
+            if (vblank == at) {
+                if (const std::uint8_t *ram = runtime.memory().raw_pointer(0x08000000u, 0x02000000u)) {
+                    const auto path = options.ram_dump_dir / ("ram_" + std::to_string(vblank) + ".bin");
+                    std::ofstream out(path, std::ios::binary);
+                    out.write(reinterpret_cast<const char *>(ram), 0x02000000);
+                    std::cerr << "[ram] " << path.string() << '\n';
+                }
+            }
         handler(vblank);
     };
     install_hle(runtime, hle, std::move(observer));

@@ -25,6 +25,7 @@ RuntimePostImportHook g_post_import_hook = nullptr;
 std::int32_t g_runtime_thread_uid = -1;
 std::array<char, 64> g_runtime_thread_name{};
 std::uint32_t g_runtime_dispatch_pc = 0u;
+const AllegrexContext *g_runtime_cpu = nullptr;  // write-watch logs: the guest ra at the store
 RuntimeHeartbeatHook g_heartbeat_hook = nullptr;
 std::uint64_t g_heartbeat_interval = 0u;
 RuntimeStarvationHook g_starvation_hook = nullptr;
@@ -120,6 +121,7 @@ void set_runtime_thread_identity(std::int32_t uid, const std::string &name) noex
 std::int32_t runtime_thread_uid() noexcept { return g_runtime_thread_uid; }
 const char *runtime_thread_name() noexcept { return g_runtime_thread_name.data(); }
 std::uint32_t runtime_dispatch_pc() noexcept { return g_runtime_dispatch_pc; }
+std::uint32_t runtime_current_ra() noexcept { return g_runtime_cpu != nullptr ? g_runtime_cpu->gpr[31] : 0u; }
 RuntimeExecutionContextToken capture_runtime_execution_context() noexcept {
     return RuntimeExecutionContextToken{g_runtime_thread_uid, g_runtime_thread_switch_generation_fast};
 }
@@ -584,6 +586,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 return;
             }
             g_runtime_dispatch_pc = before;
+            g_runtime_cpu = &cpu_;
             count_pc(before);
             if (g_pre_dispatch_hook != nullptr)
                 g_pre_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
@@ -661,6 +664,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                 break;
             }
             g_runtime_dispatch_pc = before;
+            g_runtime_cpu = &cpu_;
             count_pc(before);
             if (g_pre_dispatch_hook != nullptr)
                 g_pre_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
@@ -720,6 +724,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             break;
         }
         g_runtime_dispatch_pc = before;
+        g_runtime_cpu = &cpu_;
         count_pc(before);
         DispatchSnapshot current_snapshot{};
         current_snapshot.pc = before;

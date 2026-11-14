@@ -1,4 +1,6 @@
 #include "texture_pack.hpp"
+#include "detached_thread.hpp"
+#include "burnout_bench.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -12,12 +14,14 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <new>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG  // the Bonus postcards (ge_gl)
 #define STBI_NO_STDIO
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -58,8 +62,7 @@ Hash g_hash = Hash::Quick;
 bool g_ignore_address = false;
 std::unordered_map<Key, std::string, KeyHash> g_files;  // level 0 replacements
 
-std::mutex g_mutex;
-std::condition_variable g_cv;
+SpinLock g_mutex;  // see detached_thread.hpp: std::mutex does nothing on the Vita
 std::deque<std::shared_ptr<Pending>> g_queue;
 std::atomic<std::uint64_t> g_found{0}, g_decoded{0}, g_failed{0}, g_lookups{0};
 std::atomic<double> g_decode_ms{0.0};
@@ -89,20 +92,47 @@ std::string lower(std::string s) {
     return s;
 }
 
+// The bytes in use (alloc_stats_vita.cpp, the Vita GL build): weak, so the
+// other builds go without.
+#if defined(__vita__)
+extern "C" long long burnout_alloc_in_use() __attribute__((weak));
+#else
+long long (*const burnout_alloc_in_use)() = nullptr;  // (PC: no budget)
+#endif
+// 2026-11-11 (0.0.74, a Heavyweight race with three swapped rivals): the
+// pack's pictures took the heap to 143 MiB in use and the game died. Past
+// this, a picture is left out (the game's own texture stays).
+constexpr long long kPackBudget = 136ll * 1024 * 1024;
+std::atomic<int> g_skipped_low{0};
+
 void decoder_main() {
     for (;;) {
         std::shared_ptr<Pending> job;
         {
-            std::unique_lock lock(g_mutex);
-            g_cv.wait(lock, [] { return !g_queue.empty(); });
-            job = std::move(g_queue.front());
-            g_queue.pop_front();
+            std::lock_guard lock(g_mutex);
+            if (!g_queue.empty()) {
+                job = std::move(g_queue.front());
+                g_queue.pop_front();
+            }
+        }
+        if (job == nullptr) {
+            host_sleep_ms(5.0);
+            continue;
+        }
+        if (burnout_alloc_in_use != nullptr && burnout_alloc_in_use() > kPackBudget) {
+            ++g_skipped_low;
+            job->state.store(2, std::memory_order_release);
+            continue;
         }
         const auto started = std::chrono::steady_clock::now();
+        // Memory runs short: that picture is left out (the game's own texture
+        // stays), the game goes on (0.0.48 stopped on a std::bad_alloc here).
+        stbi_uc *pixels = nullptr;
+        try {
         std::ifstream file(job->path, std::ios::binary);
         std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         int w = 0, h = 0, channels = 0;
-        stbi_uc *pixels = bytes.empty() ? nullptr
+        pixels = bytes.empty() ? nullptr
                                         : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 4);
         if (pixels == nullptr) {
             std::fprintf(stderr, "[pack] cannot decode %s\n", job->path.c_str());
@@ -142,11 +172,18 @@ void decoder_main() {
             }
         }
         stbi_image_free(pixels);
+        pixels = nullptr;
         job->image = std::move(image);
         ++g_decoded;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         g_decode_ms.store(g_decode_ms.load() + ms);
         job->state.store(1, std::memory_order_release);
+        } catch (const std::bad_alloc &) {
+            if (pixels != nullptr) stbi_image_free(pixels);
+            std::fprintf(stderr, "[pack] out of memory decoding %s: left out\n", job->path.c_str());
+            ++g_failed;
+            job->state.store(2, std::memory_order_release);
+        }
     }
 }
 
@@ -309,7 +346,7 @@ bool open(const std::string &dir) {
         return false;
     }
     g_active = !g_files.empty();
-    if (g_active) std::thread(decoder_main).detach();
+    if (g_active) start_detached(decoder_main, 512u * 1024u);
     std::fprintf(stderr, "[pack] %s: %lu replacements (hash %s%s)\n", dir.c_str(), static_cast<unsigned long>(g_files.size()),
                  g_hash == Hash::Quick ? "quick" : "xxh32", g_ignore_address ? ", address ignored" : "");
     return g_active;
@@ -343,7 +380,6 @@ std::shared_ptr<Pending> request(const std::string &path) {
         std::lock_guard lock(g_mutex);
         g_queue.push_back(pending);
     }
-    g_cv.notify_one();
     return pending;
 }
 
@@ -359,6 +395,8 @@ std::string report() {
     std::snprintf(line, sizeof(line), "texture pack: %llu lookups, %llu replaced, %llu decoded (%.0f ms), %llu failed",
                   static_cast<unsigned long long>(g_lookups.load()), static_cast<unsigned long long>(g_found.load()),
                   static_cast<unsigned long long>(g_decoded.load()), g_decode_ms.load(), static_cast<unsigned long long>(g_failed.load()));
+    const int skipped = g_skipped_low.load();
+    if (skipped > 0) return std::string(line) + ", " + std::to_string(skipped) + " left out (memory low)";
     return line;
 }
 

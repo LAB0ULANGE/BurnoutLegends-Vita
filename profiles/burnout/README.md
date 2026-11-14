@@ -27,11 +27,21 @@ ignored by `profiles/burnout/.gitignore`.
 psp_analyze ../original/EBOOT_DECRYPTED.ELF profiles/burnout/analysis/ULES00125_report.json 0x08804000
 PSPRECOMP_NO_RETURN_HINTS=1 psp_recomp ../original/EBOOT_DECRYPTED.ELF --auto out/gen 0x08804000 16384
 python profiles/burnout/tools/patch_libc_loops.py out/gen
+python profiles/burnout/tools/patch_main_menu.py out/gen
+python profiles/burnout/tools/patch_awards.py out/gen
+python profiles/burnout/tools/patch_signatures.py out/gen
+python profiles/burnout/tools/patch_paints.py out/gen
+python profiles/burnout/tools/patch_native.py out/gen
+python profiles/burnout/tools/patch_cars.py out/gen
+python profiles/burnout/tools/patch_frame_rate.py out/gen
+python profiles/burnout/tools/patch_trax.py out/gen
 ```
 
 The unit span must be 16 KiB (16384): the runtime's fast unit index and the
 dense entry dispatch assume it. `patch_libc_loops.py` replaces the game's
-byte-per-iteration memcpy/memset loops with host calls. Point the build at the
+byte-per-iteration memcpy/memset loops with host calls. `patch_main_menu.py` lets the
+host give the main menu its fifth row (BONUS) before the game builds it. `patch_awards.py` adds the Bonus
+filters just unlocked to the game's own "new award unlocked" notice. Point the build at the
 corpus with `-DBURNOUT_GENERATED_DIR=out/gen`.
 
 ## Build
@@ -93,6 +103,28 @@ request without plugins; a clock plugin's per-title profile overrides it) and wr
 `ux0:data/burnout-bench.txt`; `ux0:data/burnout-bench.log` holds the progress
 log. The screen is a solid colour: blue running, green finished, red error.
 An optional `ux0:data/burnout/race.txt` replaces the built-in input script.
+
+## Renderer switches (PC, `burnout_headless --gl`)
+
+The decode worker's shortcuts can be turned off to compare captures and timings
+(the `GE OpenGL time: decode .., draw ..` line at exit):
+
+- `PSPRECOMP_BURNOUT_NO_CULL`: draw the objects a GE bounding box test (BBOX/BJUMP) finds out of view.
+- `PSPRECOMP_BURNOUT_NO_FAST_PRIM`: every PRIM through the general decode path.
+- `PSPRECOMP_BURNOUT_RGBA_UPLOAD`: paletted textures converted on the worker, not the GL thread.
+- `PSPRECOMP_BURNOUT_PRIM_PATHS`, `PSPRECOMP_BURNOUT_FLUSH_STATS`: per-frame counts of PRIM paths and of what ends batches.
+- `PSPRECOMP_BURNOUT_ALL_PAINTS`: every extra car paint offered (bonus menu runs).
+- `PSPRECOMP_BURNOUT_ALL_CARS`: every car's unlock flag set (bonus menu runs).
+- `PSPRECOMP_BURNOUT_NO_STATIC_VBO`: static geometry copied every frame instead of kept in GPU buffers.
+
+The GE front end (`--async-ge`, on by default on the Vita) walks the display
+lists on another thread, from a copy of each list's buffer taken when the game
+queues it. On the PC its walk is too fast to meet the game's rewrites; these
+make it as slow as on the Vita, with `--cache-sublists` as there:
+
+- `PSPRECOMP_BURNOUT_FRONT_SLOW_MS=n`: a pause before each list's walk.
+- `PSPRECOMP_BURNOUT_FRONT_SLOW_WALK_US=n`: a pause every 256 steps of the walk.
+- `PSPRECOMP_BURNOUT_FRONT_OFF_AT=vblank`: the front end turns off there, as after a record desync.
 
 ## How the HLE models time
 

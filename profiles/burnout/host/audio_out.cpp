@@ -1,3 +1,4 @@
+#include "system_core.hpp"
 #include "core_load.hpp"
 #include "audio_out.hpp"
 
@@ -13,6 +14,13 @@
 #include <psp2/audioout.h>
 #include <psp2/kernel/threadmgr.h>
 #include <pthread.h>
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <mmsystem.h>
+#include <atomic>
+#include <thread>
 #endif
 
 namespace burnout::audio {
@@ -38,47 +46,81 @@ Counters g_counters;
 std::array<std::FILE *, kChannels> g_dumps{};
 std::string g_dump_dir;
 
+// One grain of the channels mixed (the output threads).
+void mix_grain(std::int16_t *out) {
+    std::array<std::int32_t, kGrain * 2u> mix{};
+    {
+        std::lock_guard lock(g_mutex);
+        for (Fifo &fifo : g_fifos) {
+            if (!fifo.playing && fifo.count >= kPrebuffer) fifo.playing = true;
+            if (!fifo.playing) continue;
+            const std::uint32_t n = std::min(fifo.count, kGrain);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                const std::uint32_t at = (fifo.read + i) % kCapacity;
+                mix[i * 2u] += fifo.samples[at * 2u];
+                mix[i * 2u + 1u] += fifo.samples[at * 2u + 1u];
+            }
+            fifo.read = (fifo.read + n) % kCapacity;
+            fifo.count -= n;
+            if (n < kGrain) {
+                g_counters.underrun_frames += kGrain - n;
+                fifo.playing = false;
+            }
+        }
+        g_counters.played_frames += kGrain;
+    }
+    for (std::uint32_t i = 0; i < kGrain * 2u; ++i) out[i] = static_cast<std::int16_t>(std::clamp(mix[i], -32768, 32767));
+}
+
 #if defined(__vita__)
 int g_port = -1;
 volatile bool g_stop{};
 
 void *output_thread(void *core_mask) {
-    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), static_cast<int>(reinterpret_cast<std::uintptr_t>(core_mask)));
+    const bool system_core = move_to_system_core(static_cast<int>(reinterpret_cast<std::uintptr_t>(core_mask)));
+    std::fprintf(stderr, "[audio] output thread on %s\n", system_core ? "the system core (3)" : "its usual core");
     // Above the GL thread sharing the core: a late output call is a click.
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), 64);
     core_load::register_current_thread("audio_out");
     std::array<std::int16_t, kGrain * 2u> out{};
-    std::array<std::int32_t, kGrain * 2u> mix{};
     while (!g_stop) {
-        mix.fill(0);
-        bool silent = true;
-        {
-            std::lock_guard lock(g_mutex);
-            for (Fifo &fifo : g_fifos) {
-                if (!fifo.playing && fifo.count >= kPrebuffer) fifo.playing = true;
-                if (!fifo.playing) continue;
-                const std::uint32_t n = std::min(fifo.count, kGrain);
-                for (std::uint32_t i = 0; i < n; ++i) {
-                    const std::uint32_t at = (fifo.read + i) % kCapacity;
-                    mix[i * 2u] += fifo.samples[at * 2u];
-                    mix[i * 2u + 1u] += fifo.samples[at * 2u + 1u];
-                }
-                fifo.read = (fifo.read + n) % kCapacity;
-                fifo.count -= n;
-                if (n < kGrain) {
-                    g_counters.underrun_frames += kGrain - n;
-                    fifo.playing = false;
-                }
-                silent = false;
-            }
-            g_counters.played_frames += kGrain;
-        }
-        (void)silent;
-        for (std::uint32_t i = 0; i < kGrain * 2u; ++i)
-            out[i] = static_cast<std::int16_t>(std::clamp(mix[i], -32768, 32767));
+        mix_grain(out.data());
         sceAudioOutOutput(g_port, out.data());
     }
     return nullptr;
+}
+#elif defined(_WIN32)
+// The playable PC build (start_output): waveOut, 8 grains queued (~90 ms).
+HWAVEOUT g_wave{};
+std::atomic<bool> g_wave_stop{false};
+std::thread g_wave_thread;
+
+void wave_thread(HANDLE done) {
+    constexpr int kBuffers = 8;
+    std::array<std::array<std::int16_t, kGrain * 2u>, kBuffers> buffers{};
+    std::array<WAVEHDR, kBuffers> headers{};
+    for (int i = 0; i < kBuffers; ++i) {
+        headers[i].lpData = reinterpret_cast<LPSTR>(buffers[i].data());
+        headers[i].dwBufferLength = kGrain * 4u;
+        waveOutPrepareHeader(g_wave, &headers[i], sizeof(WAVEHDR));
+        headers[i].dwFlags |= WHDR_DONE;
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    while (!g_wave_stop) {
+        bool wrote = false;
+        for (int i = 0; i < kBuffers; ++i) {
+            if ((headers[i].dwFlags & WHDR_DONE) == 0u) continue;
+            mix_grain(buffers[i].data());
+            headers[i].dwFlags &= ~static_cast<DWORD>(WHDR_DONE);
+            waveOutWrite(g_wave, &headers[i], sizeof(WAVEHDR));
+            wrote = true;
+        }
+        if (!wrote) WaitForSingleObject(done, 20);
+    }
+    waveOutReset(g_wave);
+    for (auto &header : headers) waveOutUnprepareHeader(g_wave, &header, sizeof(WAVEHDR));
+    waveOutClose(g_wave);
+    CloseHandle(done);
 }
 #endif
 
@@ -116,9 +158,37 @@ bool start(int core, const std::string &dump_dir, std::string &error) {
 #endif
 }
 
+#if defined(_WIN32) && !defined(__vita__)
+bool start_output(std::string &error) {
+    HANDLE done = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    WAVEFORMATEX format{};
+    format.wFormatTag = WAVE_FORMAT_PCM;
+    format.nChannels = 2;
+    format.nSamplesPerSec = 44100;
+    format.wBitsPerSample = 16;
+    format.nBlockAlign = 4;
+    format.nAvgBytesPerSec = 44100 * 4;
+    const MMRESULT result = waveOutOpen(&g_wave, WAVE_MAPPER, &format, reinterpret_cast<DWORD_PTR>(done), 0, CALLBACK_EVENT);
+    if (result != MMSYSERR_NOERROR) {
+        CloseHandle(done);
+        error = "waveOutOpen failed (" + std::to_string(result) + ")";
+        return false;
+    }
+    g_dump_dir.clear();
+    g_enabled = true;
+    g_wave_thread = std::thread(wave_thread, done);
+    return true;
+}
+#endif
+
 void stop() {
 #if defined(__vita__)
     g_stop = true;
+#elif defined(_WIN32)
+    if (g_wave_thread.joinable()) {
+        g_wave_stop = true;
+        g_wave_thread.join();
+    }
 #endif
     for (std::FILE *&file : g_dumps)
         if (file != nullptr) {
@@ -153,6 +223,7 @@ void submit(std::uint32_t channel, const std::int16_t *samples, std::uint32_t fr
     }
     std::lock_guard lock(g_mutex);
     Fifo &fifo = g_fifos[channel];
+    g_counters.submitted_frames += frames;
     for (std::uint32_t i = 0; i < frames; ++i) {
         if (fifo.count == kCapacity) {  // the output fell behind: drop the oldest
             fifo.read = (fifo.read + 1u) % kCapacity;

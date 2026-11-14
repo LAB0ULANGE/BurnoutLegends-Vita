@@ -1,6 +1,10 @@
 #include "core_load.hpp"
 #include "music.hpp"
 
+// The player's own MP3s (trax.cpp): minimp3, public domain (CC0).
+#define MINIMP3_IMPLEMENTATION
+#include "third_party/minimp3/minimp3.h"
+
 #include "thread_sync.hpp"
 
 #include <algorithm>
@@ -44,8 +48,23 @@ struct Ahead {
     bool ready{};  // data holds blocks [first, first + count)
 };
 
+// An added MP3 (2026-11-14, trax.cpp): decoded frame by frame, resampled to
+// 44.1 kHz stereo.
+struct Mp3 {
+    mp3dec_t decoder{};
+    std::vector<std::uint8_t> input = std::vector<std::uint8_t>(16384u);
+    std::size_t have{}, used{};
+    bool eof{};
+    std::array<std::int16_t, MINIMP3_MAX_SAMPLES_PER_FRAME> pcm{};
+    int frame_samples{}, channels{2}, hz{44100};
+    std::uint32_t phase{};      // 16.16 position in the current frame
+    long data_start{};          // past the ID3v2 tag
+    bool started{};
+};
+
 struct Track {
     std::FILE *file{};
+    std::unique_ptr<Mp3> mp3;
     Header header;
     std::unique_ptr<Ahead> ahead;
     std::uint32_t position{};                  // next sample
@@ -58,6 +77,7 @@ struct Track {
 };
 
 std::map<std::uint32_t, std::string> g_paths;  // by RIFF size
+std::map<std::uint32_t, std::string> g_mp3_paths;  // added MP3s, by the RIFF size the HLE gave them
 std::map<int, Track> g_tracks;
 int g_next_handle{1};
 
@@ -203,7 +223,81 @@ bool load_block(Track &t, std::uint32_t block) {
     return true;
 }
 
+// The next MP3 frame decoded into m.pcm; false at the end of the file.
+bool next_frame(std::FILE *file, Mp3 &m) {
+    for (int guard = 0; guard < 64; ++guard) {
+        if (m.have - m.used < 2048u && !m.eof) {
+            std::memmove(m.input.data(), m.input.data() + m.used, m.have - m.used);
+            m.have -= m.used;
+            m.used = 0u;
+            const std::size_t got = std::fread(m.input.data() + m.have, 1u, m.input.size() - m.have, file);
+            m.have += got;
+            if (got == 0u) m.eof = true;
+        }
+        if (m.have == m.used) return false;
+        mp3dec_frame_info_t info{};
+        const int samples = mp3dec_decode_frame(&m.decoder, m.input.data() + m.used, static_cast<int>(m.have - m.used), m.pcm.data(), &info);
+        if (info.frame_bytes == 0) {
+            if (m.eof) return false;
+            m.used = m.have;  // no frame in what is left: read on
+            continue;
+        }
+        m.used += static_cast<std::size_t>(info.frame_bytes);
+        if (samples > 0) {
+            m.frame_samples = samples;
+            m.channels = info.channels;
+            m.hz = info.hz > 0 ? info.hz : 44100;
+            return true;
+        }
+    }
+    return false;
+}
+
+void rewind_mp3(std::FILE *file, Mp3 &m) {
+    std::fseek(file, m.data_start, SEEK_SET);
+    mp3dec_init(&m.decoder);
+    m.have = m.used = 0u;
+    m.eof = false;
+    m.frame_samples = 0;
+    m.phase = 0u;
+}
+
+// Stereo 44.1 kHz frames from the MP3 (nearest sample: the game's music
+// is 44.1 kHz, most MP3s too); false once the file has ended.
+bool decode_mp3(Track &t, std::int16_t *out, std::uint32_t frames, std::int32_t &loops) {
+    Mp3 &m = *t.mp3;
+    for (std::uint32_t i = 0; i < frames; ++i) {
+        while (m.frame_samples == 0 || (m.phase >> 16u) >= static_cast<std::uint32_t>(m.frame_samples)) {
+            if (m.frame_samples != 0) m.phase -= static_cast<std::uint32_t>(m.frame_samples) << 16u;
+            if (!next_frame(t.file, m)) {
+                if (loops == 0 || !m.started) {
+                    std::memset(out + i * 2u, 0, (frames - i) * 4u);
+                    return false;
+                }
+                if (loops > 0) --loops;
+                rewind_mp3(t.file, m);
+                if (!next_frame(t.file, m)) {
+                    std::memset(out + i * 2u, 0, (frames - i) * 4u);
+                    return false;
+                }
+            }
+            m.started = true;
+        }
+        const std::uint32_t at = m.phase >> 16u;
+        if (m.channels >= 2) {
+            out[i * 2u] = m.pcm[at * 2u];
+            out[i * 2u + 1u] = m.pcm[at * 2u + 1u];
+        } else {
+            out[i * 2u] = out[i * 2u + 1u] = m.pcm[at];
+        }
+        m.phase += static_cast<std::uint32_t>((static_cast<std::uint64_t>(m.hz) << 16u) / 44100u);
+    }
+    return true;
+}
+
 } // namespace
+
+void add_mp3(std::uint32_t riff_size, const std::string &path) { g_mp3_paths[riff_size] = path; }
 
 int set_dir(const std::string &dir) {
     g_paths.clear();
@@ -223,6 +317,21 @@ int set_dir(const std::string &dir) {
 
 int open(const std::uint8_t *riff, std::uint32_t bytes) {
     if (riff == nullptr || bytes < 8u || std::memcmp(riff, "RIFF", 4u) != 0) return -1;
+    if (const auto mp3 = g_mp3_paths.find(le32(riff + 4u)); mp3 != g_mp3_paths.end()) {
+        std::FILE *file = std::fopen(mp3->second.c_str(), "rb");
+        if (file == nullptr) return -1;
+        Track track;
+        track.file = file;
+        track.mp3 = std::make_unique<Mp3>();
+        // Past an ID3v2 tag (its size in the header), else from the start.
+        std::uint8_t id3[10]{};
+        if (std::fread(id3, 1u, 10u, file) == 10u && std::memcmp(id3, "ID3", 3u) == 0)
+            track.mp3->data_start = 10L + ((id3[6] & 0x7FL) << 21 | (id3[7] & 0x7FL) << 14 | (id3[8] & 0x7FL) << 7 | (id3[9] & 0x7FL));
+        rewind_mp3(file, *track.mp3);
+        const int handle = g_next_handle++;
+        g_tracks.emplace(handle, std::move(track));
+        return handle;
+    }
     const auto it = g_paths.find(le32(riff + 4u));
     if (it == g_paths.end()) return -1;
     std::FILE *file = std::fopen(it->second.c_str(), "rb");
@@ -266,6 +375,7 @@ bool decode(int handle, std::int16_t *out, std::uint32_t frames, std::int32_t &l
         return false;
     }
     Track &t = it->second;
+    if (t.mp3) return decode_mp3(t, out, frames, loops);
     for (std::uint32_t i = 0; i < frames; ++i) {
         if (t.position > t.header.loop_end || t.position >= t.header.total) {
             if (loops == 0) {

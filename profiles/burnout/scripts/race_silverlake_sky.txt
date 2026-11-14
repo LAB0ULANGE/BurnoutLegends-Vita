@@ -1,0 +1,21 @@
+# Burnout Legends ULES00125: cold boot -> Single Event, Road Rage, the Vita
+# remote path to Silver Lake (tools/vita_remote/go_silverlake.sh), for the cut
+# sky (2026-11-14). Same profile requirements as race_world_tour_compact.txt.
+hold   120   126  START
+hold   420   426  START
+hold   600   606  CROSS
+hold   800   806  CIRCLE
+hold   950   956  DOWN
+hold  1010  1016  CROSS
+hold  1130  1136  DOWN
+hold  1190  1196  DOWN
+hold  1250  1256  CROSS
+hold  1370  1376  RIGHT
+hold  1430  1436  DOWN
+hold  1490  1496  RIGHT
+hold  1550  1556  RIGHT
+hold  1610  1616  RIGHT
+hold  1700  1706  CROSS
+hold  1820  1826  CROSS
+pulse 1900  2600  90  6  CROSS
+hold  2600 99999  CROSS

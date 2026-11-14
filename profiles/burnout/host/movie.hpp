@@ -30,4 +30,17 @@ public:
 
 [[nodiscard]] std::unique_ptr<Movie> open(const std::string &host_path, std::string &error);
 
+// Reads and demuxes these movies on a low-priority thread, so their first
+// open() finds them ready (the menu backgrounds: 1-1.3 s freezes otherwise).
+void prefetch(std::vector<std::string> host_paths);
+// Forgets the cached movies (a playing one keeps its own copy): a race needs
+// none, and they held up to 16 MiB of the Vita's heap through it
+// (2026-11-13). The menus read them again when they play them.
+void release_cache();
+
+#if defined(_WIN32) && !defined(__vita__)
+// The playable PC build: movies decoded by Windows (Media Foundation).
+void use_windows_decoder();
+#endif
+
 } // namespace burnout::movie

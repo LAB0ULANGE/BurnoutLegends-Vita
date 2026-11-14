@@ -1,0 +1,25 @@
+# Burnout Legends ULES00125: main menu > DRIVER DETAILS and its pages (the EA
+# Trax list; 2026-11-14 custom music). Profile as race_world_tour_compact.txt.
+hold   120   126  START
+hold   420   426  START
+hold   600   606  CROSS
+hold   800   806  CIRCLE
+hold   950   956  DOWN
+hold  1010  1016  DOWN
+hold  1070  1076  DOWN
+hold  1130  1136  CROSS
+hold  1310  1316  DOWN
+hold  1370  1376  DOWN
+hold  1430  1436  DOWN
+hold  1490  1496  DOWN
+hold  1550  1556  CROSS
+hold  1730  1736  DOWN
+hold  1790  1796  DOWN
+hold  1850  1856  DOWN
+hold  1910  1916  DOWN
+hold  1970  1976  CROSS
+hold  2150  2156  DOWN
+hold  2210  2216  DOWN
+hold  2400  2406  LEFT
+hold  2500  2506  LEFT
+hold  2600  2606  RIGHT

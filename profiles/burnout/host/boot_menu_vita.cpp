@@ -108,7 +108,7 @@ Settings load(const std::string &root) {
             else if (name == "render_scale") settings.render_scale = value == 1 || value == 3 || value == 4 ? value : 2;
             else if (name == "sound") settings.sound = value != 0;
             else if (name == "frame_skip") settings.frame_skip = value != 0;
-            else if (name == "async_ge_v2") settings.async_ge = value != 0;
+            else if (name == "async_ge_v3") settings.async_ge = value != 0;
             else if (name == "shader_cache") settings.shader_cache = value != 0;
             else if (name == "skip_when_behind") settings.skip_when_behind = value != 0;
             else if (name == "offscreen_1x") settings.offscreen_1x = value != 0;
@@ -138,7 +138,7 @@ void save(const std::string &root, const Settings &settings) {
                  settings.render_scale, flag(settings.sound), flag(settings.frame_skip), flag(settings.shader_cache));
     std::fprintf(file, "skip_when_behind %d\noffscreen_1x %d\ncache_sublists %d\nsound_core1 %d\n", flag(settings.skip_when_behind),
                  flag(settings.offscreen_1x), flag(settings.cache_sublists), flag(settings.sound_core1));
-    std::fprintf(file, "save_slot %d\n", settings.save_slot);
+    std::fprintf(file, "save_slot %d\nasync_ge_v3 %d\n", settings.save_slot, flag(settings.async_ge));
     std::fclose(file);
 }
 
@@ -178,6 +178,7 @@ Settings run(const std::string &root, const std::string &build) {
     int offscreen = flag(!settings.offscreen_1x);
     int sublists = flag(!settings.cache_sublists);
     int sound_core = flag(!settings.sound_core1);
+    int parallel = flag(!settings.async_ge);
     int profile = settings.save_slot;
     int start = 0;
     // Bonus filters (unlocks.bin): global switch and the 3 filter slots.
@@ -201,12 +202,13 @@ Settings run(const std::string &root, const std::string &build) {
         {"Attendre GPU", {"Non (vitesse)", "Oui"}, &behind, "Non: le jeu garde sa vitesse, des images sautent."},
         {"Buffers effets", {"1x (rapide)", "Pleine res."}, &offscreen, "Petits buffers d'effets du jeu en 480x272."},
         {"Cache listes", {"Oui", "Non"}, &sublists, "Sous-listes inchangees recopiees: soulage le CPU."},
+        {"GE parallele", {"Oui", "Non"}, &parallel, "Listes GE lues sur le coeur 2: soulage le coeur du jeu."},
         {"Coeur du son", {"1 (libre)", "2 (avec GL)"}, &sound_core, "Mixage audio loin du thread graphique."},
         {"Cache shaders", {"Non", "Oui (exp.)"}, &shaders, "Garde les shaders compiles: demarrage rapide."},
         {"> LANCER LE JEU <", {}, &start, "X ou START pour lancer."},
     };
 
-    constexpr int kTop = 84, kRow = 22;
+    constexpr int kTop = 84, kRow = 21;  // 16 rows above the help line (y 420)
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
     int cursor = static_cast<int>(items.size()) - 1;
     std::uint32_t held = 0xFFFFFFFFu;  // ignore buttons already down at launch
@@ -258,7 +260,7 @@ Settings run(const std::string &root, const std::string &build) {
     settings.frame_skip = skip == 0;
     settings.shader_cache = shaders == 1;
     settings.cached_gpu_memory = false;
-    settings.async_ge = false;
+    settings.async_ge = parallel == 0;
     settings.skip_when_behind = behind == 0;
     settings.offscreen_1x = offscreen == 0;
     settings.cache_sublists = sublists == 0;

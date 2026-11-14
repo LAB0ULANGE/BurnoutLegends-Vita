@@ -100,8 +100,7 @@ int sceSaveDataDialogFinish(const void *finish_param);
 int sceSaveDataDialogTerm(void);
 }
 
-bool start(bool save, const std::vector<Slot> &slots, int focus) {
-    if (g_state != State::Idle || slots.empty()) return false;
+static void init_app_util() {
     static bool app_util = false;
     if (!app_util) {
         SceAppUtilInitParam init{};
@@ -110,6 +109,22 @@ bool start(bool save, const std::vector<Slot> &slots, int focus) {
         std::fprintf(stderr, "[save] sceAppUtilInit 0x%08X\n", static_cast<unsigned>(result));
         app_util = true;
     }
+}
+
+int system_language() {
+    init_app_util();
+    int vita = 1;
+    if (sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_LANG, &vita) < 0) return 1;
+    // Vita: 0-11 as the PSP, 17 Portuguese (Brazil), 18 English (UK); the
+    // Nordic languages, Polish and Turkish have no PSP code.
+    if (vita >= 0 && vita <= 11) return vita;
+    if (vita == 17) return 7;
+    return 1;
+}
+
+bool start(bool save, const std::vector<Slot> &slots, int focus) {
+    if (g_state != State::Idle || slots.empty()) return false;
+    init_app_util();
     const int count = static_cast<int>(slots.size()) < kMaxSlots ? static_cast<int>(slots.size()) : kMaxSlots;
     // The Vita's slots mirror the PSP saves: title and date, or empty.
     for (int i = 0; i < count; ++i) {
@@ -239,6 +254,11 @@ bool start(bool save, const std::vector<Slot> &slots, int focus) {
 }
 int poll() { return g_answer; }
 bool drawing() { return false; }
+// PC: PSPRECOMP_BURNOUT_LANGUAGE=n (PSP code), English by default.
+int system_language() {
+    const char *language = std::getenv("PSPRECOMP_BURNOUT_LANGUAGE");
+    return language != nullptr ? std::atoi(language) : 1;
+}
 
 #endif
 

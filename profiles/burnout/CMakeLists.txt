@@ -49,15 +49,31 @@ set(BURNOUT_HOST_SOURCES
     host/sas_core.cpp
     host/sas_worker.cpp
     host/music.cpp
+    host/trax.cpp
     host/core_load.cpp
     host/movie.cpp
     host/save_dialog.cpp
     host/psp_savedata.cpp
     host/filters.cpp
+    host/filter_names.cpp
     host/bonus.cpp
+    host/paints.cpp
     host/texture_pack.cpp
     host/iso_reader.cpp
-    host/game_setup.cpp)
+    host/game_setup.cpp
+    host/bonus_menu.cpp
+    host/native_funcs.cpp
+    host/overlay.cpp
+    host/perf_counters.cpp)
+
+# Per-frame performance counters (host/perf_counters.hpp, BRIEF_PERF_60FPS.md
+# step 0): a log of average, maximum and worst 1% over 600 frames. Off: no code.
+option(BURNOUT_PERF_COUNTERS "Per-frame performance counters (burnout-perf.log)" OFF)
+if(BURNOUT_PERF_COUNTERS)
+    # Host sources only: switching it does not rebuild the generated code.
+    set_property(SOURCE ${BURNOUT_HOST_SOURCES} host/ge_gl.cpp host/main_vita.cpp host/main_pc.cpp host/main_headless.cpp
+                 APPEND PROPERTY COMPILE_DEFINITIONS PERF_COUNTERS=1)
+endif()
 
 # First-launch install from the player's disc image: PPSSPP's PRX decrypter
 # and libkirk (GPL-2.0), and the FFmpeg ATRAC3plus decoder (LGPL) as
@@ -112,7 +128,7 @@ if(VITA)
         # A second build (other generated-code flags) installs next to this
         # one under its own title ID; the label shows on the launch screen.
         set(BURNOUT_VITA_GL_TITLE_ID "BRNG00001" CACHE STRING "Title ID of the rendering VPK")
-        set(BURNOUT_VITA_GL_NAME "Burnout recomp GL" CACHE STRING "LiveArea name of the rendering VPK")
+        set(BURNOUT_VITA_GL_NAME "Burnout Legends 2.0" CACHE STRING "LiveArea name of the rendering VPK")
         set(BURNOUT_VITA_GL_LABEL "" CACHE STRING "Build label on the launch screen (empty: none)")
         set(BURNOUT_VITA_GL_FILES "burnout-gl" CACHE STRING "Report and log names under ux0:data/")
         target_compile_definitions(burnout_vita_gl PRIVATE
@@ -122,6 +138,9 @@ if(VITA)
             target_compile_definitions(burnout_vita_gl PRIVATE BURNOUT_VITA_PROFILE=1)
         endif()
         target_include_directories(burnout_vita_gl PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+        # The renderer's decode thread (one core) bounds the frame rate on the
+        # Vita: its math calls set no errno (-O3 measured no faster than -O2).
+        target_compile_options(burnout_vita_gl PRIVATE -fno-math-errno)
     target_link_libraries(burnout_vita_gl PRIVATE burnout_thirdparty)
         target_link_libraries(burnout_vita_gl PRIVATE burnout_generated
             vitaGL vitashark SceShaccCgExt mathneon taihen_stub SceShaccCg_stub SceKernelDmacMgr_stub
@@ -148,10 +167,45 @@ if(VITA)
         # Save slot icons of the native save dialog (PSP / PS VITA marked):
         # made from the game's save icon, beside the game files.
         set(BURNOUT_VITA_SAVE_ICONS "${CMAKE_SOURCE_DIR}/../original/save_icons" CACHE PATH "Save dialog icons folder")
+        # The Bonus menu's font (Oswald Bold, SIL Open Font License).
+        list(APPEND BURNOUT_VITA_ICON_FILE FILE "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/fonts/Oswald-Bold.ttf" fonts/Oswald-Bold.ttf
+             FILE "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/fonts/OFL.txt" fonts/OFL.txt)
         foreach(item psp.png vita.png)
             if(EXISTS "${BURNOUT_VITA_SAVE_ICONS}/${item}")
                 list(APPEND BURNOUT_VITA_ICON_FILE FILE "${BURNOUT_VITA_SAVE_ICONS}/${item}" save_icons/${item})
             endif()
+        endforeach()
+        # The Bonus menu's ready-made postcards (<filter id>.jpg, made with
+        # burnout_headless --make-postcards; not in git: pictures of the game).
+        set(BURNOUT_VITA_POSTCARDS "${CMAKE_SOURCE_DIR}/../original/postcards" CACHE PATH "Bonus postcards folder")
+        file(GLOB BURNOUT_POSTCARD_FILES CONFIGURE_DEPENDS "${BURNOUT_VITA_POSTCARDS}/*.jpg")
+        foreach(item ${BURNOUT_POSTCARD_FILES})
+            get_filename_component(name "${item}" NAME)
+            list(APPEND BURNOUT_VITA_ICON_FILE FILE "${item}" postcards/${name})
+        endforeach()
+        # The Signature Takedown photos shown on the awards screen
+        # (<name>.png from Frontend.txd, made with tools/modding burnout_bake;
+        # not in git: pictures of the game).
+        set(BURNOUT_VITA_SIGNATURES "${CMAKE_SOURCE_DIR}/../original/signatures" CACHE PATH "Signature photos folder")
+        file(GLOB BURNOUT_SIGNATURE_FILES CONFIGURE_DEPENDS "${BURNOUT_VITA_SIGNATURES}/*.png")
+        foreach(item ${BURNOUT_SIGNATURE_FILES})
+            get_filename_component(name "${item}" NAME)
+            list(APPEND BURNOUT_VITA_ICON_FILE FILE "${item}" signatures/${name})
+        endforeach()
+        # The title movie with the 2.0 logo (original/title/startB.pmf, made
+        # with tools/make_title_movie.py; not in git): read before the
+        # player's own USRDIR/ovid/startB.pmf (burnout_hle.cpp, sceIoOpen).
+        set(BURNOUT_VITA_TITLE_MOVIE "${CMAKE_SOURCE_DIR}/../original/title/startB.pmf" CACHE FILEPATH "Title movie shipped in the VPK")
+        if(EXISTS "${BURNOUT_VITA_TITLE_MOVIE}")
+            list(APPEND BURNOUT_VITA_ICON_FILE FILE "${BURNOUT_VITA_TITLE_MOVIE}" ovid/startB.pmf)
+        endif()
+        # BONUS 2.0's pictures (Polaroids, postcards, newspapers: original/bonus,
+        # not in git: pictures of the game).
+        set(BURNOUT_VITA_BONUS "${CMAKE_SOURCE_DIR}/../original/bonus" CACHE PATH "BONUS 2.0 pictures folder")
+        file(GLOB BURNOUT_BONUS_FILES CONFIGURE_DEPENDS "${BURNOUT_VITA_BONUS}/*.png")
+        foreach(item ${BURNOUT_BONUS_FILES})
+            get_filename_component(name "${item}" NAME)
+            list(APPEND BURNOUT_VITA_ICON_FILE FILE "${item}" bonus/${name})
         endforeach()
         vita_create_vpk(burnout-gl.vpk ${BURNOUT_VITA_GL_TITLE_ID} eboot_gl.bin
             VERSION 01.00
@@ -181,7 +235,7 @@ psprecomp_enable_host_avx(burnout_ge_render)
 add_executable(burnout_headless host/main_headless.cpp host/ge_render.cpp host/ge_gl.cpp host/gl_context_win.cpp
     ${BURNOUT_HOST_SOURCES}
     $<$<BOOL:${WIN32}>:host/sampling_profiler_win.cpp>)
-target_link_libraries(burnout_headless PRIVATE burnout_generated burnout_ge_render opengl32)
+target_link_libraries(burnout_headless PRIVATE burnout_generated burnout_ge_render opengl32 winmm mfplat mfuuid ole32)
 target_compile_definitions(burnout_headless PRIVATE BURNOUT_GE_RENDER=1 BURNOUT_GE_SOFTWARE=1)
 target_include_directories(burnout_headless PRIVATE "${BURNOUT_PROFILE_DIR}/host")
 target_link_libraries(burnout_headless PRIVATE burnout_thirdparty)
@@ -191,6 +245,36 @@ if(MSVC)
     target_link_options(burnout_headless PRIVATE /STACK:67108864 /DEBUG)
     # Symbols for the host code (sampling profiler); generated units unchanged.
     target_compile_options(burnout_headless PRIVATE /Zi)
+endif()
+
+# The playable PC build (main_pc.cpp): a window, pad and keyboard, sound.
+# Its pictures and font are copied next to it; the game files are made at
+# its first launch from the player's own disc image.
+if(WIN32)
+    # Its icon: the LiveArea icon made into pc_icon.ico beside the game files
+    # (game-derived art, not in the repository); none when it is missing.
+    set(BURNOUT_PC_ICON "${CMAKE_SOURCE_DIR}/../original/pc_icon.ico" CACHE FILEPATH "Windows icon of the PC build")
+    set(BURNOUT_PC_RC)
+    if(EXISTS "${BURNOUT_PC_ICON}")
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/burnout_pc.rc" "1 ICON \"${BURNOUT_PC_ICON}\"\n")
+        set(BURNOUT_PC_RC "${CMAKE_CURRENT_BINARY_DIR}/burnout_pc.rc")
+    endif()
+    add_executable(burnout_pc host/main_pc.cpp host/ge_render.cpp host/ge_gl.cpp host/gl_context_win.cpp host/sampling_profiler_win.cpp ${BURNOUT_HOST_SOURCES} ${BURNOUT_PC_RC})
+    set_target_properties(burnout_pc PROPERTIES OUTPUT_NAME burnout_legends)
+    target_link_libraries(burnout_pc PRIVATE burnout_generated burnout_ge_render opengl32 winmm mfplat mfuuid ole32 burnout_thirdparty)
+    target_compile_definitions(burnout_pc PRIVATE BURNOUT_GE_RENDER=1 BURNOUT_GE_SOFTWARE=1)
+    target_include_directories(burnout_pc PRIVATE "${BURNOUT_PROFILE_DIR}/host")
+    if(MSVC)
+        # No console window: main() through the windows subsystem.
+        target_link_options(burnout_pc PRIVATE /STACK:67108864 /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+    endif()
+    set(BURNOUT_PC_PICTURES "${CMAKE_SOURCE_DIR}/../original")
+    add_custom_command(TARGET burnout_pc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:burnout_pc>/fonts"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/fonts/Oswald-Bold.ttf"
+                "${CMAKE_CURRENT_SOURCE_DIR}/host/third_party/fonts/OFL.txt" "$<TARGET_FILE_DIR:burnout_pc>/fonts/"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${BURNOUT_PC_PICTURES}/postcards" "$<TARGET_FILE_DIR:burnout_pc>/postcards"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${BURNOUT_PC_PICTURES}/signatures" "$<TARGET_FILE_DIR:burnout_pc>/signatures")
 endif()
 
 add_executable(burnout_opcode_census tools/opcode_census.cpp)

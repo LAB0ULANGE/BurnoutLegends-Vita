@@ -87,6 +87,13 @@ struct alignas(16) AllegrexContext {
         return (integral & 1LL) == 0LL ? lower : lower + 1.0;
     }
 
+    // fmin(1, fmax(low, value)) as newlib computes it (NaN gives low; -0.0
+    // stays), without the library calls ARMv7 makes for fminf/fmaxf.
+    static PSPRECOMP_CONTEXT_FORCEINLINE float vfpu_clamp(float value, float low) noexcept {
+        const float raised = std::isnan(value) ? low : (low > value ? low : value);
+        return 1.0f < raised ? 1.0f : raised;
+    }
+
     // VF2IN/VF2IZ/VF2IU/VF2ID lane conversion (Mode 16..19) of an already
     // scaled value: NaN gives INT_MAX, out-of-range values saturate.
     template <std::uint32_t Mode>
@@ -98,6 +105,25 @@ struct alignas(16) AllegrexContext {
             float converted;
             __asm__("vcvt.s32.f32 %0, %1" : "=t"(converted) : "t"(scaled));
             return std::bit_cast<std::int32_t>(converted);
+        } else if constexpr (Mode == 16u) {
+            // VCVTR rounds with the FPSCR mode (round to nearest, ties to
+            // even: never changed here) and saturates like the path below.
+            float converted;
+            __asm__("vcvtr.s32.f32 %0, %1" : "=t"(converted) : "t"(scaled));
+            return std::bit_cast<std::int32_t>(converted);
+        } else {
+            // Ceil/floor: the truncation moved by one where it went the wrong
+            // way (exact: a float that large is already an integer; the
+            // saturated ends stay).
+            float truncated;
+            __asm__("vcvt.s32.f32 %0, %1" : "=t"(truncated) : "t"(scaled));
+            std::int32_t value = std::bit_cast<std::int32_t>(truncated);
+            if constexpr (Mode == 18u) {
+                if (static_cast<float>(value) < scaled && value != std::numeric_limits<std::int32_t>::max()) ++value;
+            } else {
+                if (static_cast<float>(value) > scaled && value != std::numeric_limits<std::int32_t>::min()) --value;
+            }
+            return value;
         }
 #endif
         const double value = static_cast<double>(scaled);
@@ -335,8 +361,8 @@ struct alignas(16) AllegrexContext {
     template <std::uint32_t VectorRegister, std::uint32_t Length, std::uint32_t DestinationPrefix, std::uint32_t I>
     PSPRECOMP_CONTEXT_FORCEINLINE void write_vfpu_lane_dprefix_const(float value) noexcept {
         constexpr std::uint32_t saturation = (DestinationPrefix >> (I * 2u)) & 3u;
-        if constexpr (saturation == 1u) value = std::fmin(1.0f, std::fmax(0.0f, value));
-        else if constexpr (saturation == 3u) value = std::fmin(1.0f, std::fmax(-1.0f, value));
+        if constexpr (saturation == 1u) value = vfpu_clamp(value, 0.0f);
+        else if constexpr (saturation == 3u) value = vfpu_clamp(value, -1.0f);
         if constexpr (((DestinationPrefix >> (8u + I)) & 1u) == 0u) {
             constexpr std::size_t index = vfpu_vector_lane_index(VectorRegister, Length, I);
             vfpu[index] = value;
@@ -409,8 +435,8 @@ struct alignas(16) AllegrexContext {
         }
         auto saturate_lane = [&](std::uint32_t i) {
             const std::uint32_t saturation = (destination_prefix >> (i * 2u)) & 3u;
-            if (saturation == 1u) value[i] = std::fmin(1.0f, std::fmax(0.0f, value[i]));
-            else if (saturation == 3u) value[i] = std::fmin(1.0f, std::fmax(-1.0f, value[i]));
+            if (saturation == 1u) value[i] = vfpu_clamp(value[i], 0.0f);
+            else if (saturation == 3u) value[i] = vfpu_clamp(value[i], -1.0f);
         };
         saturate_lane(0u);
         if constexpr (Length >= 2u) saturate_lane(1u);
@@ -529,9 +555,9 @@ struct alignas(16) AllegrexContext {
             value[i] = source[i];
             const std::uint32_t saturation = (destination_prefix >> (i * 2u)) & 3u;
             if (saturation == 1u) {
-                value[i] = std::fmin(1.0f, std::fmax(0.0f, value[i]));
+                value[i] = vfpu_clamp(value[i], 0.0f);
             } else if (saturation == 3u) {
-                value[i] = std::fmin(1.0f, std::fmax(-1.0f, value[i]));
+                value[i] = vfpu_clamp(value[i], -1.0f);
             }
         }
 
@@ -1748,8 +1774,8 @@ struct alignas(16) AllegrexContext {
             }
             const std::uint32_t saturation = (destination_prefix >> (column * 2u)) & 3u;
             float &value = result[last_row * 4u + column];
-            if (saturation == 1u) value = std::fmin(1.0f, std::fmax(0.0f, value));
-            else if (saturation == 3u) value = std::fmin(1.0f, std::fmax(-1.0f, value));
+            if (saturation == 1u) value = vfpu_clamp(value, 0.0f);
+            else if (saturation == 3u) value = vfpu_clamp(value, -1.0f);
         }
 
         write_vfpu_matrix(result, destination_matrix_register, side);
@@ -1777,8 +1803,8 @@ struct alignas(16) AllegrexContext {
                 continue;
             }
             const std::uint32_t saturation = (destination_prefix >> (column * 2u)) & 3u;
-            if (saturation == 1u) value = std::fmin(1.0f, std::fmax(0.0f, value));
-            else if (saturation == 3u) value = std::fmin(1.0f, std::fmax(-1.0f, value));
+            if (saturation == 1u) value = vfpu_clamp(value, 0.0f);
+            else if (saturation == 3u) value = vfpu_clamp(value, -1.0f);
         }
 
         write_vfpu_matrix(source, destination_matrix_register, side);

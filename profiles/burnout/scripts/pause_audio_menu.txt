@@ -1,0 +1,14 @@
+# Burnout Legends ULES00125: World Tour > Compact > first event, then the
+# pause menu's OPTIONS > AUDIO (the EA Trax list; 2026-11-14 custom music).
+hold   120   126  START
+hold   420   426  START
+hold   600   606  CROSS
+hold   800   806  CIRCLE
+pulse  950  1500   90  6  CROSS
+hold  2400  2420  START
+hold  2520  2526  DOWN
+hold  2580  2586  DOWN
+hold  2640  2646  CROSS
+hold  2760  2766  CROSS
+hold  2940  2946  DOWN
+hold  3000  3006  DOWN

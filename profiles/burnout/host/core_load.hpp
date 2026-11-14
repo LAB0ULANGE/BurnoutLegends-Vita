@@ -14,4 +14,8 @@ void register_current_thread(const char *name);
 // each thread's share. Empty on the first call and off the Vita.
 [[nodiscard]] std::string report();
 
+// PC (Windows): the thread PSPRECOMP_PROFILE_THREAD names, once it registered
+// (a HANDLE), for the sampling profiler; null otherwise.
+[[nodiscard]] void *profile_target();
+
 } // namespace burnout::core_load

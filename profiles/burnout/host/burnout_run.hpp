@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+namespace psprecomp {
+class GuestMemory;
+}
+
 namespace burnout {
 
 inline constexpr std::uint64_t kAutoMeasureStart = UINT64_MAX;
@@ -29,6 +33,15 @@ struct BenchOptions {
     std::uint64_t auto_settle_vblanks{600u};   // race intro + countdown
     std::string race_marker{"/streamed.dat"};  // first opened when a race loads
     std::filesystem::path frames_csv;
+    // PC research: guest RAM (0x08000000-0x0A000000) written to
+    // <ram_dump_dir>/ram_<vblank>.bin at these vblanks.
+    std::vector<std::uint64_t> ram_dump_vblanks;
+    // Once per vblank on the emulation thread, with the guest memory (the
+    // Bonus menu), and the pad as the game reads it.
+    std::function<void(psprecomp::GuestMemory &)> per_vblank;
+    std::function<std::uint32_t(std::uint32_t)> button_filter;
+    std::function<bool(std::uint32_t &, std::uint32_t &, std::uint32_t &)> guest_call;
+    std::filesystem::path ram_dump_dir;
     // Optional: before the measured window, every 60 vblanks, one line with the user
     // RAM hash and the hash of each 64 KiB block (to locate host divergences).
     std::filesystem::path hash_trace;

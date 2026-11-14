@@ -180,11 +180,11 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         out << "    ctx.set_gpr(" << d.rd << ", ((" << reg(d.rt) << " & 0x000000FFu) << 24u) | ((" << reg(d.rt) << " & 0x0000FF00u) << 8u) | ((" << reg(d.rt) << " & 0x00FF0000u) >> 8u) | ((" << reg(d.rt) << " & 0xFF000000u) >> 24u));\n";
         break;
     case psprecomp::OpcodeKind::Lw: out << "    ctx.set_gpr(" << d.rt << ", rt.memory().aot_load32(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << ")));\n"; break;
-    case psprecomp::OpcodeKind::Lwl: out << "    ctx.set_gpr(" << d.rt << ", rt.memory().aot_load_word_left(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << "));\n"; break;
-    case psprecomp::OpcodeKind::Lwr: out << "    ctx.set_gpr(" << d.rt << ", rt.memory().aot_load_word_right(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << "));\n"; break;
+    case psprecomp::OpcodeKind::Lwl: out << "    ctx.set_gpr(" << d.rt << ", aot_mem.aot_load_word_left(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << "));\n"; break;
+    case psprecomp::OpcodeKind::Lwr: out << "    ctx.set_gpr(" << d.rt << ", aot_mem.aot_load_word_right(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << "));\n"; break;
     case psprecomp::OpcodeKind::Sw: out << "    rt.memory().aot_store32(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << ");\n"; break;
-    case psprecomp::OpcodeKind::Swl: out << "    rt.memory().aot_store_word_left(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << ");\n"; break;
-    case psprecomp::OpcodeKind::Swr: out << "    rt.memory().aot_store_word_right(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << ");\n"; break;
+    case psprecomp::OpcodeKind::Swl: out << "    aot_mem.aot_store_word_left(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << ");\n"; break;
+    case psprecomp::OpcodeKind::Swr: out << "    aot_mem.aot_store_word_right(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << ");\n"; break;
     case psprecomp::OpcodeKind::Lh: out << "    ctx.set_gpr(" << d.rt << ", static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(rt.memory().aot_load16(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "))))));\n"; break;
     case psprecomp::OpcodeKind::Lhu: out << "    ctx.set_gpr(" << d.rt << ", rt.memory().aot_load16(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << ")));\n"; break;
     case psprecomp::OpcodeKind::Sh: out << "    rt.memory().aot_store16(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), static_cast<std::uint16_t>(" << reg(d.rt) << "));\n"; break;

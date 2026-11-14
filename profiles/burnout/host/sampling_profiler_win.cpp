@@ -1,4 +1,5 @@
 #include "sampling_profiler_win.hpp"
+#include "core_load.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <string>
@@ -74,11 +76,16 @@ struct SamplingProfiler::State {
         while (!quit.load(std::memory_order_relaxed)) {
             Sleep(1u);
             if (!active.load(std::memory_order_relaxed)) continue;
-            if (SuspendThread(target) == static_cast<DWORD>(-1)) continue;
+            HANDLE watched = target;
+            if (const char *wanted = std::getenv("PSPRECOMP_PROFILE_THREAD"); wanted != nullptr) {
+                watched = static_cast<HANDLE>(core_load::profile_target());
+                if (watched == nullptr) continue;  // not started yet
+            }
+            if (SuspendThread(watched) == static_cast<DWORD>(-1)) continue;
             context.ContextFlags = CONTEXT_FULL;
             Sample sample{};
-            if (GetThreadContext(target, &context)) safe_unwind(context, sample.frames);
-            ResumeThread(target);
+            if (GetThreadContext(watched, &context)) safe_unwind(context, sample.frames);
+            ResumeThread(watched);
             if (sample.frames[0] != 0u) samples.push_back(sample);
         }
         timeEndPeriod(1u);

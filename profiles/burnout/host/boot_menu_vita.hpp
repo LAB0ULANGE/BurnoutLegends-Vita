@@ -11,7 +11,7 @@ struct Settings {
     int render_scale{2};    // default 960x544, lowered by the dynamic resolution (gl-99); 2 = 960x544, 4 = 840x476, 3 = 720x408, 1 = the PSP's 480x272
     bool sound{true};
     bool frame_skip{};      // drop a frame when the GPU side falls behind (off: the user wants every frame)
-    bool async_ge{};        // display lists walked on another core (no longer offered: crashed)
+    bool async_ge{true};    // display lists walked on core 2: 0.0.34 drew wrong, 0.0.35 crashed at the race start (Vita only); 0.0.38 walks a copy of the list buffer
     bool shader_cache{};    // compiled shader programs kept on the memory card
     bool cached_gpu_memory{};  // vitaGL pools in cached memory (no longer offered)
     // gl-48, each on its own so the log tells which one helps or breaks.

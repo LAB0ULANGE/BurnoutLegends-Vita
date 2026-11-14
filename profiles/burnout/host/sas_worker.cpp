@@ -1,8 +1,11 @@
+#include "system_core.hpp"
+#include <cstdio>
 #include "core_load.hpp"
 #include "sas_worker.hpp"
 
 #include "burnout_bench.hpp"
 #include "thread_sync.hpp"
+#include "perf_counters.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -47,6 +50,7 @@ void run() {
         const double started = host_now_ms();
         work();
         g_busy_us.fetch_add(static_cast<std::uint64_t>((host_now_ms() - started) * 1000.0), std::memory_order_relaxed);
+        PERF_ONLY(perf::add_audio_ms(host_now_ms() - started));
         std::lock_guard lock(g_mutex);
         g_running_work = false;
         g_cv.notify_all();
@@ -55,7 +59,8 @@ void run() {
 
 #if defined(__vita__)
 void *thread_main(void *core_mask) {
-    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), static_cast<int>(reinterpret_cast<std::uintptr_t>(core_mask)));
+    const bool system_core = move_to_system_core(static_cast<int>(reinterpret_cast<std::uintptr_t>(core_mask)));
+    std::fprintf(stderr, "[sas] mixer thread on %s\n", system_core ? "the system core (3)" : "its usual core");
     // Above the GL thread sharing the core, so the game seldom waits for it.
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), 80);
     core_load::register_current_thread("sas_mix");
@@ -141,6 +146,7 @@ void drain() {
     g_cv.wait(lock, [] { return g_queue.empty() && !g_running_work; });
     g_wait_us.fetch_add(static_cast<std::uint64_t>((host_now_ms() - started) * 1000.0), std::memory_order_relaxed);
     g_waits.fetch_add(1u, std::memory_order_relaxed);
+    PERF_ONLY(perf::emulation_blocked(host_now_ms() - started));
 }
 
 double take_wait_ms(std::uint64_t &waits) {

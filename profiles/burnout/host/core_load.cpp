@@ -1,10 +1,18 @@
 #include "core_load.hpp"
 
+#if defined(_WIN32) && !defined(__vita__)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -92,7 +100,24 @@ std::string report() {
 
 #else
 
+#if defined(_WIN32)
+// PC: PSPRECOMP_PROFILE_THREAD=<name> makes the sampling profiler (headless
+// --profile) watch that thread (decode, gl, ge_front...) instead of the
+// emulation thread.
+void *g_profile_target{};
+void register_current_thread(const char *name) {
+    const char *wanted = std::getenv("PSPRECOMP_PROFILE_THREAD");
+    if (wanted == nullptr || std::strcmp(wanted, name) != 0) return;
+    HANDLE handle{};
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0u);
+    g_profile_target = handle;
+}
+void *profile_target() { return g_profile_target; }
+#else
 void register_current_thread(const char *) {}
+void *profile_target() { return nullptr; }
+#endif
 std::string report() { return {}; }
 
 #endif

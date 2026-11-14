@@ -90,6 +90,13 @@ void *__wrap_memalign(std::size_t alignment, std::size_t size) {
 
 namespace burnout::alloc_stats {
 
+} // namespace burnout::alloc_stats
+// (For budgets elsewhere, a plain C name: texture_pack.cpp asks it weakly.)
+extern "C" long long burnout_alloc_in_use() { return burnout::alloc_stats::g_live_bytes(); }
+namespace burnout::alloc_stats {
+
+long long g_live_bytes() { return g_live.load(std::memory_order_relaxed); }
+
 std::string report() {
     char line[1024];
     int at = std::snprintf(line, sizeof(line), "allocations: in use %lld KiB; by thread (net / allocated since last):",

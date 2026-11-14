@@ -55,7 +55,7 @@ void configure(const Options &options);
 // The CPU wrote VRAM (a movie frame): textures there are uploaded again.
 void cpu_wrote_vram(std::uint32_t address, std::uint32_t size);
 // The next presented frame is captured (PNG in the capture folder).
-void request_capture();
+void request_capture(bool trace_draws = true);
 // Block transfer copies made ahead and not yet used (memory diagnostics).
 std::size_t early_queue_size();
 [[nodiscard]] bool active() noexcept;
@@ -71,8 +71,9 @@ void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std:
 // The plain commands at the start of `span` words, up to the first
 // control-flow command: handled as ge_commands does in the same pass that
 // finds where they end. Returns their count.
+// `pc`: the guest address of `words` (the worker follows BJUMPs within a run).
 std::uint32_t ge_plain_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t span,
-                                std::uint32_t base, std::uint32_t offset);
+                                std::uint32_t base, std::uint32_t offset, std::uint32_t pc);
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t word, std::uint32_t base,
                 std::uint32_t offset);
 // CALL of the sub-list at `target` (emulation thread, ge_scan): when it is a
@@ -89,8 +90,10 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
 // its own transfer registers and reads guest memory when they disagree.
 // Returns whether the whole list was covered (it reached END before any
 // stall, and no transfer goes into RAM); only then may a peek say "done".
+// `end` (when given): the list then lies in [pc, *end) (no jump out of that
+// span, at most 1 MiB), else 0.
 bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
-                     std::uint32_t offset);
+                     std::uint32_t offset, std::uint32_t *end = nullptr);
 // sceDisplaySetFrameBuf: the frame at `address` is about to be shown.
 void frame_buffer_set(const psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stride,
                       std::uint32_t format, std::uint64_t vblank);

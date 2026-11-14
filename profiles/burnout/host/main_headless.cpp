@@ -2,8 +2,13 @@
 // the burnout HLE, drives it with a scripted controller and reports host time
 // per logical game frame. No audio output; --render draws the GE lists with the
 // software rasterizer and --capture writes PNG frames.
+#include "trax.hpp"
 #include "audio_out.hpp"
 #include "texture_pack.hpp"
+#include "bonus.hpp"
+#include "bonus_menu.hpp"
+#include "paints.hpp"
+#include "overlay.hpp"
 #include "game_setup.hpp"
 #include "music.hpp"
 #include "sas_worker.hpp"
@@ -18,6 +23,10 @@
 #include "sampling_profiler_win.hpp"
 #endif
 
+#include <cstdio>
+#include <cstring>
+#include <utility>
+#include <vector>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -79,12 +88,23 @@ Cli parse(int argc, char **argv) {
             cli.render.enabled = true;
             cli.render.backend = burnout::render::Backend::OpenGL;
         }
+        else if (key == "--psp-picture") {  // the Vita's DISPLAY: PSP setting (480x272 inside 960x544 targets)
+            burnout::gl::set_valid_region(true);
+            burnout::gl::set_dynamic_resolution(true, 1.5f);
+            burnout::gl::set_picture_scale(1.0f);
+        }
+        else if (key == "--dynamic-pin") {  // the Vita's dynamic resolution held at SCALE (1.5: 720x408), valid + tight regions
+            burnout::gl::set_valid_region(true);
+            burnout::gl::set_tight_regions(true);
+            burnout::gl::set_dynamic_resolution(true, 1.5f, std::stof(value()));
+        }
         else if (key == "--capture-dir") cli.render.capture_dir = value();
         else if (key == "--frame-skip") cli.render.frame_skip = true;  // as on the Vita
         else if (key == "--skip-when-behind") cli.render.skip_when_behind = true;  // with --frame-skip
         else if (key == "--offscreen-1x") cli.render.offscreen_1x = true;  // effect buffers at 1x
         else if (key == "--cache-sublists") cli.render.cache_sublists = true;  // unchanged sub-lists from a copy
         else if (key == "--async-ge") o.async_ge = true;  // display lists on another thread, as on the Vita
+        else if (key == "--custom-music") burnout::trax::configure(value(), "");  // DIR: MP3s added to EA Trax (trax.cpp)
         else if (key == "--sas-thread") burnout::sas_worker::start(0);  // SAS mixing on its own thread, as on the Vita
         else if (key == "--music-dir") {  // converted tracks (tools/convert_music.py)
             std::cerr << "music tracks: " << burnout::music::set_dir(value()) << "\n";
@@ -100,6 +120,151 @@ Cli parse(int argc, char **argv) {
             for (std::size_t at = 0, comma; (comma = list.find(',', at)) != std::string::npos; at = comma + 1u)
                 if (const int index = burnout::filters::find(list.substr(at, comma - at)); index >= 0) active.push_back(index);
             burnout::gl::set_filters(active);
+        }
+        else if (key == "--dump-ram") {  // V1,V2,... DIR: guest RAM at those vblanks
+            std::string list = value() + ",";
+            for (std::size_t at = 0, comma; (comma = list.find(',', at)) != std::string::npos; at = comma + 1u)
+                if (comma > at) o.ram_dump_vblanks.push_back(std::stoull(list.substr(at, comma - at)));
+            o.ram_dump_dir = value();
+        }
+        else if (key == "--poke") {  // V:ADDR=WORD,... guest words written at every vblank from V (research)
+            static std::vector<std::pair<std::uint32_t, std::uint32_t>> pokes;
+            static std::uint64_t from = 0;
+            std::string list = value() + ",";
+            const auto colon = list.find(':');
+            from = std::stoull(list.substr(0, colon));
+            for (std::size_t at = colon + 1u, comma; (comma = list.find(',', at)) != std::string::npos; at = comma + 1u) {
+                const std::string item = list.substr(at, comma - at);
+                const auto eq = item.find('=');
+                if (eq != std::string::npos)
+                    pokes.emplace_back(static_cast<std::uint32_t>(std::stoul(item.substr(0, eq), nullptr, 16)),
+                                       static_cast<std::uint32_t>(std::stoul(item.substr(eq + 1u), nullptr, 16)));
+            }
+            o.per_vblank = [](psprecomp::GuestMemory &memory) {
+                static std::uint64_t vblank = 0;
+                if (++vblank < from) return;
+                // An odd address writes the half-word at address - 1.
+                for (const auto &[address, word] : pokes)
+                    if (std::uint8_t *p = memory.raw_pointer(address & ~1u, 4u)) std::memcpy(p, &word, (address & 1u) != 0u ? 2u : 4u);
+            };
+        }
+        else if (key == "--make-postcards") {  // PICTURE DIR: every Bonus filter applied to PICTURE, DIR/<id>.ppm (needs --gl and a --capture)
+            const std::string picture = value();
+            burnout::gl::make_postcards(picture, value());
+        }
+        else if (key == "--antialias") {  // 0 off, 1 FXAA, 2 light (Vita default)
+            const int mode = std::stoi(value());
+            burnout::gl::set_antialias_lite(mode == 2);
+            burnout::gl::set_antialias(mode != 0);
+        }
+        else if (key == "--bonus-menu") {  // the Bonus row in the pause menu (every filter available)
+            static burnout::bonus::State state;
+            {
+                std::string font = __FILE__;
+                font = font.substr(0, font.find_last_of("/\\") + 1u) + "third_party/fonts/Oswald-Bold.ttf";
+                if (!burnout::overlay::init(font)) std::fprintf(stderr, "overlay: no font at %s\n", font.c_str());
+                std::string cards = __FILE__;
+                cards = cards.substr(0, cards.find_last_of("/\\") + 1u) + "../../../../original/postcards";
+                burnout::gl::set_postcard_pictures(cards);
+                std::string photos = __FILE__;
+                photos = photos.substr(0, photos.find_last_of("/\\") + 1u) + "../../../../original/signatures";
+                burnout::bonus_menu::set_signature_photos(photos, [](const std::string &path, float x, float y, float w, float h, float angle) {
+                    burnout::gl::set_photo(path, x, y, w, h, angle);
+                });
+            }
+            burnout::bonus_menu::configure({
+                [] { return state.enabled; },
+                [] { return static_cast<int>(burnout::filters::all().size()); },
+                [](int i) { return burnout::filters::all()[static_cast<std::size_t>(i)].name; },
+                [](int i) { return burnout::bonus::available(state, i); },
+                [](int i) {
+                    for (const auto &id : state.active)
+                        if (burnout::filters::find(id) == i) return true;
+                    return false;
+                },
+                [](int i) {
+                    burnout::bonus::toggle(state, i);
+                    burnout::gl::set_filters(burnout::bonus::applied(state));
+                    std::fprintf(stderr, "[bonus] %s\n", burnout::filters::describe(burnout::bonus::applied(state)).c_str());
+                },
+                [](int i) {
+                    return std::string("LOCKED: ") + burnout::bonus::signature_name(burnout::bonus::filter_signature(i));
+                },
+                [](int signature) {
+                    const int filter = burnout::bonus::signature_filter(signature);
+                    if (!burnout::bonus::unlock(state, filter)) return false;
+                    std::fprintf(stderr, "[bonus] Signature Takedown %s: %s unlocked\n", burnout::bonus::signature_name(signature),
+                                 burnout::filters::all()[static_cast<std::size_t>(filter)].name);
+                    return true;
+                },
+                [](int i) {
+                    const int signature = burnout::bonus::filter_signature(i);
+                    return signature < 0 ? std::string() : std::string(burnout::bonus::signature_name(signature));
+                },
+                [](int i, float x, float y, float w, float h, float angle) {
+                    burnout::gl::set_postcard(i >= 0 ? std::vector<int>{i} : std::vector<int>{}, x, y, w, h, angle);
+                },
+                [] { burnout::gl::postcard_photo(); },
+        [](int i) {
+                    const burnout::bonus::Reward reward = burnout::bonus::filter_reward(i);
+                    return reward.source == burnout::bonus::Source::Free ? -1 : static_cast<int>(reward.source) * 100 + reward.index;
+                },
+                [](float mph) { burnout::gl::set_car_speed(mph); },
+                [](int postcards, int headlines, int percent) {
+                    const int unlocked = burnout::bonus::unlock_progress(state, postcards, headlines, percent);
+                    if (unlocked > 0) std::fprintf(stderr, "[bonus] progress %d postcards, %d headlines, %d %%: %d filters unlocked\n", postcards,
+                                                   headlines, percent, unlocked);
+                    return unlocked;
+                },
+                {},  // no BONUS VITA / DISPLAY rows (as on the Vita)
+                {},
+                {},
+                {},
+                // BONUS 2.0's pictures: files of original/ (bonus/, signatures/).
+                [](int slot, const std::string &path, float x, float y, float w, float h, float angle) {
+                    static const std::string root = [] {
+                        std::string here = __FILE__;
+                        return here.substr(0, here.find_last_of("/\\") + 1u) + "../../../../original/";
+                    }();
+                    burnout::gl::set_picture(slot, path.empty() ? path : root + path, x, y, w, h, angle);
+                },
+                [](bool hide) { burnout::gl::set_hide_3d(hide); },
+            });
+            burnout::paints::set_texels_written([](std::uint32_t address, std::uint32_t bytes) { burnout::render::cpu_wrote_vram(address, bytes); });
+            o.per_vblank = [](psprecomp::GuestMemory &memory) {
+                burnout::bonus_menu::update(memory);
+            };
+            o.button_filter = [](std::uint32_t buttons) { return burnout::bonus_menu::filter_buttons(buttons); };
+            o.guest_call = [](std::uint32_t &f, std::uint32_t &a0, std::uint32_t &a1) { return burnout::bonus_menu::take_guest_call(f, a0, a1); };
+        }
+        else if (key == "--paint") burnout::paints::set_chosen(std::stoi(value()));  // N: extra paint chosen at launch (as unlocks.bin)
+        else if (key == "--force-signature") {
+            // N[,N...]:V (after --bonus-menu): Signature Takedowns N (0-19,
+            // Takedown Book order) marked done in the live profile from vblank
+            // V, as if earned in the race (reward screen tests without playing).
+            static std::vector<int> signatures;
+            static std::uint64_t from = 0;
+            static std::function<void(psprecomp::GuestMemory &)> before;
+            const std::string v = value();
+            const auto colon = v.find(':');
+            std::istringstream list(v.substr(0, colon));
+            for (std::string item; std::getline(list, item, ',');) signatures.push_back(std::stoi(item));
+            from = colon == std::string::npos ? 0u : std::stoull(v.substr(colon + 1u));
+            before = o.per_vblank;
+            o.per_vblank = [](psprecomp::GuestMemory &memory) {
+                static std::uint64_t vblank = 0;
+                if (++vblank == from)
+                    for (const int signature : signatures) {
+                        if (signature < 0 || signature >= 20) continue;
+                        constexpr std::uint32_t kProfileSignatures = 0x08DC31D0u + 0xF61Eu;
+                        if (std::uint8_t *done = memory.raw_pointer(kProfileSignatures + static_cast<std::uint32_t>(signature), 1u)) {
+                            std::fprintf(stderr, "[test] vblank %llu: Signature Takedown %d marked done (was %u)\n",
+                                         static_cast<unsigned long long>(vblank), signature, *done);
+                            *done = 1u;
+                        }
+                    }
+                if (before) before(memory);
+            };
         }
         else if (key == "--texture-pack") burnout::texture_pack::open(value());  // PPSSPP pack folder (textures.ini)
         else if (key == "--install-from-iso") {  // ISO OUTDIR: the Vita first-launch install, then exit
@@ -122,10 +287,21 @@ Cli parse(int argc, char **argv) {
             cli.render.trace_from = std::stoull(range.substr(0, dash));
             cli.render.trace_to = dash == std::string::npos ? cli.render.trace_from : std::stoull(range.substr(dash + 1));
         }
-        else if (key == "--capture") {  // comma-separated vblanks; implies --render
+        else if (key == "--capture") {  // comma-separated vblanks or FROM-TO/STEP ranges; implies --render
             cli.render.enabled = true;
             std::istringstream list(value());
-            for (std::string item; std::getline(list, item, ',');) cli.render.capture_vblanks.insert(std::stoull(item));
+            for (std::string item; std::getline(list, item, ',');) {
+                const std::size_t dash = item.find('-');
+                if (dash == std::string::npos) {
+                    cli.render.capture_vblanks.insert(std::stoull(item));
+                    continue;
+                }
+                const std::size_t slash = item.find('/');
+                const std::uint64_t from = std::stoull(item.substr(0, dash));
+                const std::uint64_t to = std::stoull(item.substr(dash + 1, slash == std::string::npos ? std::string::npos : slash - dash - 1));
+                const std::uint64_t step = slash == std::string::npos ? 1u : std::max<std::uint64_t>(1u, std::stoull(item.substr(slash + 1)));
+                for (std::uint64_t v = from; v <= to; v += step) cli.render.capture_vblanks.insert(v);
+            }
         }
         else throw psprecomp::Error("unknown option " + key);
     }

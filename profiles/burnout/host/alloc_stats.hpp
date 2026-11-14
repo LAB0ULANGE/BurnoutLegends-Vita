@@ -7,5 +7,6 @@
 namespace burnout::alloc_stats {
 
 std::string report();
+long long g_live_bytes();  // bytes in use now
 
 } // namespace burnout::alloc_stats

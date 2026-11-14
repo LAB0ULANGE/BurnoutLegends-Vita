@@ -12,6 +12,10 @@ namespace burnout::music {
 // Scans `dir` for EATraxNN.ima files; returns how many tracks were found.
 int set_dir(const std::string &dir);
 
+// An added MP3 (trax.cpp), played when the game hands a RIFF header whose
+// size field is `riff_size` (the HLE's stand-in for EATraxNN.mus, n >= 24).
+void add_mp3(std::uint32_t riff_size, const std::string &path);
+
 // The track whose .mus RIFF header starts `riff` (at least 8 bytes), or -1.
 [[nodiscard]] int open(const std::uint8_t *riff, std::uint32_t bytes);
 void close(int handle);

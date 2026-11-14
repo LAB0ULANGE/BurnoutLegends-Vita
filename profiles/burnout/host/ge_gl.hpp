@@ -24,6 +24,10 @@ bool initialize(std::string &error);
 void set_render_scale(float scale);
 // Vita: sharpen the picture as it is enlarged to the screen (render scale below 2).
 void set_lazy_levels(bool enabled);
+// Vita: compiled shaders kept in this directory (empty: none).
+void set_gxp_cache(const std::string &directory);
+// Static geometry: its vertices hashed once in `frames` frames (1: every frame).
+void set_probe_every(std::uint32_t frames);
 void set_effect_1x(bool enabled);  // gl-95 test
 // gl-97: GPU scenes limited to the columns each target's draws reach (Vita, patched vitaGL).
 void set_tight_regions(bool enabled);
@@ -31,6 +35,7 @@ void set_tight_regions(bool enabled);
 void set_valid_region(bool enabled);
 // Vita: GXM parameter buffer size before initialize (0: vitaGL default 16 MiB).
 void set_param_buffer_mib(int mib);
+void set_large_rings(bool large);  // Vita: GXM command rings enlarged (gl_context_vita.cpp)
 // Vita: GXM scenes per frame of the FBO render targets (vitaGL; before initialize).
 void set_fbo_scenes(int scenes);
 // gl-90: GPU probe on every draw (log mode 100 normal, 101 32x32 scissor, 102 white texture, 103 no blending).
@@ -42,10 +47,46 @@ void set_present_sharpen(bool enabled);
 // Bonus filters (indices into filters::all(), at most 3): applied by the
 // present pass from the next frame; empty = the plain present pass.
 void set_filters(const std::vector<int> &active);
+// While a menu is up (front end, pause) the picture is shown without the
+// filters (they made the menus unreadable); races keep them.
+void set_filters_suspended(bool suspended);
+// The game's 3D draws left out (2D, through mode, kept): the end-of-race
+// Signature award, where two pictures replace the turning car.
+void set_hide_3d(bool hide);
+// Directory where the filters' programs are kept once built (Vita).
+void set_filter_shader_cache(const std::string &directory);
+// The Bonus menu's postcard: its photo through these filters, drawn in the box
+// (centre x, y from the top, width, height on the 960x544 screen, turned by
+// angle radians); empty: none. The photo is the race beside the menu, taken
+// at the next frame after postcard_photo() (the live picture until then).
+void set_postcard(const std::vector<int> &filters, float x, float y, float width, float height, float angle);
+void postcard_photo();
+// The sun's glare in races (its additive 2D draws' alpha scaled; 1: as the game).
+void set_sun_glare(float scale);
+// Ready-made postcards: <directory>/<filter id>.jpg shown as they are.
+void set_postcard_pictures(const std::string &directory);
+// The presented picture (PC build): its size, 960x544 by default (the Vita).
+void set_present_size(int width, int height);
+// A PNG (with its transparency) over the screen: centre x, y in PSP pixels
+// (480x272, y from the top), size, angle (radians); path empty: none.
+void set_photo(const std::string &path, float x, float y, float width, float height, float angle);
+// The title logo, a PNG over the screen in a slot of its own: centre x, top y
+// in PSP pixels, width (height from the picture); path empty: none.
+void set_title_logo(const std::string &path, float x, float top, float width);
+// Picture slot 0-3 (the Bonus 2.0 pages): a PNG or JPG over the screen, centre
+// x, y, width, height in 960x544 pixels, angle (radians); path empty: none.
+void set_picture(int slot, const std::string &path, float x, float y, float width, float height, float angle);
+bool picture_ready(int slot);  // its file decoded and drawn (or no picture in the slot)
+// PC tool: every filter applied to this picture, written to the directory as
+// <filter id>.ppm at the next capture.
+void make_postcards(const std::string &picture, const std::string &directory);
 // gl-77: foliage PRIMs past near_distance partly left out (2 in 3 kept), past far_distance more (1 in 3 kept).
 void set_thin_foliage(bool enabled, float near_distance, float far_distance);
 // Screen-sized targets drawn between min_scale and the render scale, by GPU load.
 void set_dynamic_resolution(bool enabled, float min_scale, float pinned = 0.0f);
+// The picture drawn at this scale from the next frame (1 = the PSP's 480x272),
+// 0: the dynamic resolution again. Needs the dynamic resolution on.
+void set_picture_scale(float scale);
 // Render targets narrower than the screen (the game's effect buffers) at 1x
 // whatever the render scale (before initialize).
 void set_offscreen_1x(bool enabled);
@@ -91,6 +132,13 @@ extern volatile std::uint32_t emulation_phase;
 extern double io_read_ms, io_read_max_ms;
 // One line in the log, flushed at once (bring-up on the Vita).
 void trace(const char *message);
+// FXAA on the race frames (menus, drawn in 2D only, are left sharp).
+void set_antialias(bool enabled);
+void set_trilinear(bool enabled);
+// The light 5-tap anti-aliasing instead of FXAA (before the renderer starts).
+void set_antialias_lite(bool lite);
+// The player's car speed (mph), for the filters that use it (Chameleon).
+void set_car_speed(float mph);
 // The next frame's draws listed in the log ([tt] lines), as TARGET_TRACE does.
 void trace_next_frame();
 // Once the renderer runs, Vita traces are queued and written here (by the
@@ -114,6 +162,28 @@ struct SnapshotState {
 };
 extern SnapshotState g_scan;
 
+// The GE front end walks a copy of the list's buffer made when the game
+// queued it (0.0.37 on the Vita: the game rewrote the buffer mid-walk, a word
+// read twice differed and the snapshot records fell out of step). Reads in
+// [lo, hi) come from `data`; anything else from guest memory. Set only by the
+// front end's thread, around one walk.
+struct GuestShadow {
+    std::uint32_t lo{}, hi{};
+    const std::uint8_t *data{};
+};
+extern GuestShadow g_shadow;
+// Reads of a walk with a copy that went to memory the game rewrites (outside
+// the copy and outside 0x08800000-0x09BFFFFF): the copy did not cover them.
+extern std::uint64_t g_shadow_misses;
+inline const std::uint8_t *shadowed(const psprecomp::GuestMemory &memory, std::uint32_t address, std::size_t size) {
+    const std::uint32_t a = address & 0x0FFFFFFFu;
+    if (g_shadow.data != nullptr) {
+        if (a >= g_shadow.lo && a + size <= g_shadow.hi) return g_shadow.data + (a - g_shadow.lo);
+        if (a < 0x08800000u || a >= 0x09C00000u) ++g_shadow_misses;
+    }
+    return memory.raw_pointer(address, size);
+}
+
 // Emulation-thread side of the GL worker. Follows the vertex and index
 // pointers and appends to `snapshot` the guest bytes `word` will read, so the
 // worker can draw the frame while the game overwrites them. Returns the
@@ -123,8 +193,16 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
                                std::uint32_t offset, Snapshot &snapshot);
 // A run of plain commands (see render::ge_commands): PRIM and LOAD_CLUT
 // entries take their records from `records` in order.
+// Drawing back on after a BJUMP culled an object (the end of a job).
+void end_culling();
+// Records in the job being drawn (checked against each command's own).
+void set_record_count(std::size_t count);
+// Whether a job's records ever fell out of step (any thread may ask).
+bool records_desynced() noexcept;
+// `address`: the guest address of words[0] (0: unknown), for BJUMP.
 void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uint32_t count, std::uint32_t base,
-            std::uint32_t offset, const Snapshot &snapshot, const std::uint32_t *records, std::size_t &next_record);
+            std::uint32_t offset, std::uint32_t address, const Snapshot &snapshot, const std::uint32_t *records,
+            std::size_t &next_record);
 // Worker side of the same rule: whether the PRIM `word` about to be decoded
 // has a record (non-indexed PRIMs of static vertices have none, they are read
 // in place).

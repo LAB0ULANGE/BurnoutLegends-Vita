@@ -1,0 +1,12 @@
+# Burnout Legends ULES00125: World Tour > Compact > first event, driven to the
+# end; with PSPRECOMP_BURNOUT_FORCE_ALL_AT (every event gold, every Signature
+# done during the race) the race's end shows every award, one CROSS every 4 s
+# (the 2026-11-14 award clips). Profile as race_world_tour_compact.txt.
+hold   120   126  START
+hold   420   426  START
+hold   600   606  CROSS
+hold   800   806  CIRCLE
+pulse  950  1500   90  6  CROSS
+hold  1500 16600  CROSS
+pulse 1500 16600  240 30 R
+pulse 16800 99999 240 6 CROSS

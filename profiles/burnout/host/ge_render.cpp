@@ -251,6 +251,7 @@ void block_transfer(psprecomp::GuestMemory &memory, std::uint32_t data) {
 struct CachedRun {
     std::shared_ptr<const std::vector<std::uint32_t>> words;
     std::uint32_t first{}, count{}, base{}, offset{};
+    std::uint32_t address{};  // guest address of words[first] (BJUMP targets)
 };
 
 struct Job {
@@ -258,7 +259,7 @@ struct Job {
     std::vector<std::array<std::uint32_t, 3>> commands;
     std::vector<CachedRun> cached;  // kCachedRun entries carry their index here
     // Runs of plain commands, copied whole: a commands entry {start, count,
-    // kRun} with base and offset in the two words before start.
+    // kRun} with the run's guest address, base and offset in the three words before start.
     std::vector<std::uint32_t> words;
     std::vector<std::uint32_t> records;  // snapshot records of the runs' PRIM/LOAD_CLUT, in order
     std::vector<Transfer> transfers;  // TRXKICK entries carry their index here
@@ -363,6 +364,9 @@ std::atomic<bool> g_worker_profiling{true};
 #endif
 
 void worker_loop() {
+#if !defined(__vita__)
+    core_load::register_current_thread("decode");
+#endif
 #if defined(_WIN32)
     if (std::getenv("PSPRECOMP_BURNOUT_PROFILE_WORKER") != nullptr)
         g_worker_profiler = std::make_unique<SamplingProfiler>(g_worker_profiling);
@@ -397,17 +401,18 @@ void worker_loop() {
         switch (job.kind) {
         case Job::Kind::Commands: {
             gl::set_drawing(!job.skip);
+            gl::set_record_count(job.records.size());
             std::size_t next_record = 0u;
             for (const auto &c : job.commands) {
                 if (c[2] == kCachedRun) {
                     const CachedRun &run = job.cached[c[0]];
-                    gl::ge_run(*g_memory, run.words->data() + run.first, run.count, run.base, run.offset, job.snapshot,
+                    gl::ge_run(*g_memory, run.words->data() + run.first, run.count, run.base, run.offset, run.address, job.snapshot,
                                job.records.data(), next_record);
                     continue;
                 }
                 if (c[2] == kRun) {
                     const std::uint32_t *words = job.words.data() + c[0];
-                    gl::ge_run(*g_memory, words, c[1], words[-2], words[-1], job.snapshot, job.records.data(), next_record);
+                    gl::ge_run(*g_memory, words, c[1], words[-2], words[-1], words[-3], job.snapshot, job.records.data(), next_record);
                     continue;
                 }
                 // A TRXKICK carries the index of its snapshot instead of base/offset.
@@ -427,6 +432,7 @@ void worker_loop() {
                 gl::ge_command(*g_memory, c[0], c[1], c[2]);
                 if (snapshot) gl::use_snapshot(nullptr, 0u);
             }
+            gl::end_culling();
             gl::end_list(std::move(job.snapshot));
             gl::account(host_now_ms() - started, started - waiting);
             break;
@@ -575,9 +581,12 @@ std::size_t early_queue_size() {
     return g_early.size();
 }
 
-void request_capture() {
+void request_capture(bool trace_draws) {
     g_capture_requested = true;
-    gl::trace_next_frame();
+    // (The next frame's draws in the log too, for the pad's diagnostic
+    // screenshot; remote screenshots skip it: hundreds of lines written to
+    // the memory card stalled the game for seconds, 2026-11-14.)
+    if (trace_draws) gl::trace_next_frame();
 }
 
 void cpu_wrote_vram(std::uint32_t address, std::uint32_t size) {
@@ -783,10 +792,11 @@ constexpr std::array<ForwardKind, 256> kForwardKind = [] {
 // With `stop_at_control`, the run ends at the first control command
 // (ge_plain_commands); returns the commands taken.
 std::uint32_t forward_run(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t count,
-                          std::uint32_t base, std::uint32_t offset, bool stop_at_control) {
+                          std::uint32_t base, std::uint32_t offset, bool stop_at_control, std::uint32_t pc) {
     std::uint32_t start = 0u;
     const auto emit_run = [&](std::uint32_t end) {
         if (end == start) return;
+        g_pending_words.push_back(pc != 0u ? pc + start * 4u : 0u);  // the run's guest address (0: unknown)
         g_pending_words.push_back(base);
         g_pending_words.push_back(offset);
         const auto at = static_cast<std::uint32_t>(g_pending_words.size());
@@ -875,6 +885,7 @@ struct CachedCall {
     gl::SnapshotState exit{};                // pointer state after the RET
     std::uint32_t exit_base{}, exit_offset{};
     std::uint64_t used{};                    // last flip it was looked up
+    std::uint32_t target{};                  // its guest address
 };
 std::unordered_map<CallKey, CachedCall, CallKeyHash> g_calls;
 std::uint64_t g_call_hits{}, g_call_walked{}, g_call_hit_words{};
@@ -1033,7 +1044,8 @@ void forward_cached(const CachedCall &call) {
     gl::g_scan = call.exit;
     for (const CallSegment &segment : call.segments) {
         g_pending.push_back({static_cast<std::uint32_t>(g_pending_cached.size()), 0u, kCachedRun});
-        g_pending_cached.push_back({call.words, segment.first, segment.count, segment.base, segment.offset});
+        g_pending_cached.push_back({call.words, segment.first, segment.count, segment.base, segment.offset,
+                                    call.target + segment.first * 4u});
     }
     const auto first = static_cast<std::uint32_t>(g_pending_snapshot.records.size());
     g_pending_snapshot.records.insert(g_pending_snapshot.records.end(), call.records.begin(), call.records.end());
@@ -1052,6 +1064,7 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
     auto [it, inserted] = g_calls.try_emplace(CallKey{target, base, offset, gl::g_scan});
     CachedCall &call = it->second;
     call.used = g_flips;
+    call.target = target;
     if (inserted) g_call_bytes += call_bytes(call);
     if (!inserted && !call.cacheable) return false;
     const auto bytes = static_cast<std::uint32_t>(call.words != nullptr ? call.words->size() * 4u : 0u);
@@ -1093,8 +1106,12 @@ bool ge_cached_call(const psprecomp::GuestMemory &memory, std::uint32_t target, 
 }
 
 bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, std::uint32_t base,
-                     std::uint32_t offset) {
+                     std::uint32_t offset, std::uint32_t *end) {
+    if (end != nullptr) *end = 0u;
     if (!g_options.enabled || g_options.backend != Backend::OpenGL) return false;
+    const std::uint32_t lo = pc & 0x0FFFFFFCu;
+    std::uint32_t hi = lo;
+    bool contiguous = true;
     constexpr std::uint32_t kLimit = 1u << 20u;
     std::vector<EarlyTransfer> found;
     bool covered = false;  // reached END, and every transfer goes to VRAM
@@ -1108,6 +1125,8 @@ bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std
         std::memcpy(&word, at, 4u);
         const std::uint32_t op = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
+        if (pc < lo || pc >= lo + (1u << 20u)) contiguous = false;
+        hi = std::max(hi, pc + 4u);
         pc += 4u;
         switch (op) {
         case 0x08u: pc = (base | data) + offset; continue;  // JUMP
@@ -1136,6 +1155,7 @@ bool early_transfers(const psprecomp::GuestMemory &memory, std::uint32_t pc, std
         for (EarlyTransfer &early : found) g_early.push_back(std::move(early));
         while (g_early.size() > kEarlyMax) g_early.pop_front();
     }
+    if (end != nullptr && covered && contiguous) *end = hi;
     return covered && !to_ram;
 }
 
@@ -1153,15 +1173,15 @@ void ge_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std:
         gl::emulation_phase = 1u;
         return;
     }
-    forward_run(memory, words, count, base, offset, false);
+    forward_run(memory, words, count, base, offset, false, 0u);
 }
 
 std::uint32_t ge_plain_commands(psprecomp::GuestMemory &memory, const std::uint8_t *words, std::uint32_t span,
-                                std::uint32_t base, std::uint32_t offset) {
+                                std::uint32_t base, std::uint32_t offset, std::uint32_t pc) {
     if (g_options.enabled && g_options.backend == Backend::OpenGL && g_async) {
         g_memory = &memory;
         gl::emulation_phase = 2u;
-        return forward_run(memory, words, span, base, offset, true);
+        return forward_run(memory, words, span, base, offset, true, pc);
     }
     std::uint32_t plain = 0u;
     while (plain < span && kForwardKind[words[plain * 4u + 3u]] != ForwardKind::Control) ++plain;

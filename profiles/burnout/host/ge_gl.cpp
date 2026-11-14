@@ -9,13 +9,18 @@
 
 #include "burnout_bench.hpp"
 #include "thread_sync.hpp"
+#include "detached_thread.hpp"
 #include "filters.hpp"
 #include "texture_pack.hpp"
+#include "perf_counters.hpp"
+#include "overlay.hpp"
+#include "third_party/stb_image.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +28,8 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -35,6 +42,7 @@
 #endif
 
 #if defined(__vita__)
+#include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
 #include <pthread.h>
 #endif
@@ -514,11 +522,60 @@ void main() {
 }
 )";
 
+// A picture with its own transparency (the Signature photo, set_photo).
+const char *kPhotoFragmentShader = R"(
+uniform sampler2D u_texture;
+varying vec2 v_texcoord;
+void main() {
+    gl_FragColor = texture2D(u_texture, v_texcoord);
+}
+)";
+
 const char *kPresentFragmentShader = R"(
 uniform sampler2D u_texture;
 varying vec2 v_texcoord;
 void main() {
-#if SHARPEN
+#if FXAA == 2
+    // Light anti-aliasing (5 taps, no dependent reads): the four diagonal
+    // samples sit half a texel away, so the bilinear unit averages 2x2
+    // texels each (a 3x3 tent around the pixel). Where the local contrast is
+    // high (an edge) the pixel moves toward that blur; flat areas and fine
+    // texture detail of low contrast are left as they are.
+    vec2 t = vec2(TEXEL_X, TEXEL_Y) * 0.5;
+    vec3 m = texture2D(u_texture, v_texcoord).rgb;
+    vec3 nw = texture2D(u_texture, v_texcoord + vec2(-t.x, -t.y)).rgb;
+    vec3 ne = texture2D(u_texture, v_texcoord + vec2(t.x, -t.y)).rgb;
+    vec3 sw = texture2D(u_texture, v_texcoord + vec2(-t.x, t.y)).rgb;
+    vec3 se = texture2D(u_texture, v_texcoord + vec2(t.x, t.y)).rgb;
+    vec3 w = vec3(0.299, 0.587, 0.114);
+    float lnw = dot(nw, w), lne = dot(ne, w), lsw = dot(sw, w), lse = dot(se, w), lm = dot(m, w);
+    float lmin = min(lm, min(min(lnw, lne), min(lsw, lse)));
+    float lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
+    float edge = clamp((lmax - lmin) * 4.0 - 0.15, 0.0, 0.8);
+    gl_FragColor = vec4(mix(m, (nw + ne + sw + se) * 0.25, edge), 1.0);
+#elif FXAA
+    // FXAA (the console variant, 9 taps): edges found from the luma of the
+    // four diagonal neighbours, blended along them.
+    vec2 t = vec2(TEXEL_X, TEXEL_Y);
+    vec3 nw = texture2D(u_texture, v_texcoord + vec2(-1.0, -1.0) * t).rgb;
+    vec3 ne = texture2D(u_texture, v_texcoord + vec2(1.0, -1.0) * t).rgb;
+    vec3 sw = texture2D(u_texture, v_texcoord + vec2(-1.0, 1.0) * t).rgb;
+    vec3 se = texture2D(u_texture, v_texcoord + vec2(1.0, 1.0) * t).rgb;
+    vec3 m = texture2D(u_texture, v_texcoord).rgb;
+    vec3 w = vec3(0.299, 0.587, 0.114);
+    float lnw = dot(nw, w), lne = dot(ne, w), lsw = dot(sw, w), lse = dot(se, w), lm = dot(m, w);
+    float lmin = min(lm, min(min(lnw, lne), min(lsw, lse)));
+    float lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
+    vec2 dir = vec2(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));
+    float reduce = max((lnw + lne + lsw + lse) * (0.25 * 0.125), 1.0 / 128.0);
+    float rcp_min = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * rcp_min, vec2(-8.0), vec2(8.0)) * t;
+    vec3 a = 0.5 * (texture2D(u_texture, v_texcoord + dir * (1.0 / 3.0 - 0.5)).rgb +
+                    texture2D(u_texture, v_texcoord + dir * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 b = a * 0.5 + 0.25 * (texture2D(u_texture, v_texcoord - dir * 0.5).rgb + texture2D(u_texture, v_texcoord + dir * 0.5).rgb);
+    float lb = dot(b, w);
+    gl_FragColor = vec4((lb < lmin || lb > lmax) ? a : b, 1.0);
+#elif SHARPEN
     // Unsharp mask against the four neighbouring texels: the picture keeps
     // its edges as it is enlarged to the screen.
     vec3 c = texture2D(u_texture, v_texcoord).rgb;
@@ -528,6 +585,29 @@ void main() {
 #else
     gl_FragColor = vec4(texture2D(u_texture, v_texcoord).rgb, 1.0);
 #endif
+}
+)";
+
+// Our overlay (the Bonus menu): shapes and text in screen pixels.
+const char *kOverlayVertexShader = R"(
+attribute vec2 a_position;
+attribute vec2 a_texcoord;
+attribute vec4 a_color;
+varying vec2 v_texcoord;
+varying vec4 v_color;
+void main() {
+    gl_Position = vec4(a_position.x / 480.0 - 1.0, 1.0 - a_position.y / 272.0, 0.0, 1.0);
+    v_texcoord = a_texcoord;
+    v_color = a_color;
+}
+)";
+
+const char *kOverlayFragmentShader = R"(
+uniform sampler2D u_texture;
+varying vec2 v_texcoord;
+varying vec4 v_color;
+void main() {
+    gl_FragColor = vec4(v_color.rgb, v_color.a * texture2D(u_texture, v_texcoord).a);
 }
 )";
 
@@ -632,16 +712,87 @@ bool g_lighting_dirty{true};  // a lighting or material command changed since th
 bool g_drawing{true};         // false while a frame is skipped
 std::unordered_map<std::uint32_t, RenderTarget> g_targets;
 std::unordered_map<std::uint64_t, Texture> g_textures;
+// The last textures looked up (direct-mapped by key): most draws reuse one of
+// a handful, and the map's hashing showed in the worker's profile. Elements
+// of an unordered_map keep their address until erased (evict_textures
+// clears this).
+struct TextureSlot {
+    std::uint64_t key{~std::uint64_t{0}};
+    Texture *texture{};
+};
+std::array<TextureSlot, 32> g_texture_slots{};
+Texture &find_texture(std::uint64_t key) {
+    TextureSlot &slot = g_texture_slots[(key ^ (key >> 29u) ^ (key >> 43u)) & 31u];
+    if (slot.texture != nullptr && slot.key == key) return *slot.texture;
+    Texture &texture = g_textures[key];
+    slot = {key, &texture};
+    return texture;
+}
 Program g_uber, g_present, g_present_sharp;  // GL thread (sharp: enlarged pictures)
+Program g_photo_program;                    // set_photo: its alpha kept
+Program g_present_fxaa;                      // anti-aliasing (Bonus menu), races only
+bool g_antialias_lite{true};                 // its 5-tap light version (the default; FXAA proper cost the Vita 20-26 ms)
+Program g_overlay;                           // our overlay (Bonus menu)
+GLuint g_overlay_texture{};                  // its font atlas
+std::atomic<bool> g_antialias{false};
+bool g_trilinear{true};                      // every mip-mapped texture filtered trilinear
+std::atomic<bool> g_frame_flat{true};        // the last frame drew no 3D (menus)
 // Bonus filters (filters.hpp): while some are on, their generated program
 // replaces g_present in the present pass (no other target or pass). The
 // request comes from any thread; the GL thread builds it at the next present.
-Program g_filter;
-GLint g_filter_extent{-1}, g_filter_pixels{-1}, g_filter_time{-1};
+struct FilterProgram {
+    Program program;
+    GLint extent{-1}, pixels{-1}, time{-1}, speed{-1};
+};
+FilterProgram g_filter;
+std::atomic<bool> g_hide_3d{false};  // set_hide_3d
+std::atomic<bool> g_filters_suspended{false};  // a menu is up: the picture without the filters
+std::atomic<float> g_car_speed{0.0f};  // mph, from the emulation thread
 SyncMutex g_filter_mutex{"gl_filters"};
 std::vector<int> g_filter_request;
 std::atomic<std::uint32_t> g_filter_version{0};
 std::uint32_t g_filter_built{0};  // GL thread
+// The Bonus menu's postcard: the picture through other filters, drawn small
+// in a box of the 960x544 screen (none when the request is empty).
+FilterProgram g_card;
+std::vector<int> g_card_request;
+// The presented picture's size: the Vita's screen; the PC build may make it
+// larger (set_present_size), its window then shows it scaled.
+int g_screen_w = 960, g_screen_h = 544;
+float g_card_box[5]{};  // centre x, y (from the top), width, height, angle (radians)
+// The postcard's photo: the race beside the menu, taken once when asked (a
+// still picture, kept for the main menu's Bonus rows too).
+std::atomic<bool> g_snapshot_request{false};
+// Ready-made postcards (one picture per filter, <dir>/<filter id>.jpg, made
+// on the PC by make_postcards): shown as they are, no program to build.
+std::string g_postcard_dir;  // empty: none
+// A picture over the screen (set_photo): the Signature Takedown photo on the
+// awards screen. Path empty: none. Box as g_card_box, then alpha.
+std::string g_photo_path, g_photo_loaded_path;
+float g_photo_box[5]{};
+GLuint g_photo_texture{};
+// The title logo over the title movie (set_title_logo): x centre, y top, width.
+std::string g_logo_path, g_logo_loaded_path;
+float g_logo_box[5]{};
+GLuint g_logo_texture{};
+float g_logo_aspect{0.25f};
+// Pictures over the screen (set_picture, the Bonus 2.0 pages): a few slots,
+// each a PNG or JPG in a box (centre x, y, width, height in PSP pixels,
+// angle), loaded when its path changes; path empty: none.
+struct Picture {
+    std::string path, loaded;
+    float box[5]{};
+    GLuint texture{};
+};
+constexpr int kPictures = 4;
+Picture g_pictures[kPictures];
+GLuint g_card_image{};       // the postcard shown, 0: none (the photo through g_card)
+std::vector<std::pair<std::string, GLuint>> g_card_images;  // loaded, most recent first
+// PC: make the postcards from this picture at the next capture.
+std::string g_make_postcards_from, g_make_postcards_to;
+GLuint g_snapshot_texture{}, g_snapshot_fbo{};
+constexpr int kSnapshotW = 512, kSnapshotH = 256;
+std::uint32_t g_card_built{0};  // GL thread
 std::vector<GLuint> g_framebuffer_texture;   // GL thread: colour texture id of each framebuffer id
 std::vector<std::uint32_t> g_framebuffer_psp_width;  // GL thread: its width in PSP pixels
 #if defined(__vita__)
@@ -662,6 +813,7 @@ struct GpuCounters {
     double skin_ms{};
     std::unordered_map<std::uint32_t, TargetUse> targets;  // by target key
 } g_gpu;
+std::uint64_t g_gpu_generation{};  // g_gpu reset (its targets map anew)
 // Scale of each render target as created (decode thread): the screen-sized
 // ones at the render scale, narrower ones optionally at 1x (offscreen_1x).
 bool g_offscreen_1x{};
@@ -759,6 +911,81 @@ float float24(std::uint32_t data) noexcept { return std::bit_cast<float>(data <<
 // Test: variant fragment shaders at medium precision (half floats on the SGX).
 bool g_fragment_mediump{};
 
+// Compiled shaders kept on the memory card (2026-11-11, from the THUG Vita
+// port, Code/Gfx/Vita/p_shader_decor.cpp:95-170, COMPARAISON_THUG.md #5):
+// each variant cost the Vita's shader compiler 0.5-2.5 s, 62 of them at every
+// launch (0.0.74's log). The program is still linked at each launch (whole
+// linked programs loaded with glProgramBinary crashed the Vita in
+// 0.0.10-0.0.16). vitaGL's default mode (VGL_MODE_POSTPONED) compiles the two
+// shaders only in glLinkProgram, translating them as a pair (their varyings
+// matched): 0.0.80b/c read a shader back right after glCompileShader, before
+// it existed, and crashed at launch. Now the pair is read back after the link
+// and kept in one file (vertex size, vertex, fragment) under a hash of both
+// sources and of the vitaGL build; both shaders load together or not at all.
+// Empty: none.
+std::string g_gxp_cache;
+
+#if defined(__vita__)
+std::string gxp_pair_path(const std::string &defines, const char *vertex, const char *fragment) {
+    std::uint64_t hash = 0xCBF29CE484222325ull;
+    const auto mix = [&hash](const std::string &text) {
+        for (const char c : text) hash = (hash ^ static_cast<std::uint8_t>(c)) * 0x100000001B3ull;
+        hash = (hash ^ 0xFFu) * 0x100000001B3ull;
+    };
+    mix("vitagl-2bdbe89 pair-2");
+    mix(g_fragment_mediump ? "mediump" : "highp");
+    mix(defines);
+    mix(vertex);
+    mix(fragment);
+    char name[40];
+    std::snprintf(name, sizeof(name), "/%016llx.gxp", static_cast<unsigned long long>(hash));
+    return g_gxp_cache + name;
+}
+std::vector<std::uint8_t> &gxp_buffer() {
+    static std::vector<std::uint8_t> buffer(512u * 1024u);
+    return buffer;
+}
+bool gxp_load_pair(const std::string &path, GLuint &vs, GLuint &fs) {
+    std::FILE *file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+    std::vector<std::uint8_t> &buffer = gxp_buffer();
+    const std::size_t n = std::fread(buffer.data(), 1, buffer.size(), file);
+    std::fclose(file);
+    std::uint32_t first = 0u;
+    if (n >= 4u) std::memcpy(&first, buffer.data(), 4u);
+    // Each part: at least a matrix count and a GXP header.
+    if (n >= buffer.size() || n < 4u + 128u || first < 64u || first > n - 4u - 64u) {
+        std::remove(path.c_str());
+        return false;
+    }
+    vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderBinary(1, &vs, 0, buffer.data() + 4u, static_cast<GLsizei>(first));
+    fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderBinary(1, &fs, 0, buffer.data() + 4u + first, static_cast<GLsizei>(n - 4u - first));
+    return true;
+}
+void gxp_store_pair(const std::string &path, GLuint vs, GLuint fs) {
+    std::vector<std::uint8_t> &buffer = gxp_buffer();
+    const std::size_t half = (buffer.size() - 4u) / 2u;
+    GLsizei a = 0, b = 0;
+    // vitaGL writes the whole shader whatever the size given: each half
+    // (256 KiB) is far above a GXP shader's few KiB.
+    vglGetShaderBinary(vs, static_cast<GLsizei>(half), &a, buffer.data() + 4u);
+    if (a <= 0 || static_cast<std::size_t>(a) > half) return;
+    vglGetShaderBinary(fs, static_cast<GLsizei>(half), &b, buffer.data() + 4u + a);
+    if (b <= 0 || static_cast<std::size_t>(b) > half) return;
+    const std::uint32_t first = static_cast<std::uint32_t>(a);
+    std::memcpy(buffer.data(), &first, 4u);
+    const std::size_t total = 4u + static_cast<std::size_t>(a) + static_cast<std::size_t>(b);
+    const std::string partial = path + ".part";
+    if (std::FILE *file = std::fopen(partial.c_str(), "wb")) {
+        const bool written = std::fwrite(buffer.data(), 1, total, file) == total;
+        if (std::fclose(file) == 0 && written) std::rename(partial.c_str(), path.c_str());
+        else std::remove(partial.c_str());
+    }
+}
+#endif
+
 GLuint compile(GLenum type, const std::string &defines, const char *source, std::string &error) {
 #if defined(__vita__)
     const bool mediump = g_fragment_mediump && type == GL_FRAGMENT_SHADER && !defines.empty();
@@ -782,6 +1009,11 @@ GLuint compile(GLenum type, const std::string &defines, const char *source, std:
 }
 
 std::string g_shader_cache;  // directory, empty: no cache
+// The Bonus filters' programs, always cached (0.0.9: 0.4-1.1 s to build one
+// on the Vita, each time a filter is first shown). Their key does not hold
+// the build date: they are built once, whatever the build (a binary that does
+// not load is built again).
+std::string g_filter_shader_cache;
 bool g_cached_memory{};
 
 void bind_attributes(GLuint id, bool present) {
@@ -815,15 +1047,13 @@ bool find_uniforms(Program &program, bool present, std::string &error) {
 // vitaGL does not bound the copy, hence the large buffer.
 constexpr std::size_t kProgramBinaryMax = 1u << 20u;
 
-std::string cache_path(const char *vertex, const char *fragment, const std::string &defines) {
+std::string cache_path(const std::string &directory, const char *vertex, const char *fragment, const std::string &defines, const char *stamp) {
     std::uint64_t hash = 0xCBF29CE484222325ull;
-    // The build date stands for the vitaGL and shader compiler it was linked
-    // with: a newer build never loads an older binary.
-    for (const std::string &part : {std::string(vertex), std::string(fragment), defines, std::string(__DATE__ __TIME__)})
+    for (const std::string &part : {std::string(vertex), std::string(fragment), defines, std::string(stamp)})
         for (const char c : part) hash = (hash ^ static_cast<std::uint8_t>(c)) * 0x100000001B3ull;
     char name[32];
     std::snprintf(name, sizeof(name), "/%016llx.bin", static_cast<unsigned long long>(hash));
-    return g_shader_cache + name;
+    return directory + name;
 }
 
 bool load_cached(Program &program, const std::string &path, bool present) {
@@ -862,21 +1092,53 @@ void store_cached(const Program &program, const std::string &path) {
 #endif
 
 bool link(Program &program, const char *vertex, const char *fragment, bool present, std::string &error,
-          const std::string &defines = {}) {
+          const std::string &defines = {}, bool filter = false) {
 #if defined(__vita__)
-    const std::string cached = g_shader_cache.empty() ? std::string() : cache_path(vertex, fragment, defines);
+    // The build date stands for the vitaGL and shader compiler it was linked
+    // with: a newer build never loads an older binary (filters: see above).
+    const std::string &directory = filter ? g_filter_shader_cache : g_shader_cache;
+    const std::string cached = directory.empty() ? std::string()
+                                                 : cache_path(directory, vertex, fragment, defines, filter ? "filters-1" : __DATE__ __TIME__);
     if (!cached.empty() && load_cached(program, cached, present)) return true;
 #endif
-    const GLuint vs = compile(GL_VERTEX_SHADER, defines, vertex, error);
-    if (vs == 0u) return false;
-    const GLuint fs = compile(GL_FRAGMENT_SHADER, defines, fragment, error);
-    if (fs == 0u) return false;
+    GLuint vs = 0u, fs = 0u;
+#if defined(__vita__)
+    const std::string pair = g_gxp_cache.empty() ? std::string() : gxp_pair_path(defines, vertex, fragment);
+    const bool kept = !pair.empty() && gxp_load_pair(pair, vs, fs);
+#else
+    const bool kept = false;
+#endif
+    if (!kept) {
+        vs = compile(GL_VERTEX_SHADER, defines, vertex, error);
+        if (vs == 0u) return false;
+        fs = compile(GL_FRAGMENT_SHADER, defines, fragment, error);
+        if (fs == 0u) return false;
+    }
     program.id = glCreateProgram();
     glAttachShader(program.id, vs);
     glAttachShader(program.id, fs);
     bind_attributes(program.id, present);
     glLinkProgram(program.id);
-    if (!find_uniforms(program, present, error)) return false;
+    if (!find_uniforms(program, present, error)) {
+#if defined(__vita__)
+        if (!kept) return false;
+        // Kept shaders that do not link: deleted, compiled from source.
+        trace(("kept shaders unusable, compiled again: " + error).c_str());
+        std::remove(pair.c_str());
+        glDeleteProgram(program.id);
+        program = {};
+        const std::string saved = g_gxp_cache;
+        g_gxp_cache.clear();
+        const bool ok = link(program, vertex, fragment, present, error, defines, filter);
+        g_gxp_cache = saved;
+        return ok;
+#else
+        return false;
+#endif
+    }
+#if defined(__vita__)
+    if (!pair.empty() && !kept) gxp_store_pair(pair, vs, fs);
+#endif
 #if defined(__vita__)
     if (!cached.empty()) store_cached(program, cached);
 #endif
@@ -894,7 +1156,8 @@ bool link(Program &program, const char *vertex, const char *fragment, bool prese
 enum class Op : std::uint32_t {
     Enable, Disable, BlendFunc, BlendEquation, DepthFunc, DepthMask, ColorMask, FrontFace, Scissor, Viewport,
     UseProgram, BindFramebuffer, BindTexture, TexParameter, TexImage, TexImageP8, Uniform4, UniformMatrix, Draw, CreateTarget,
-    Present, Capture, StencilFunc, StencilOp, StencilMask, Prepass, ValidRegion, DeleteTexture
+    Present, Capture, StencilFunc, StencilOp, StencilMask, Prepass, ValidRegion, DeleteTexture, TexImageIndexed,
+    RotateTexture
 };
 
 // Cut-out depth prepass (gl-72): an opaque alpha-tested textured draw that
@@ -1068,7 +1331,14 @@ extern int g_scale;
 void end_scene();  // gl-98 per-scene regions, below
 
 RenderTarget &render_target(std::uint32_t key, std::uint32_t stride) {
+    // The same target draw after draw: no map lookup (targets are never
+    // erased, and map elements keep their address).
+    static std::uint32_t last_key = UINT32_MAX;
+    static RenderTarget *last = nullptr;
+    if (last != nullptr && key == last_key) return *last;
     auto [it, inserted] = g_targets.try_emplace(key);
+    last_key = key;
+    last = &it->second;
     RenderTarget &target = it->second;
     if (!inserted) return target;
     end_scene();  // its creation clears it: a GPU scene of its own
@@ -1176,15 +1446,36 @@ std::uint64_t probe_hash(const std::uint8_t *data, std::size_t size) noexcept {
     return (static_cast<std::uint64_t>(a) << 32u) | b;
 }
 
-std::uint64_t fnv(const std::uint8_t *data, std::size_t size, std::uint64_t hash = 0xCBF29CE484222325ull) noexcept {
+// 64-bit hash of a palette or a texture (cache keys and change checks):
+// four independent 32-bit lanes, as a 32-bit CPU multiplies them (one chain
+// of 64-bit multiplies cost ~1.5 ms a frame on the Vita for the palettes).
+std::uint64_t fnv(const std::uint8_t *data, std::size_t size, std::uint64_t seed = 0xCBF29CE484222325ull) noexcept {
+    std::uint32_t a = static_cast<std::uint32_t>(seed), b = static_cast<std::uint32_t>(seed >> 32u);
+    std::uint32_t c = 0x9E3779B9u ^ static_cast<std::uint32_t>(size), d = 0x7F4A7C15u;
     std::size_t i = 0;
-    for (; i + 8u <= size; i += 8u) {
-        std::uint64_t word;
-        std::memcpy(&word, data + i, 8u);
-        hash = (hash ^ word) * 0x100000001B3ull;
+    for (; i + 16u <= size; i += 16u) {
+        // 2026-11-13: on the Vita the static geometry's hash ran at ~70 MB/s
+        // (7-8 ms a race frame for ~550 KiB on the GL thread), waiting on
+        // memory line by line: ask for the lines 256 bytes ahead.
+#if defined(_MSC_VER)
+        _mm_prefetch(reinterpret_cast<const char *>(data + i + 256u), _MM_HINT_T0);
+#else
+        __builtin_prefetch(data + i + 256u);
+#endif
+        std::uint32_t w[4];
+        std::memcpy(w, data + i, 16u);
+        a = (a ^ w[0]) * 0x01000193u;
+        b = (b ^ w[1]) * 0x85EBCA6Bu;
+        c = (c ^ w[2]) * 0xC2B2AE35u;
+        d = (d ^ w[3]) * 0x27D4EB2Fu;
     }
-    for (; i < size; ++i) hash = (hash ^ data[i]) * 0x100000001B3ull;
-    return hash;
+    for (; i < size; ++i) a = (a ^ data[i]) * 0x01000193u;
+    // Mix the lanes into both halves.
+    a ^= (c << 13u) | (c >> 19u);
+    b ^= (d << 17u) | (d >> 15u);
+    a = (a ^ (b >> 15u)) * 0x2C1B3C6Du;
+    b = (b ^ (a >> 13u)) * 0x297A2D39u;
+    return (static_cast<std::uint64_t>(a) << 32u) | b;
 }
 
 // Binds the texture for the current state and returns the texcoord transform
@@ -1243,7 +1534,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                         (static_cast<std::uint64_t>(width) << 16u) ^ (static_cast<std::uint64_t>(height) << 4u) ^
                         (swizzled ? 1u : 0u) ^ (static_cast<std::uint64_t>(buffer_width) << 40u);
     if (paletted) key ^= (g_clut_hash ^ cmd(0xC5u)) * 31u;
-    Texture &texture = g_textures[key];
+    Texture &texture = find_texture(key);
     texture.last_frame = g_stats.frames;
     const bool fresh = texture.name == 0u;
     if (fresh) {
@@ -1258,7 +1549,9 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     const bool in_vram = (address & 0x0F000000u) == 0x04000000u && !recheck_vram;
     const std::uint32_t upload_mode = 0u;  // gl-66 probe: 1 P8 paletted, 2 no mips (no GPU difference)
     const bool reformat = !fresh && texture.upload_mode != upload_mode;
-    if ((reformat || (in_vram ? texture.stale : texture.checked_frame != g_stats.frames)) && source != nullptr) {
+    // (A RAM texture is stale when the host rewrote it: a car livery.)
+    if ((reformat || (in_vram ? texture.stale : (texture.checked_frame != g_stats.frames || texture.stale))) && source != nullptr) {
+        const bool rewritten = !in_vram && texture.stale;
         texture.checked_frame = g_stats.frames;
         texture.stale = false;
         // Every 64 frames (staggered) the whole texture is hashed anyway.
@@ -1266,7 +1559,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
         // A VRAM texture is only stale after a write into it: re-uploaded
         // without hashing it whole (a movie frame: 1 MiB every frame).
         const bool written = in_vram && !fresh && !reformat;
-        const bool full = !written && (fresh || reformat || probe != texture.probe || ((g_stats.frames + texture.name) & 63u) == 0u);
+        const bool full = !written && (fresh || reformat || rewritten || probe != texture.probe || ((g_stats.frames + texture.name) & 63u) == 0u);
         texture.probe = probe;
         if (full) g_stats.texture_bytes_hashed += bytes;
         const std::uint64_t hash = full ? fnv(source, bytes) : texture.hash;
@@ -1314,8 +1607,33 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                     }
                 data = linear_bytes.data();
             }
-            std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4u);
-            for (std::uint32_t y = 0; y < height; ++y) {
+            // Paletted 4/8-bit textures (the scenery's, the cars'): the GL
+            // thread looks the palette up (Op::TexImageIndexed); here only
+            // their stats, from the indices' histogram. PC:
+            // PSPRECOMP_BURNOUT_RGBA_UPLOAD converts here as before.
+            static const char *const dump = std::getenv("PSPRECOMP_BURNOUT_TEX_DUMP");
+            static const bool rgba_upload = std::getenv("PSPRECOMP_BURNOUT_RGBA_UPLOAD") != nullptr;
+            const bool indexed = !rgba_upload && (format == 4u || format == 5u) && upload_mode == 0u && dump == nullptr;
+            std::uint32_t counts[256];
+            std::vector<std::uint8_t> palette_rgba;
+            if (indexed) {
+                std::fill(std::begin(counts), std::end(counts), 0u);
+                for (std::uint32_t y = 0; y < height; ++y) {
+                    const std::uint8_t *row = data + y * row_bytes;
+                    if (format == 5u)
+                        for (std::uint32_t x = 0; x < width; ++x) ++counts[row[x]];
+                    else
+                        for (std::uint32_t x = 0; x < width; ++x) ++counts[(row[x / 2u] >> ((x & 1u) * 4u)) & 15u];
+                }
+                palette_rgba.resize(1024u);
+                const std::uint32_t entries = format == 5u ? 256u : 16u;
+                for (std::uint32_t i = 0; i < entries; ++i) {
+                    const auto c = clut_color(i);
+                    std::memcpy(&palette_rgba[i * 4u], c.data(), 4u);
+                }
+            }
+            std::vector<std::uint8_t> rgba(indexed ? 0u : static_cast<std::size_t>(width) * height * 4u);
+            for (std::uint32_t y = 0; y < height && !indexed; ++y) {
                 const std::uint8_t *row = data + y * row_bytes;
                 std::uint8_t *out = &rgba[static_cast<std::size_t>(y) * width * 4u];
                 if (format == 3u) {
@@ -1336,8 +1654,7 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                     std::memcpy(out, c.data(), 4u);
                 }
             }
-            if (const char *dump = std::getenv("PSPRECOMP_BURNOUT_TEX_DUMP");
-                dump != nullptr && (address & 0x0FFFFFFFu) == std::strtoul(dump, nullptr, 16)) {
+            if (dump != nullptr && (address & 0x0FFFFFFFu) == std::strtoul(dump, nullptr, 16)) {
                 char name[96];
                 std::snprintf(name, sizeof(name), "tex_%08X_f%llu_%ux%u.rgba", address, static_cast<unsigned long long>(g_stats.frames),
                               width, height);
@@ -1366,6 +1683,17 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 // texels are mostly green. The "no trees" option skips those.
                 std::size_t clear = 0u;
                 std::uint64_t sum[3]{};
+                if (indexed) {
+                    for (std::uint32_t i = 0; i < 256u; ++i) {
+                        if (counts[i] == 0u) continue;
+                        const std::uint8_t *c = &palette_rgba[i * 4u];
+                        min_alpha = std::min(min_alpha, c[3]);
+                        if (c[3] <= 16u) { clear += counts[i]; continue; }
+                        sum[0] += static_cast<std::uint64_t>(c[0]) * counts[i];
+                        sum[1] += static_cast<std::uint64_t>(c[1]) * counts[i];
+                        sum[2] += static_cast<std::uint64_t>(c[2]) * counts[i];
+                    }
+                }
                 for (std::size_t i = 0u; i < rgba.size(); i += 4u) {
                     min_alpha = std::min(min_alpha, rgba[i + 3u]);
                     if (rgba[i + 3u] <= 16u) { ++clear; continue; }
@@ -1381,7 +1709,8 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 texture.foliage = (address & 0x0F000000u) == 0x04000000u && clear_fraction >= 0.05 && g >= b * 1.4 && r <= g * 1.25 && g < 200.0;
                 if (texture.foliage) g_foliage_addresses.insert(address);
                 else g_foliage_addresses.erase(address);
-                if (std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr)
+                static const bool atest_stats = std::getenv("PSPRECOMP_BURNOUT_ATEST_STATS") != nullptr;
+                if (atest_stats)
                     std::fprintf(stderr, "[texfmt] fmt %u clutfmt %u %ux%u levels %u swz %d minA %u clear %.3f rgb %.0f %.0f %.0f foliage %d addr %08X\n",
                                  format, cmd(0xC5u) & 3u, width, height, levels, swizzled ? 1 : 0, min_alpha, clear_fraction, r, g, b,
                                  texture.foliage ? 1 : 0, address);
@@ -1409,11 +1738,26 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
                 const bool deferred = g_recording_deferred;
                 g_recording_deferred = false;
                 if (deferred) record(Op::BindTexture, {texture.name});
-                record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()),
-                                      (texture.mipmapped ? 1u : 0u) | (in_place ? 2u : 0u)});
+                const std::uint32_t flags = (texture.mipmapped ? 1u : 0u) | (in_place ? 2u : 0u);
+                if (in_place) {
+                    // Another GL texture of the texture's ring (see RotateTexture),
+                    // bound; its sampling is recorded again below.
+                    record(Op::RotateTexture, {texture.name});
+                    for (GLint &value : texture.sampling) value = -1;
+                    if (!deferred) g_state.texture = texture.name;
+                }
+                if (indexed) {
+                    record(Op::TexImageIndexed, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()),
+                                                 flags | (format == 4u ? 4u : 0u), row_bytes});
+                    if (swizzled) g_frame.blobs.push_back(std::move(linear_bytes));
+                    else g_frame.blobs.emplace_back(source, source + static_cast<std::size_t>(row_bytes) * height);
+                    g_frame.blobs.push_back(std::move(palette_rgba));
+                } else {
+                    record(Op::TexImage, {width, height, static_cast<std::uint32_t>(g_frame.blobs.size()), flags});
+                    g_frame.blobs.push_back(std::move(rgba));
+                }
                 g_recording_deferred = deferred;
                 if (deferred) g_state.texture = ~0u;
-                g_frame.blobs.push_back(std::move(rgba));
             }
             ++g_stats.texture_uploads;
         }
@@ -1441,9 +1785,10 @@ std::array<float, 4> bind_texture(psprecomp::GuestMemory &memory) {
     GLint min_filter = 0;
     const std::uint32_t min_mode = cmd(0xC6u) & 7u;
     if (texture.mipmapped && levels != 0u && min_mode >= 4u) {
-        static constexpr GLint modes[4]{GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST, GL_NEAREST_MIPMAP_LINEAR,
-                                        GL_LINEAR_MIPMAP_LINEAR};
-        min_filter = modes[min_mode - 4u];
+        // Always trilinear: the PSP's nearest-level modes show bands where the
+        // road changes mip level (the Vita's GPU has no anisotropic filter).
+        min_filter = g_trilinear ? GL_LINEAR_MIPMAP_LINEAR : std::array<GLint, 4>{GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST,
+                                                                                    GL_NEAREST_MIPMAP_LINEAR, GL_LINEAR_MIPMAP_LINEAR}[min_mode - 4u];
     }
     set_sampling(texture.sampling, linear, clamp_u, clamp_v, min_filter);
     g_texture_min_alpha = texture.min_alpha;
@@ -1520,10 +1865,12 @@ struct CachedUniform {
 };
 std::array<CachedUniform, kSlotCount> g_uniforms;
 
+std::uint32_t g_matrix_writes{};  // changes recorded to the three matrix slots (upload_matrices)
 bool uniform_changed(GLint slot, const float *values, std::size_t count) {
     if (slot < 0 || slot >= kSlotCount) return false;
     CachedUniform &cached = g_uniforms[static_cast<std::size_t>(slot)];
     if (cached.count == count && std::memcmp(cached.values.data(), values, count * sizeof(float)) == 0) return false;
+    if (slot == kWorld || slot == kWorldView || slot == kProjection) ++g_matrix_writes;
     cached.count = static_cast<std::uint32_t>(std::min(count, cached.values.size()));
     std::memcpy(cached.values.data(), values, cached.count * sizeof(float));
     return true;
@@ -1556,6 +1903,23 @@ void psp_matrix(const float *m, float *out) {
 }
 
 void upload_matrices() {
+    // (2026-11-14) Same world, view and projection as the last call, and the
+    // three uniforms still recorded: nothing to compute or compare (the
+    // decode thread spent ~2.4 ms a frame here, ~440 calls).
+    static float last_world[12]{}, last_view[12]{}, last_projection[16]{};
+    static bool last_batch_world{}, have_last{};
+    static std::uint32_t last_writes{};
+    const bool same = have_last && last_batch_world == g_batch_world && last_writes == g_matrix_writes &&
+                      std::memcmp(last_world, g_world.data(), sizeof(last_world)) == 0 &&
+                      std::memcmp(last_view, g_view.data(), sizeof(last_view)) == 0 &&
+                      std::memcmp(last_projection, g_projection.data(), sizeof(last_projection)) == 0 &&
+                      g_uniforms[kWorld].count == 16u && g_uniforms[kWorldView].count == 16u && g_uniforms[kProjection].count == 16u;
+    if (same) return;
+    have_last = true;
+    last_batch_world = g_batch_world;
+    std::memcpy(last_world, g_world.data(), sizeof(last_world));
+    std::memcpy(last_view, g_view.data(), sizeof(last_view));
+    std::memcpy(last_projection, g_projection.data(), sizeof(last_projection));
     // PSP 4x3 matrices are row-vector (v * M); GL wants column-major M^T.
     float world[16]{}, view[16]{}, world_view[16]{};
     static constexpr float kIdentity[12]{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
@@ -1577,6 +1941,7 @@ void upload_matrices() {
     uniform_matrix(kWorld, world);
     uniform_matrix(kWorldView, world_view);
     uniform_matrix(kProjection, g_projection.data());
+    last_writes = g_matrix_writes;  // ours: no one else has changed them since
 }
 
 std::uint32_t upload_vertex_state(bool through);
@@ -1607,6 +1972,10 @@ void splice_deferred() {
 }
 
 std::string trace_batch_box();  // diagnostic, defined after the batch layout
+// 2D draws held to group them by target (see HeldDraw).
+bool hold_2d_draw(std::uint32_t key);  // (see HeldDraw)
+void emit_held_draws();
+void soften_sun_glare(std::uint32_t key);  // (see g_sun_glare)
 // Through-mode batch: rightmost x and top y (PSP pixels); false for 3D.
 bool batch_extent(int &x1, int &y0);
 
@@ -1669,6 +2038,12 @@ void end_scene() {
     g_scene.framebuffer = ~0u;
 }
 
+#if defined(PERF_COUNTERS)
+constexpr bool kFlushDetail = true;
+#else
+constexpr bool kFlushDetail = false;  // no extra clock reads in the players' builds
+#endif
+double g_flush_texture_ms{}, g_flush_state_ms{}, g_flush_tail_ms{}, g_flush_matrices_ms{}, g_flush_vertex_state_ms{}, g_flush_target_ms{};  // decode thread, sampled 1 in 16 (2026-11-13)
 void flush() {
     if (g_batch_runs.empty() || !g_drawing) {
         g_batch_indices.clear();
@@ -1688,8 +2063,28 @@ void flush() {
     const double started = timed ? host_now_ms() : 0.0;
     const std::uint32_t address = cmd(0x9Cu);
     const std::uint32_t stride = cmd(0x9Du) & 0x7FCu;
+    if (hold_2d_draw(target_key(address))) {
+        g_batch_indices.clear();
+        g_batch_runs.clear();
+        g_batch_index_total = 0u;
+        g_batch.clear();
+        g_batch_count = 0u;
+        g_batch_in_place = nullptr;
+        phase = outer_phase;
+        return;
+    }
+    soften_sun_glare(target_key(address));
     RenderTarget &target = render_target(target_key(address), stride);
-    TargetUse &use = g_gpu.targets[target_key(address)];
+    // (Its counters: the last target's kept until the counters are reset.)
+    static std::uint32_t use_key = UINT32_MAX;
+    static std::uint64_t use_generation = ~0ull;
+    static TargetUse *use_last = nullptr;
+    if (use_last == nullptr || use_key != target_key(address) || use_generation != g_gpu_generation) {
+        use_key = target_key(address);
+        use_generation = g_gpu_generation;
+        use_last = &g_gpu.targets[use_key];
+    }
+    TargetUse &use = *use_last;
     use.width = target.width;
     ++use.draws;
     ++g_gpu.draws;
@@ -1757,6 +2152,10 @@ void flush() {
     if (g_state.framebuffer != target.framebuffer) {
         g_state.framebuffer = target.framebuffer;
         record(Op::BindFramebuffer, {target.framebuffer, target.dynamic ? static_cast<std::uint32_t>(target.draw_q) : 0u});
+        // Viewport and scissor are scaled by the bound target's scale: set
+        // again (two targets of the same PSP size can have other scales).
+        g_state.viewport_w = g_state.viewport_h = -1;
+        g_state.scissor[0] = -1;
         ++use.binds;
         ++g_gpu.switches;
     }
@@ -1800,8 +2199,16 @@ void flush() {
     }
     const bool clear_mode = (cmd(0xD3u) & 1u) != 0u;
     const bool through = (g_batch_vtype & 0x800000u) != 0u;
+    const double matrices_started = kFlushDetail && timed ? host_now_ms() : 0.0;
     if (!through) upload_matrices();
+    const double vertex_state_started = kFlushDetail && timed ? host_now_ms() : 0.0;
     const std::uint32_t vertex_variant = upload_vertex_state(through);
+    if (kFlushDetail && timed) {
+        const double now = host_now_ms();
+        g_flush_matrices_ms += (vertex_state_started - matrices_started) * 16.0;
+        g_flush_vertex_state_ms += (now - vertex_state_started) * 16.0;
+        g_flush_target_ms += (matrices_started - started) * 16.0;
+    }
     uniform4(kViewport, float24(cmd(0x42u)), float24(cmd(0x43u)),
              float24(cmd(0x45u)) - static_cast<float>(cmd(0x4Cu) & 0xFFFFu) / 16.0f,
              float24(cmd(0x46u)) - static_cast<float>(cmd(0x4Du) & 0xFFFFu) / 16.0f);
@@ -1816,7 +2223,9 @@ void flush() {
     const bool textured = !clear_mode && (cmd(0x1Eu) & 1u) != 0u;
     if (textured) {
         phase = 7u;
+        const double tex_started = kFlushDetail && timed ? host_now_ms() : 0.0;
         const auto texmap = bind_texture(*g_memory);
+        if (kFlushDetail && timed) g_flush_texture_ms += (host_now_ms() - tex_started) * 16.0;
         phase = 8u;
         uniform4(kTexMap, texmap[0], texmap[1], texmap[2], texmap[3]);
     }
@@ -2059,8 +2468,9 @@ void flush() {
                          cmd(0x24u) & 1u, cmd(0xDCu) & 0xFFFFFFu, cmd(0xDDu) & 0xFFFFFFu, cmd(0xE0u) & 0xFFFFFFu,
                          cmd(0xE1u) & 0xFFFFFFu, cmd(0xE8u) & 0xFFFFFFu, cmd(0xE9u) & 0xFFFFFFu, cmd(0x28u) & 1u);
             if (textured)
-                std::fprintf(stderr, "[tt]    texture bufw=%u size=%ux%u format=%u fb format=%u\n", cmd(0xA8u) & 0x7FFu,
-                             1u << (cmd(0xB8u) & 0xFu), 1u << ((cmd(0xB8u) >> 8u) & 0xFu), cmd(0xC3u) & 0xFu, cmd(0xD2u) & 3u);
+                std::fprintf(stderr, "[tt]    texture bufw=%u size=%ux%u format=%u fb format=%u clut=%08X/%06X\n", cmd(0xA8u) & 0x7FFu,
+                             1u << (cmd(0xB8u) & 0xFu), 1u << ((cmd(0xB8u) >> 8u) & 0xFu), cmd(0xC3u) & 0xFu, cmd(0xD2u) & 3u,
+                             (cmd(0xB0u) & 0xFFFFF0u) | ((cmd(0xB1u) << 8u) & 0x0F000000u), cmd(0xC5u) & 0xFFFFFFu);
             static const std::pair<long, long> skip = [] {
                 const char *v = std::getenv("PSPRECOMP_BURNOUT_TARGET_SKIP");
                 long a = -1, b = -1;
@@ -2084,7 +2494,8 @@ void flush() {
         const std::uint32_t texture = (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u);
         return std::find(g_skipped_cutouts.begin(), g_skipped_cutouts.end(), texture) != g_skipped_cutouts.end();
     };
-    if ((g_no_cutouts && g_draw_is_cutout && g_texture_foliage) || skipped_cutout()) {
+    if ((g_no_cutouts && g_draw_is_cutout && g_texture_foliage) || skipped_cutout() ||
+        (g_hide_3d.load(std::memory_order_relaxed) && (g_batch_vtype & 0x800000u) == 0u)) {
         g_batch.clear();
         g_batch_count = 0u;
         g_batch_in_place = nullptr;
@@ -2095,6 +2506,8 @@ void flush() {
         return;
     }
     phase = 9u;
+    const double tail_started = kFlushDetail && timed ? host_now_ms() : 0.0;
+    if (kFlushDetail && timed) g_flush_state_ms += (tail_started - started) * 16.0;
     bind_vertices();
     ++g_stats.batches;
     g_stats.vertices += g_batch_count;
@@ -2104,7 +2517,11 @@ void flush() {
     g_batch_indices.clear();
     g_batch_runs.clear();
     g_batch_index_total = 0u;
-    if (timed) g_stats.draw_ms += (host_now_ms() - started) * 16.0;
+    if (timed) {
+        const double now = host_now_ms();
+        g_stats.draw_ms += (now - started) * 16.0;
+        if (kFlushDetail) g_flush_tail_ms += (now - tail_started) * 16.0;
+    }
     phase = outer_phase;
 }
 
@@ -2246,6 +2663,209 @@ void copy_vertex(std::uint8_t *out, const std::uint8_t *in, const BatchLayout &t
 
 BatchLayout g_layout;
 
+// Fewer GPU scenes on the screen (gl-109). After the 3D, the game makes
+// small copies of the screen (the car's 64x64 reflection map 154000, the sun's
+// occlusion sample 174000, the bloom 110000) between its 2D draws (sun glare,
+// bloom composite, HUD). Each switch away from the screen and back is a new
+// GPU scene of the whole 1024x544 target (~7 ms on the Vita). So every 2D draw
+// after the first one into another target is held, and they are drawn at the
+// next 3D draw or at the frame's end, grouped: the other targets' draws then
+// the screen's, or the screen's first when they are all light (small or
+// see-through: HUD, haze) and none samples the others' targets (a plain race
+// frame then has one screen scene: its reflection map gets the HUD, in a
+// 64x64 blur). Each group keeps its order; a copy then may lack (or show) the
+// light 2D draws it had (or not) in the game's order, nothing else moves.
+// PSPRECOMP_BURNOUT_NO_HOLD=1 turns it off, PSPRECOMP_BURNOUT_HOLD_DEBUG
+// logs the order chosen.
+struct HeldDraw {
+    std::array<std::uint32_t, 256> commands{};
+    std::vector<std::uint8_t> batch;
+    std::vector<std::uint16_t> indices;
+    std::vector<std::uint32_t> runs;
+    std::uint32_t count{}, vtype{}, min_alpha{}, index_total{};
+    std::uint32_t target{};             // its target's key
+    std::uint32_t sampled{UINT32_MAX};  // the target it samples, if any
+    bool light{};                       // small or see-through
+    BatchLayout layout;
+    std::array<std::uint8_t, 1024> clut{};  // the palette loaded then (the HUD's textures are paletted)
+    std::uint64_t clut_hash{};
+    std::uint32_t clut_loaded{}, clut_max{};
+};
+std::vector<HeldDraw> g_held;
+bool g_replaying{};
+std::uint32_t g_screen_key{UINT32_MAX};  // the target of this frame's 3D
+std::uint64_t g_held_draws{}, g_held_screen_first{}, g_held_others_first{};  // stats
+
+bool small_2d_batch() {
+    if ((g_batch_vtype & 0x800000u) == 0u || g_batch_count == 0u) return false;
+    const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+    const std::uint32_t format = (g_batch_vtype >> 7u) & 3u;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+        const std::uint8_t *p = vertices + i * g_layout.stride + g_layout.pos;
+        float x = 0.0f, y = 0.0f;
+        if (format == 3u) {
+            std::memcpy(&x, p, 4);
+            std::memcpy(&y, p + 4, 4);
+        } else if (format == 2u) {
+            std::int16_t v[2];
+            std::memcpy(v, p, 4);
+            x = v[0];
+            y = v[1];
+        } else {
+            return false;
+        }
+        x0 = std::min(x0, x);
+        y0 = std::min(y0, y);
+        x1 = std::max(x1, x);
+        y1 = std::max(y1, y);
+    }
+    if ((x1 - x0) * (y1 - y0) <= 480.0f * 272.0f / 4.0f) return true;
+    // Larger: only a see-through one (Lakeside's sun haze, alpha 0x4B, on the
+    // whole screen); the showroom's opaque tint is not.
+    if (g_layout.col_size != 4u || (cmd(0x21u) & 1u) == 0u) return false;
+    for (std::uint32_t i = 0; i < g_batch_count; ++i)
+        if (vertices[i * g_layout.stride + g_layout.col + 3u] >= 0x80u) return false;
+    return true;
+}
+
+// The held draws, in the order chosen (decode thread: at a 3D draw or the
+// frame's end; the batch being recorded is kept).
+void emit_held_draws() {
+    if (g_held.empty() || g_replaying) return;
+    bool screen_first = true;
+    for (const HeldDraw &held : g_held) {
+        if (held.target != g_screen_key) continue;
+        bool needs_other = !held.light;
+        for (const HeldDraw &other : g_held)
+            if (other.target != g_screen_key && other.target == held.sampled) needs_other = true;
+        if (needs_other) screen_first = false;
+    }
+    ++(screen_first ? g_held_screen_first : g_held_others_first);
+    static const bool debug = std::getenv("PSPRECOMP_BURNOUT_HOLD_DEBUG") != nullptr;
+    if (debug)
+        std::fprintf(stderr, "[hold] frame %llu: %zu draws, %s first\n", static_cast<unsigned long long>(g_stats.frames), g_held.size(),
+                     screen_first ? "screen" : "others");
+    const std::array<std::uint32_t, 256> commands = g_commands;
+    const std::array<std::uint8_t, 1024> clut = g_clut;
+    const std::uint64_t clut_hash = g_clut_hash;
+    const std::uint32_t clut_loaded = g_clut_loaded, clut_max = g_clut_max;
+    const BatchLayout layout = g_layout;
+    const std::uint32_t vtype = g_batch_vtype, count = g_batch_count, min_alpha = g_batch_min_alpha, index_total = g_batch_index_total;
+    const std::uint8_t *in_place = g_batch_in_place;
+    // The batch being recorded, set aside (swapped, not copied: it can be
+    // large, and this runs at the frame's first 3D draw).
+    decltype(g_batch) batch;
+    batch.swap(g_batch);
+    decltype(g_batch_indices) indices;
+    indices.swap(g_batch_indices);
+    std::vector<std::uint32_t> runs;
+    runs.swap(g_batch_runs);
+    g_replaying = true;
+    for (int pass = 0; pass < 2; ++pass)
+        for (HeldDraw &held : g_held) {
+            const bool on_screen = held.target == g_screen_key;
+            if (on_screen != (screen_first == (pass == 0))) continue;
+            g_commands = held.commands;
+            g_clut = held.clut;
+            g_clut_hash = held.clut_hash;
+            g_clut_loaded = held.clut_loaded;
+            g_clut_max = held.clut_max;
+            g_layout = held.layout;
+            g_batch.assign(held.batch.begin(), held.batch.end());
+            g_batch_in_place = nullptr;
+            g_batch_indices.assign(held.indices.begin(), held.indices.end());
+            g_batch_runs = held.runs;
+            g_batch_count = held.count;
+            g_batch_vtype = held.vtype;
+            g_batch_min_alpha = held.min_alpha;
+            g_batch_index_total = held.index_total;
+            flush();
+        }
+    g_replaying = false;
+    g_held.clear();
+    g_commands = commands;
+    g_clut = clut;
+    g_clut_hash = clut_hash;
+    g_clut_loaded = clut_loaded;
+    g_clut_max = clut_max;
+    g_layout = layout;
+    g_batch.swap(batch);
+    g_batch_in_place = in_place;
+    g_batch_indices.swap(indices);
+    g_batch_runs.swap(runs);
+    g_batch_count = count;
+    g_batch_vtype = vtype;
+    g_batch_min_alpha = min_alpha;
+    g_batch_index_total = index_total;
+    forget_state();
+}
+
+// The sun's glare (Lakeside's flares and bloom haze): the game adds them to
+// the screen after the 3D, 2D draws blended source alpha + fixed (additive).
+// Their vertex alpha is scaled by this (1: as the game; the Vita: 0.5, the
+// player found it too dazzling). PC: PSPRECOMP_BURNOUT_SUN_GLARE=0.5.
+float g_sun_glare = [] {
+    const char *value = std::getenv("PSPRECOMP_BURNOUT_SUN_GLARE");
+    return value != nullptr ? static_cast<float>(std::atof(value)) : 1.0f;
+}();
+
+void soften_sun_glare(std::uint32_t key) {
+    if (g_sun_glare >= 1.0f || key != g_screen_key || g_screen_key == UINT32_MAX || (g_batch_vtype & 0x800000u) == 0u ||
+        g_batch_count == 0u || (cmd(0x21u) & 1u) == 0u || (cmd(0xDFu) & 0xFu) != 2u || ((cmd(0xDFu) >> 4u) & 0xFu) != 0xAu ||
+        g_layout.col_size != 4u)
+        return;
+    if (g_batch_in_place != nullptr) {  // read in place from the snapshot: copied first
+        const std::size_t bytes = static_cast<std::size_t>(g_batch_count) * g_layout.stride;
+        g_batch.resize(bytes);
+        std::memcpy(g_batch.data(), g_batch_in_place, bytes);
+        g_batch_in_place = nullptr;
+    }
+    for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+        std::uint8_t &alpha = g_batch[i * g_layout.stride + g_layout.col + 3u];
+        alpha = static_cast<std::uint8_t>(static_cast<float>(alpha) * g_sun_glare + 0.5f);
+    }
+    g_batch_min_alpha = static_cast<std::uint32_t>(static_cast<float>(g_batch_min_alpha) * g_sun_glare);
+}
+
+// In flush, before anything is recorded for the batch: true when it is held.
+bool hold_2d_draw(std::uint32_t key) {
+    static const bool off = std::getenv("PSPRECOMP_BURNOUT_NO_HOLD") != nullptr;
+    if (off || g_replaying) return false;
+    if ((g_batch_vtype & 0x800000u) == 0u) {  // 3D: what is held goes first
+        emit_held_draws();
+        g_screen_key = key;
+        return false;
+    }
+    if (g_screen_key == UINT32_MAX || g_batch_count == 0u || (g_held.empty() && key == g_screen_key)) return false;
+    if (g_held.size() >= 96u) {
+        emit_held_draws();
+        return false;
+    }
+    HeldDraw held;
+    held.commands = g_commands;
+    held.clut = g_clut;
+    held.clut_hash = g_clut_hash;
+    held.clut_loaded = g_clut_loaded;
+    held.clut_max = g_clut_max;
+    const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
+    held.batch.assign(vertices, vertices + static_cast<std::size_t>(g_batch_count) * g_layout.stride);
+    held.indices.assign(g_batch_indices.begin(), g_batch_indices.end());
+    held.runs = g_batch_runs;
+    held.count = g_batch_count;
+    held.vtype = g_batch_vtype;
+    held.min_alpha = g_batch_min_alpha;
+    held.index_total = g_batch_index_total;
+    held.layout = g_layout;
+    held.target = key;
+    const std::uint32_t texture = (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u);
+    if ((cmd(0x1Eu) & 1u) != 0u && (texture & 0x0F000000u) == 0x04000000u) held.sampled = target_key(texture);
+    held.light = small_2d_batch();
+    g_held.push_back(std::move(held));
+    ++g_held_draws;
+    return true;
+}
+
 bool batch_extent(int &x1, int &y0) {
     if ((g_batch_vtype & 0x800000u) == 0u || g_batch_count == 0u) return false;
     const std::uint8_t *vertices = g_batch_in_place != nullptr ? g_batch_in_place : g_batch.data();
@@ -2299,10 +2919,24 @@ std::string trace_batch_box() {
                     colour = 0u;
                     std::memcpy(&colour, vertices + g_layout.col, std::min<std::uint32_t>(g_layout.col_size, 4u));
                 }
-                char text[128];
+                char text[192];
                 std::snprintf(text, sizeof(text), "[tt]    box %.0f,%.0f-%.0f,%.0f (format %u) colour %08X size %u vtype %06X\n", x0, y0, x1, y1,
                               format, colour, g_layout.col_size, g_batch_vtype & 0xFFFFFFu);
-                return std::string(text);
+                std::string out = text;
+                if ((g_batch_vtype & 3u) == 3u || (g_batch_vtype & 3u) == 2u) {  // float or 16-bit texture coordinates: their box
+                    const VertexLayout layout = vertex_layout(g_batch_vtype);
+                    float u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f;
+                    for (std::uint32_t i = 0; i < g_batch_count; ++i) {
+                        const std::uint8_t *p = vertices + i * layout.stride + layout.tc;
+                        float u = 0.0f, v = 0.0f;
+                        if ((g_batch_vtype & 3u) == 3u) { std::memcpy(&u, p, 4); std::memcpy(&v, p + 4, 4); }
+                        else { std::uint16_t t[2]; std::memcpy(t, p, 4); u = t[0]; v = t[1]; }
+                        u0 = std::min(u0, u); v0 = std::min(v0, v); u1 = std::max(u1, u); v1 = std::max(v1, v);
+                    }
+                    std::snprintf(text, sizeof(text), "[tt]    uv %.1f,%.1f-%.1f,%.1f\n", u0, v0, u1, v1);
+                    out += text;
+                }
+                return out;
             }
 
 // Vertices whose fields already sit at the batch offsets: one fixed-size copy
@@ -2341,6 +2975,7 @@ struct ScreenBox {
 };
 ScreenBox g_sun_box;
 std::uint32_t g_sun_copy{UINT32_MAX};  // target key of the box's copy
+std::uint32_t g_sun_small_copy{UINT32_MAX};  // the last small (<= 256) target seen as the copy
 
 // Bounding box of a through-mode batch's float texture coordinates.
 bool batch_uv_box(ScreenBox &box) {
@@ -2375,10 +3010,43 @@ bool batch_box(ScreenBox &box) {
 }
 
 bool is_sun_box_draw(bool textured) {
-    if (textured && g_sun_box.valid && g_sun_copy != UINT32_MAX &&
-        target_key((cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u)) == g_sun_copy)
-        return true;
+    // A draw sampling the box's copy (the glare) in a frame whose box was seen.
+    const bool samples_copy = textured && g_sun_copy != UINT32_MAX &&
+                              target_key((cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u)) == g_sun_copy;
+    if (samples_copy && g_sun_box.valid) return true;
+    // And in a frame whose box was not seen (2026-11-14: the sun partly off
+    // screen, at the Airport's sunset, left the glare drawn from the black
+    // copy: a black square), when the copy is the small target (g_sun_copy
+    // is at times the bloom buffer, whose draws stay as they were).
+    const std::uint32_t sampled_key = target_key((cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u));
+    if (textured && !g_sun_box.valid && g_sun_small_copy != UINT32_MAX && sampled_key == g_sun_small_copy &&
+        target_key(cmd(0x9Cu)) != g_sun_small_copy) {
+        const auto copy = g_targets.find(g_sun_small_copy);
+        if (copy != g_targets.end() && copy->second.width <= 256 && copy->second.height <= 256) {
+            static const bool trace = std::getenv("PSPRECOMP_BURNOUT_SUN_TRACE") != nullptr;
+            if (trace)
+                std::fprintf(stderr, "[sun] frame %llu: copy %06X sampled onto %06X without a box (vtype %06X, %u vertices)\n",
+                             static_cast<unsigned long long>(g_stats.frames), g_sun_small_copy, target_key(cmd(0x9Cu)), g_batch_vtype, g_batch_count);
+            return true;
+        }
+    }
     ScreenBox box;
+    // The glare drawn from the box's copy (2026-11-14): a draw sampling a
+    // small render target, centred across on the box measured this frame.
+    // Recognised by itself: the copy is a 2D draw held to the end of the
+    // frame, so on a race's first frames g_sun_copy was not known yet (the
+    // bright rectangle in the sky at the start of a race).
+    if (textured && g_sun_box.valid && batch_box(box)) {
+        const std::uint32_t sampled = target_key((cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u));
+        const auto target = g_targets.find(sampled);
+        const float centre = (box.x0 + box.x1) * 0.5f, sun_centre = (g_sun_box.x0 + g_sun_box.x1) * 0.5f;
+        if (target != g_targets.end() && sampled != target_key(cmd(0x9Cu)) && target->second.width <= 256 &&
+            target->second.height <= 256 && std::abs(centre - sun_centre) <= 3.0f && box.y0 <= g_sun_box.y1) {
+            g_sun_copy = sampled;
+            g_sun_small_copy = sampled;  // (width and height <= 256, checked above)
+            return true;
+        }
+    }
     if (g_batch_count > 8u || !batch_box(box)) return false;
     if (!textured && (cmd(0x21u) & 1u) == 0u && (cmd(0x24u) & 1u) != 0u && box.x1 - box.x0 <= 64.0f &&
         box.y1 - box.y0 <= 64.0f && g_layout.col_size == 4u) {
@@ -2400,6 +3068,9 @@ bool is_sun_box_draw(bool textured) {
         if (target_key(cmd(0x9Cu)) != target_key(texture) && g_targets.count(target_key(texture)) != 0u && batch_uv_box(uv) &&
             close_to(uv.x0, g_sun_box.x0) && close_to(uv.y0, g_sun_box.y0) && close_to(uv.x1, g_sun_box.x1) && close_to(uv.y1, g_sun_box.y1)) {
             g_sun_copy = target_key(cmd(0x9Cu));  // the copy itself is harmless
+            if (const auto copy = g_targets.find(g_sun_copy);
+                copy != g_targets.end() && copy->second.width <= 256 && copy->second.height <= 256)
+                g_sun_small_copy = g_sun_copy;
             return false;
         }
     }
@@ -2558,6 +3229,9 @@ void bind_vertices() {
 struct SnapshotHeader {
     std::uint32_t index_bytes{UINT32_MAX}, vertex_bytes{UINT32_MAX}, vertex_offset{};
     std::uint32_t index_in_guest{};  // the index part (palette) is read from guest memory
+    // What the record was made for (the command, and the vertex or palette
+    // address then): the worker checks it is the command it is drawing.
+    std::uint32_t tag_word{}, tag_address{};
 };
 
 const std::uint8_t *g_snapshot{};
@@ -2841,6 +3515,43 @@ const std::uint8_t *skin_cached(const std::uint8_t *raw, std::uint32_t count, st
     return entry.result.data();
 }
 
+// PC tool (tools/make_liveries.py): the triangles drawn with a car livery
+// texture (256x256, 8-bit CLUT), in the model's space with their texture
+// coordinates, appended to $PSPRECOMP_BURNOUT_DUMP_CAR_UV as text:
+//   T <texture address> <quick hash of its texels>, then "x y z u v" per corner.
+void dump_car_triangles(psprecomp::GuestMemory &memory, const std::uint8_t *raw, const VertexLayout &layout, std::uint32_t vtype,
+                        std::uint32_t primitive, std::uint32_t count, const std::uint32_t *indices) {
+    static std::FILE *out = [] {
+        const char *path = std::getenv("PSPRECOMP_BURNOUT_DUMP_CAR_UV");
+        return path != nullptr ? std::fopen(path, "w") : nullptr;
+    }();
+    if (out == nullptr || count < 3u || (cmd(0xC3u) & 0xFu) != 5u || (cmd(0xB8u) & 0xF0Fu) != 0x808u) return;
+    const std::uint32_t tc = vtype & 3u, pos = (vtype >> 7u) & 3u;
+    if (tc == 0u || ((vtype >> 9u) & 3u) != 0u || (vtype & 0x800000u) != 0u) return;  // untextured, skinned or 2D
+    const std::uint32_t address = (cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u);
+    const std::uint8_t *texels = memory.raw_pointer(address, 65536u);
+    if (texels == nullptr) return;
+    const std::uint32_t hash = texture_pack::quick_hash(texels, 65536u, (address & 15u) == 0u);
+    const float pos_scale = pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f;
+    const float tc_scale = tc == 1u ? 1.0f / 128.0f : tc == 2u ? 1.0f / 32768.0f : 1.0f;
+    const float su = float24(cmd(0x48u)), sv = float24(cmd(0x49u)), ou = float24(cmd(0x4Au)), ov = float24(cmd(0x4Bu));
+    const auto corner = [&](std::uint32_t i) {
+        const std::uint32_t v = indices != nullptr ? indices[i] : i;
+        const std::uint8_t *at = raw + static_cast<std::size_t>(v) * layout.stride;
+        std::fprintf(out, "%g %g %g %g %g\n", component(at + layout.pos, pos, 0u, true) * pos_scale,
+                     component(at + layout.pos, pos, 1u, true) * pos_scale, component(at + layout.pos, pos, 2u, true) * pos_scale,
+                     component(at + layout.tc, tc, 0u, false) * tc_scale * su + ou, component(at + layout.tc, tc, 1u, false) * tc_scale * sv + ov);
+    };
+    std::fprintf(out, "T %08x %08x\n", address, hash);
+    for (std::uint32_t i = 2; i < count; ++i) {
+        if (primitive == 3u && i % 3u != 2u) continue;  // list: every third
+        const std::uint32_t a = primitive == 5u ? 0u : i - 2u, b = i - 1u;
+        corner(a);
+        corner(b);
+        corner(i);
+    }
+}
+
 bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     phase = 1u;
     const std::uint32_t primitive = (data >> 16u) & 7u;
@@ -2882,7 +3593,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
 
     const bool lit = !through && (cmd(0x17u) & 1u) != 0u;
 
-    phase = 2u;
+    phase = 1u;
     std::uint32_t max_vertex = 0u;
     static ScratchVector<std::uint32_t> indices;
     indices.resize(count);
@@ -2902,11 +3613,12 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
             max_vertex = std::max(max_vertex, indices[i]);
         }
     }
-    phase = 3u;
+    phase = 1u;
     const std::uint32_t vertex_count = count == 0u ? 0u : max_vertex + 1u;
     const std::uint8_t *raw = guest_bytes(memory, g_vertex_address, vertex_count * stride, true);
     if (raw == nullptr) { ++g_stats.skipped_primitives; return false; }
-    static const bool foliage_stats = std::getenv("PSPRECOMP_BURNOUT_FOLIAGE_STATS") != nullptr || g_thin_foliage;
+    dump_car_triangles(memory, raw, psp_layout, psp_vtype, primitive, count, index != 0u ? indices.data() : nullptr);
+    static const bool foliage_stats =std::getenv("PSPRECOMP_BURNOUT_FOLIAGE_STATS") != nullptr || g_thin_foliage;
     if ((g_thin_foliage || foliage_stats) && weights == 0u && !through && (cmd(0x1Eu) & 1u) != 0u && (cmd(0x22u) & 1u) != 0u &&
         (cmd(0xDBu) & 7u) != 1u && (cmd(0x21u) & 1u) == 0u && vertex_count != 0u &&
         g_foliage_addresses.count((cmd(0xA0u) & 0xFFFFF0u) | ((cmd(0xA8u) << 8u) & 0x0F000000u)) != 0u) {
@@ -3003,7 +3715,9 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
     if (lit) g_stats.lit_vertices += vertex_count;
     // Indexed batch: the PRIM's vertices are appended once and triangles index
     // them.
-    const std::size_t worst = flat ? static_cast<std::size_t>(count) * 3u
+    // (Flat: the PRIM's vertices once, plus three per triangle whose
+    // vertices differ in colour or normal.)
+    const std::size_t worst = flat ? static_cast<std::size_t>(vertex_count) + static_cast<std::size_t>(count) * 3u
         : primitive == 6u ? static_cast<std::size_t>(count) * 2u : vertex_count;
     if (g_batch_count + worst > 65535u) {
         flush();
@@ -3012,7 +3726,9 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         g_batch_min_alpha = 255u;
         g_batch_world = world_applied;
     }
-    if (!g_keep_discard) {
+    // (Only read by flush when the alpha test is on, which a batch keeps:
+    // turning it on or off ends the batch.)
+    if (!g_keep_discard && (cmd(0x22u) & 1u) != 0u) {
         // A lower bound of what the PSP takes as the colour's alpha: the
         // vertex colours when there are any, and the material ambient alpha
         // (unlit without colours, or lit) either way.
@@ -3061,16 +3777,28 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         next[2] = static_cast<std::uint16_t>(c);
         next += 3;
     };
-    phase = 4u;
+    phase = 1u;
     if (in_place) {
         g_batch_count += vertex_count;
-    } else if (!flat && primitive != 6u) {
+    } else if (primitive != 6u) {
         std::uint8_t *dst = append_vertices(vertex_count);
         if (out.same_as_psp) std::memcpy(dst, raw, static_cast<std::size_t>(vertex_count) * vertex_stride);
         else copy_vertices(dst, raw, vertex_count, out, layout);
     }
+    // Flat shading: a triangle whose three vertices have the same colour and
+    // normal looks the same smooth, so it indexes the PRIM's vertices (copied
+    // above) like a smooth one (2026-11-13: ~96 % of Burnout's flat
+    // triangles, ~900 a frame in races, were copied vertex by vertex).
+    const std::uint32_t flat_col = (vtype >> 2u) & 7u, flat_nrm = (vtype >> 5u) & 3u;
+    const std::size_t flat_col_size = flat_col == 7u ? 4u : flat_col >= 4u ? 2u : 0u;
+    const std::size_t flat_nrm_size = flat_nrm == 0u ? 0u : flat_nrm == 1u ? 3u : flat_nrm == 2u ? 6u : 12u;
+    const auto same_look = [&](std::uint32_t a, std::uint32_t c) {
+        const std::uint8_t *va = vertex(a), *vc = vertex(c);
+        return std::memcmp(va + layout.col, vc + layout.col, flat_col_size) == 0 &&
+               std::memcmp(va + layout.nrm, vc + layout.nrm, flat_nrm_size) == 0;
+    };
     const auto emit = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
-        if (flat) {
+        if (flat && !(same_look(indices[a], indices[c]) && same_look(indices[b], indices[c]))) {
             // The last vertex gives the colour (and the normal it is lit with).
             const auto first = static_cast<std::uint16_t>(g_batch_count);
             std::uint8_t *dst = append_vertices(3u);
@@ -3097,6 +3825,8 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
         phase = 0u;
         return true;
     }
+    // Sampled: 13 flat-shaded copies, 4 sprites, 2 indexed (5 above: runs).
+    phase = flat ? 13u : primitive == 6u ? 4u : 2u;
     switch (primitive) {
     case 3u:
         for (std::uint32_t i = 0; i + 2u < count; i += 3u) emit(i, i + 1u, i + 2u);
@@ -3149,6 +3879,7 @@ bool decode_prim(psprecomp::GuestMemory &memory, std::uint32_t data) {
 bool batch_neutral(std::uint32_t op) noexcept {
     switch (op) {
     case 0x00u: case 0x01u: case 0x02u: case 0x03u: case 0x04u: case 0x08u: case 0x0Au: case 0x0Bu: case 0x0Cu:
+    case 0x07u: case 0x09u:  // BBOX, BJUMP
     case 0x0Eu: case 0x0Fu: case 0x10u: case 0x13u: case 0x14u:
     case 0x2Au: case 0x2Bu:  // bones: skinning is applied as vertices are decoded
         return true;
@@ -3159,6 +3890,7 @@ bool batch_neutral(std::uint32_t op) noexcept {
 
 // ---------------------------------------------------------------- GL thread side
 
+double g_decode_waited_gl_ms{};  // decode thread, in submit_frame
 struct GlThread {
     SyncMutex mutex{"ge_gl"};  // finish() may run on the SCE main thread
     SyncCondition cv{"ge_gl", mutex};
@@ -3182,6 +3914,13 @@ std::atomic<double> g_gl_busy_ms{0.0}, g_gl_present_ms{0.0};
 
 // Once per frame, as its present is recorded: the next frame's resolution.
 void update_dynamic_resolution() {
+    // A picture without 3D (menus): the filters left out. Counted whether or
+    // not the resolution is dynamic (2026-11-14: the test builds, fixed
+    // resolution, never left "menus" and never showed a filter).
+    static int flat_frames = 0;
+    flat_frames = g_frame_3d_draws == 0u ? flat_frames + 1 : 0;
+    g_frame_flat.store(flat_frames >= 2, std::memory_order_relaxed);
+    g_frame_3d_draws = 0u;
     if (!g_dynamic_resolution) return;
     static double last_present = 0.0, smooth = 0.0;
     static int calm = 0, hold = 0, ceiling = 0, ceiling_frames = 0;
@@ -3201,9 +3940,6 @@ void update_dynamic_resolution() {
     last_wall = now_wall;
     ++at_level[g_dynamic_q];
     ++frames;
-    static int flat_frames = 0;
-    flat_frames = g_frame_3d_draws == 0u ? flat_frames + 1 : 0;
-    g_frame_3d_draws = 0u;
     if (ceiling_frames > 0 && --ceiling_frames == 0) ceiling = g_scale;
     static const bool test = std::getenv("PSPRECOMP_BURNOUT_DYNAMIC_TEST") != nullptr;
     if (g_dynamic_pin != 0) {
@@ -3241,7 +3977,7 @@ void update_dynamic_resolution() {
     if (frames % 300u == 0u) {
         std::string line = "dynamic resolution: now " + std::to_string(480 * g_dynamic_q / 8) + "x" + std::to_string(272 * g_dynamic_q / 8) +
                            ", frames by width:";
-        for (int q = g_scale; q >= g_dynamic_min; --q)
+        for (int q = g_scale; q >= 8; --q)
             if (at_level[q] != 0u) line += " " + std::to_string(480 * q / 8) + ":" + std::to_string(at_level[q]);
         trace(line.c_str());
         for (auto &n : at_level) n = 0u;
@@ -3250,9 +3986,100 @@ void update_dynamic_resolution() {
 // GL thread breakdown (gl-74): draws issued, the vertex/index preparation
 // (index expansion and copies to GPU memory) and the draws past the budget.
 std::atomic<double> g_gl_upload_ms{0.0}, g_gl_draw_ms{0.0};
+// PERF builds: the GL thread's draw path split (ms, bytes), for the vitaGL
+// fast path work (PERF_LOG 2026-11-13). GL thread only.
+double g_pf_hash_ms{}, g_pf_expand_ms{}, g_pf_scratch_ms{}, g_pf_uniform_ms{};
+double g_pf_entry_ms{}, g_pf_runs_hash_ms{}, g_pf_lookup_ms{}, g_pf_bind_ms{};  // more of the upload part (2026-11-13)
+// These detail timers, the per-op times, the GL state census and vitaGL's
+// draw profile cost the GL thread several ms a frame themselves: only with
+// ux0:data/burnout/gl_detail.txt (PC: PSPRECOMP_BURNOUT_GL_DETAIL).
+const bool g_gl_detail = [] {
+#if defined(__vita__)
+    std::FILE *f = std::fopen("ux0:data/burnout/gl_detail.txt", "rb");
+    if (f != nullptr) std::fclose(f);
+    return f != nullptr;
+#else
+    return std::getenv("PSPRECOMP_BURNOUT_GL_DETAIL") != nullptr;
+#endif
+}();
+// Every draw timed (as before 2026-11-13): with the detail, or
+// ux0:data/burnout/time_every_draw.txt to compare.
+const bool g_gl_time_every_draw = [] {
+#if defined(__vita__)
+    std::FILE *f = std::fopen("ux0:data/burnout/time_every_draw.txt", "rb");
+    if (f != nullptr) std::fclose(f);
+    return g_gl_detail || f != nullptr;
+#else
+    return g_gl_detail;
+#endif
+}();
+std::uint64_t g_pf_hash_bytes{}, g_pf_scratch_bytes{}, g_pf_dynamic_draws{};
 std::atomic<std::uint64_t> g_gl_draws{0u}, g_gl_budget_dropped{0u};
 std::uint32_t g_draw_budget{[] { const char *v = std::getenv("PSPRECOMP_BURNOUT_DRAW_BUDGET"); return v != nullptr ? static_cast<std::uint32_t>(std::atoi(v)) : 0u; }()};  // test: draws past this in a frame are not drawn (0: all)
 std::uint32_t g_gl_frame_draws{};
+
+// A texture rewritten every frame (the menu movie) and updated in place: on
+// the Vita each update of a texture the GPU drew in the last 4 frames got a
+// new copy from vitaGL (1 MiB for the movie; the old one freed 4 frames
+// later). With the pools full vitaGL waited 1 s per garbage collection and
+// the game ended (0.0.43 and 0.0.46 after a while in the main menu). Such a
+// texture now rotates through a few GL textures of its own: each update goes
+// to one the GPU has not used for 5 frames, written where it is.
+struct TextureRing {
+    static constexpr int kSize = 6;
+    GLuint names[kSize]{};
+    std::uint64_t left[kSize]{};  // frame it stopped being the one drawn
+    int count = 0, current = -1;
+};
+std::unordered_map<GLuint, TextureRing> g_rings;  // by the decode thread's texture id
+std::uint64_t g_gl_present_count{};
+std::uint64_t g_ring_rotations{}, g_ring_waits{};
+
+GLuint gl_texture(GLuint id);
+// True (once) for a ring texture never given its size: TexImage allocates it.
+std::unordered_map<GLuint, std::uint64_t> g_ring_sizes;  // GL name -> width << 32 | height
+bool fresh_ring_texture(GLuint name, std::uint32_t width, std::uint32_t height) {
+    if (g_rings.empty()) return false;
+    const std::uint64_t size = static_cast<std::uint64_t>(width) << 32u | height;
+    for (auto &[id, ring] : g_rings)
+        for (int i = 1; i < ring.count; ++i)
+            if (ring.names[i] == name) {
+                auto [it, inserted] = g_ring_sizes.try_emplace(name, size);
+                if (!inserted && it->second == size) return false;
+                it->second = size;
+                return true;
+            }
+    return false;
+}
+
+void rotate_texture(GLuint id) {
+    TextureRing &ring = g_rings[id];
+    int next = -1;
+    for (int i = 0; i < ring.count && next < 0; ++i) {
+        const int at = (ring.current + 1 + i) % ring.count;
+        if (at != ring.current && ring.left[at] + 5u <= g_gl_present_count) next = at;
+    }
+    if (next < 0 && ring.count < TextureRing::kSize) {
+        // The first slot is the texture as it was (already the right size).
+        if (ring.count == 0) {
+            ring.names[0] = gl_texture(id);
+            ring.left[0] = g_gl_present_count;
+            ring.count = 1;
+            ring.current = 0;
+        }
+        glGenTextures(1, &ring.names[ring.count]);
+        next = ring.count++;
+    }
+    if (next < 0) {
+        ++g_ring_waits;  // every one drawn lately: updated in place (vitaGL copies)
+        return;
+    }
+    if (ring.current >= 0) ring.left[ring.current] = g_gl_present_count;
+    ring.current = next;
+    ++g_ring_rotations;
+    g_gl_textures[id] = ring.names[next];
+    glBindTexture(GL_TEXTURE_2D, ring.names[next]);
+}
 
 GLuint gl_texture(GLuint id) {
     if (id >= g_gl_textures.size()) g_gl_textures.resize(id + 1u, 0u);
@@ -3411,7 +4238,11 @@ constexpr std::uint32_t kKnownVariants[]{
     0x005C00u, 0x005C02u, 0x00C602u, 0x01C626u, 0x024400u, 0x1A0000u, 0x1A4400u, 0x1A4540u,
     0x1A4740u, 0x1E440Du, 0x1E4540u, 0x21C626u, 0x62C602u, 0x7AC602u, 0x380040Du, 0x404740u, 0x005E00u, 0x000200u,
     // Met in free play on the US tracks (gl-47 log, 0.6-1.7 s each mid-race).
-    0x605C00u, 0x600000u, 0x605C02u, 0x600002u, 0x7EC602u, 0x1E4400u, 0x7E5C00u, 0x7E0000u};
+    0x605C00u, 0x600000u, 0x605C02u, 0x600002u, 0x7EC602u, 0x1E4400u, 0x7E5C00u, 0x7E0000u,
+    // Compiled mid-race by 0.0.1 on a fresh install (a 5.4 s freeze at the
+    // start of the first race, shader_variants.txt of the test console).
+    0x60C602u, 0x41A4740u, 0x81A4740u, 0x81A4400u, 0x81E4540u, 0x81E440Du, 0x87AC602u, 0x004540u, 0x81E4400u, 0x81A4540u,
+    0x87E5C00u};  // Waterfront, 0.0.2 test
 
 void compile_remembered_variants() {
     if (g_variant_list.empty()) return;
@@ -3472,6 +4303,85 @@ void expand_indices(std::uint16_t *out, const std::uint32_t *runs, std::uint32_t
     }
 }
 
+// Static geometry in GPU buffers (GL thread). A draw of guest vertices drawn
+// in place (the track, the cars' bodies: in_frame 0) was copied into GPU
+// scratch memory with its expanded indices every frame (vertex+index upload,
+// 6-8 ms a frame on the Vita's GL thread, beside the GE front end since
+// 0.0.38). The same vertices with the same runs keep a vertex and an index
+// buffer. A hash of the vertices catches the track streaming new geometry
+// into the same place, and the game's own changes in place; unused
+// buffers go after 300 frames, or sooner past the budget.
+// PC: PSPRECOMP_BURNOUT_NO_STATIC_VBO.
+struct StaticGeometry {
+    GLuint vertex_buffer{}, index_buffer{};
+    std::uint64_t probe{};
+    std::uint32_t bytes{}, index_bytes{};
+    std::uint64_t used{};
+    std::uint32_t changes{};  // times its vertices were found rewritten
+    bool changing{};          // rewritten again and again: copied each frame instead
+};
+struct GeometryKey {
+    std::uintptr_t pointer{};
+    std::uint32_t bytes{}, index_count{};
+    std::uint64_t runs{};
+    bool operator==(const GeometryKey &o) const noexcept {
+        return pointer == o.pointer && bytes == o.bytes && index_count == o.index_count && runs == o.runs;
+    }
+};
+struct GeometryKeyHash {
+    std::size_t operator()(const GeometryKey &k) const noexcept {
+        std::uint64_t h = static_cast<std::uint64_t>(k.pointer) * 0x9E3779B97F4A7C15ull;
+        h ^= (static_cast<std::uint64_t>(k.bytes) << 32u | k.index_count) + 0x632BE59BD9B4E019ull + (h << 6u) + (h >> 2u);
+        h ^= k.runs + (h << 6u) + (h >> 2u);
+        return static_cast<std::size_t>(h ^ (h >> 31u));
+    }
+};
+const bool g_static_vbo = std::getenv("PSPRECOMP_BURNOUT_NO_STATIC_VBO") == nullptr;
+std::unordered_map<GeometryKey, StaticGeometry, GeometryKeyHash> g_geometry;
+std::uint64_t g_geometry_frame{}, g_geometry_bytes{};
+// Static geometry: a known piece's vertices hashed once in this many frames
+// (set_probe_every; PSPRECOMP_BURNOUT_PROBE_EVERY on the PC).
+std::uint32_t g_probe_every = [] {
+    const char *v = std::getenv("PSPRECOMP_BURNOUT_PROBE_EVERY");
+    return v != nullptr ? static_cast<std::uint32_t>(std::max(1, std::atoi(v))) : 1u;
+}();
+std::uint64_t g_geometry_hits{}, g_geometry_misses{}, g_geometry_stale{};
+// Pieces whose vertices changed once (by address, kept across evictions):
+// hashed every frame from then on, whatever g_probe_every (2026-11-13: with
+// one check in 4 frames, a piece the game rewrites, the road's colours in a
+// tunnel, was drawn stale 3 frames in 4 until it counted 3 changes: flicker).
+std::unordered_set<std::uintptr_t> g_geometry_ever_changed;
+std::uint64_t g_geometry_late{};  // changes first seen by a staggered check (shown up to N-1 frames late)
+std::uint32_t g_geometry_count{};  // g_geometry.size(), for the log (another thread)
+constexpr std::uint64_t kGeometryBudget = 24ull << 20u;
+
+std::uint64_t runs_hash(const std::uint32_t *runs, std::uint32_t run_words, const std::uint16_t *explicit_indices) noexcept {
+    std::uint64_t h = 0xCBF29CE484222325ull ^ run_words;
+    for (std::uint32_t r = 0; r < run_words; ++r) h = (h ^ runs[r]) * 0x100000001B3ull;
+    // Explicit indices (runs of other kinds): their values too.
+    for (std::uint32_t r = 0; r + 1u < run_words; r += 2u) {
+        const std::uint32_t first = runs[r], count = runs[r + 1u] & 0xFFFFFFu, kind = runs[r + 1u] >> 24u;
+        if (kind == 3u || kind == 4u || kind == 5u) continue;
+        for (std::uint32_t i = 0; i < count; ++i) h = (h ^ explicit_indices[first + i]) * 0x100000001B3ull;
+    }
+    return h;
+}
+
+void evict_geometry(bool all) {
+    for (auto it = g_geometry.begin(); it != g_geometry.end();) {
+        StaticGeometry &g = it->second;
+        if (all || g.used + 300u < g_geometry_frame || (g_geometry_bytes > kGeometryBudget && g.used + 2u < g_geometry_frame)) {
+            glDeleteBuffers(1, &g.vertex_buffer);
+            glDeleteBuffers(1, &g.index_buffer);
+            g_geometry_bytes -= std::min<std::uint64_t>(g_geometry_bytes, g.bytes + g.index_bytes);
+            it = g_geometry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g_geometry_count = static_cast<std::uint32_t>(g_geometry.size());
+}
+
 void draw_body(const Frame &frame, const std::uint32_t *a, double started);
 void draw(const Frame &frame, const std::uint32_t *a) {
     if (g_draw_budget != 0u && g_gl_frame_draws >= g_draw_budget) {
@@ -3480,9 +4390,15 @@ void draw(const Frame &frame, const std::uint32_t *a) {
     }
     ++g_gl_frame_draws;
     g_gl_draws.store(g_gl_draws.load() + 1u);
-    const double started = host_now_ms();
+    // A clock read costs ~0.9 us on the Vita and this took three a draw
+    // (~1.2 ms a race frame on core 2, 2026-11-13): one draw in 16 is timed
+    // and counts for 16 (every draw in the detailed measure).
+    static std::uint32_t draws = 0u;
+    const bool timed = g_gl_time_every_draw || (++draws & 15u) == 0u;
+    const double weight = g_gl_time_every_draw ? 1.0 : 16.0;
+    const double started = timed ? host_now_ms() : 0.0;
     draw_body(frame, a, started);
-    g_gl_draw_ms.store(g_gl_draw_ms.load() + host_now_ms() - started);
+    if (timed) g_gl_draw_ms.store(g_gl_draw_ms.load() + (host_now_ms() - started) * weight);
 }
 void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
     const std::uint32_t in_frame = a[0], source = a[1], bytes = a[2], stride = a[3], attribs_at = a[4];
@@ -3495,36 +4411,147 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
     }
     std::array<AttribSetup, 4> attribs;
     std::memcpy(attribs.data(), frame.data.data() + attribs_at, sizeof(attribs));
+    const auto *runs = reinterpret_cast<const std::uint32_t *>(frame.data.data() + runs_at);
+    const auto *explicit_indices = reinterpret_cast<const std::uint16_t *>(frame.data.data() + explicit_at);
     static std::vector<std::uint16_t> expanded;
-    expanded.resize(index_count);
-    expand_indices(expanded.data(), reinterpret_cast<const std::uint32_t *>(frame.data.data() + runs_at), run_words,
-                   reinterpret_cast<const std::uint16_t *>(frame.data.data() + explicit_at));
-    const void *indices = expanded.data();
-    std::uintptr_t base = reinterpret_cast<std::uintptr_t>(vertices);
-#if defined(__vita__)
-    // One copy into GPU-visible scratch memory, wrapped as a vertex buffer:
-    // vitaGL then draws from it instead of copying every attribute stream.
-    if (void *gpu = vglAllocFromScratch(bytes)) {
-        std::memcpy(gpu, vertices, bytes);
-        glBindBuffer(GL_ARRAY_BUFFER, g_vertex_buffer);
-        vglBufferData(GL_ARRAY_BUFFER, gpu);
-        base = 0u;
-    } else {
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    const void *indices = nullptr;
+    std::uintptr_t base = 0u;
+    bool cached = false;
+    static bool vbo_failed = false;  // the GPU heap refused a buffer once: copies from then on
+    PERF_ONLY(const double setup_started = g_gl_detail ? host_now_ms() : 0.0; if (g_gl_detail) g_pf_entry_ms += setup_started - started);
+    if (g_static_vbo && !vbo_failed && in_frame == 0u && bytes >= 256u && index_count != 0u) {
+        const GeometryKey key{reinterpret_cast<std::uintptr_t>(vertices), bytes, index_count,
+                              runs_hash(runs, run_words, explicit_indices)};
+        PERF_ONLY(if (g_gl_detail) g_pf_runs_hash_ms += host_now_ms() - setup_started);
+        // The whole of the vertices: the game changes a few bytes of some in
+        // place (the road's colours in Waterfront's tunnel), which a sparse
+        // probe missed.
+        PERF_ONLY(const double lookup_started = g_gl_detail ? host_now_ms() : 0.0);
+        auto [it, inserted] = g_geometry.try_emplace(key);
+        StaticGeometry &g = it->second;
+        PERF_ONLY(if (g_gl_detail) g_pf_lookup_ms += host_now_ms() - lookup_started);
+        // (2026-11-11, optimisation: the whole hash every frame cost the
+        // Vita's GL thread a large part of its 12-14 ms of "vertex+index
+        // upload" in races. With g_probe_every N, a known piece is hashed
+        // once in N frames, staggered by its address: a change shows at most
+        // N-1 frames late.)
+        const auto address = reinterpret_cast<std::uintptr_t>(vertices);
+        const bool every_frame = g_probe_every <= 1u || inserted || g.changing || g.changes != 0u ||
+                                 (g_probe_every > 1u && g_geometry_ever_changed.count(address) != 0u);
+        const bool check = every_frame || (g_geometry_frame + (address >> 6u)) % g_probe_every == 0u;
+        PERF_ONLY(const double hash_started = g_gl_detail ? host_now_ms() : 0.0);
+        const std::uint64_t probe = check ? fnv(vertices, bytes, 0x9AE16A3B2F90404Full ^ bytes) : g.probe;
+        PERF_ONLY(if (g_gl_detail) { g_pf_hash_ms += host_now_ms() - hash_started; if (check) g_pf_hash_bytes += bytes; });
+        if (!inserted && g.probe != probe && g_probe_every > 1u && g_geometry_ever_changed.insert(address).second && !every_frame)
+            ++g_geometry_late;
+        if (!inserted && !g.changing && g.probe != probe && ++g.changes >= 3u) {
+            // Rewritten frame after frame (a moving piece of a menu): a new GPU
+            // buffer each frame made vitaGL allocate and free one per frame.
+            // Copied each frame like other changing geometry instead.
+            g.changing = true;
+            glDeleteBuffers(1, &g.vertex_buffer);
+            glDeleteBuffers(1, &g.index_buffer);
+            g.vertex_buffer = g.index_buffer = 0u;
+            g_geometry_bytes -= std::min<std::uint64_t>(g_geometry_bytes, g.bytes + g.index_bytes);
+            g.bytes = g.index_bytes = 0u;
+        }
+        if (g.changing) {
+            g.used = g_geometry_frame;
+        } else if (!inserted && g.probe == probe) {
+            ++g_geometry_hits;
+        } else {
+            if (inserted) {
+                glGenBuffers(1, &g.vertex_buffer);
+                glGenBuffers(1, &g.index_buffer);
+                ++g_geometry_misses;
+                g_geometry_count = static_cast<std::uint32_t>(g_geometry.size());
+            } else {
+                ++g_geometry_stale;  // new data in the same place (streaming)
+                g_geometry_bytes -= std::min<std::uint64_t>(g_geometry_bytes, g.bytes + g.index_bytes);
+            }
+            expanded.resize(index_count);
+            expand_indices(expanded.data(), runs, run_words, explicit_indices);
+            while (glGetError() != GL_NO_ERROR) {}  // earlier errors are not this buffer's
+            glBindBuffer(GL_ARRAY_BUFFER, g.vertex_buffer);
+            glBufferData(GL_ARRAY_BUFFER, bytes, vertices, GL_STATIC_DRAW);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.index_buffer);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, index_count * sizeof(std::uint16_t), expanded.data(), GL_STATIC_DRAW);
+            if (glGetError() != GL_NO_ERROR) {
+                vbo_failed = true;
+                trace("static geometry: a GPU buffer could not be made, copies from now on");
+            } else {
+                g.probe = probe;
+                g.bytes = bytes;
+                g.index_bytes = index_count * 2u;
+                g_geometry_bytes += g.bytes + g.index_bytes;
+            }
+        }
+        if (g.changing) {
+        } else if (vbo_failed) {
+            evict_geometry(true);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        } else {
+            PERF_ONLY(const double bind_started = g_gl_detail ? host_now_ms() : 0.0);
+            g.used = g_geometry_frame;
+            glBindBuffer(GL_ARRAY_BUFFER, g.vertex_buffer);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.index_buffer);
+            cached = true;
+            PERF_ONLY(if (g_gl_detail) g_pf_bind_ms += host_now_ms() - bind_started);
+        }
     }
-    const std::size_t index_bytes = index_count * sizeof(std::uint16_t);
-    if (void *gpu = vglAllocFromScratch(index_bytes)) {
-        std::memcpy(gpu, indices, index_bytes);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_index_buffer);
-        vglBufferData(GL_ELEMENT_ARRAY_BUFFER, gpu);
-        indices = nullptr;
-    } else {
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    // Other draws (2D, present, filters) give client pointers: no buffer
+    // left bound after this one.
+    struct Unbind {
+        bool on;
+        ~Unbind() {
+            if (!on) return;
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        }
+    } unbind{cached};
+    if (!cached) {
+        PERF_ONLY(const double expand_started = g_gl_detail ? host_now_ms() : 0.0; ++g_pf_dynamic_draws);
+        expanded.resize(index_count);
+        expand_indices(expanded.data(), runs, run_words, explicit_indices);
+        indices = expanded.data();
+        base = reinterpret_cast<std::uintptr_t>(vertices);
+        PERF_ONLY(if (g_gl_detail) g_pf_expand_ms += host_now_ms() - expand_started);
+    }
+#if defined(__vita__)
+    PERF_ONLY(const double scratch_started = g_gl_detail ? host_now_ms() : 0.0);
+    PERF_ONLY(if (!cached) g_pf_scratch_bytes += bytes + index_count * sizeof(std::uint16_t));
+    if (!cached) {
+        // One copy into GPU-visible scratch memory, wrapped as a vertex buffer:
+        // vitaGL then draws from it instead of copying every attribute stream.
+        if (void *gpu = vglAllocFromScratch(bytes)) {
+            sceClibMemcpy(gpu, vertices, bytes);  // the system NEON copy (newlib's: ~110 MB/s here)
+            glBindBuffer(GL_ARRAY_BUFFER, g_vertex_buffer);
+            vglBufferData(GL_ARRAY_BUFFER, gpu);
+            base = 0u;
+        } else {
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        }
+        const std::size_t index_bytes = index_count * sizeof(std::uint16_t);
+        if (void *gpu = vglAllocFromScratch(index_bytes)) {
+            sceClibMemcpy(gpu, indices, index_bytes);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_index_buffer);
+            vglBufferData(GL_ELEMENT_ARRAY_BUFFER, gpu);
+            indices = nullptr;
+        } else {
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        }
     }
 #else
-    (void)bytes;
+    if (!cached) {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
 #endif
-    g_gl_upload_ms.store(g_gl_upload_ms.load() + host_now_ms() - started);
+#if defined(__vita__)
+    PERF_ONLY(if (g_gl_detail) g_pf_scratch_ms += host_now_ms() - scratch_started);
+#endif
+    if (started != 0.0) g_gl_upload_ms.store(g_gl_upload_ms.load() + (host_now_ms() - started) * (g_gl_time_every_draw ? 1.0 : 16.0));
     for (GLuint i = 0; i < 4u; ++i) {
         const AttribSetup &setup = attribs[i];
         if (setup.size == 0) {
@@ -3536,7 +4563,9 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
                                   static_cast<GLsizei>(stride), reinterpret_cast<const void *>(base + setup.offset));
         }
     }
+    PERF_ONLY(const double uniform_started = g_gl_detail ? host_now_ms() : 0.0);
     sync_uniforms();
+    PERF_ONLY(if (g_gl_detail) g_pf_uniform_ms += host_now_ms() - uniform_started);
     if (g_prepass_next) {
         g_prepass_next = false;
         // Depth only, with the alpha test's discard...
@@ -3684,55 +4713,149 @@ void draw_body(const Frame &frame, const std::uint32_t *a, double started) {
 }
 
 // GL thread: (re)builds the filter program when the request changed.
+// The last filter programs built, by fragment source (most recent first): the
+// Bonus menu's preview goes back and forth between a few combinations, and
+// building one costs the Vita 0.5-1.2 s.
+struct CachedFilter {
+    std::string fragment;
+    Program program;
+};
+std::vector<CachedFilter> g_filter_cache;
+constexpr std::size_t kFilterCacheSize = 8u;
+
+void build_filter(FilterProgram &out, const std::vector<int> &active, const char *what) {
+    out = FilterProgram{};
+    const std::string fragment = filters::fragment_shader(active);
+    if (fragment.empty()) {
+        trace((std::string(what) + ": none").c_str());
+        return;
+    }
+    const double started = host_now_ms();
+    const auto cached = std::find_if(g_filter_cache.begin(), g_filter_cache.end(), [&](const CachedFilter &c) { return c.fragment == fragment; });
+    if (cached != g_filter_cache.end()) {
+        std::rotate(g_filter_cache.begin(), cached, cached + 1);
+        out.program = g_filter_cache.front().program;
+    } else {
+        std::string error;
+        if (!link(out.program, kPresentVertexShader, fragment.c_str(), true, error, {}, true)) {
+            out = FilterProgram{};
+            trace((std::string(what) + ": " + filters::describe(active) + " FAILED: " + error).c_str());
+            return;
+        }
+        g_filter_cache.insert(g_filter_cache.begin(), CachedFilter{fragment, out.program});
+        if (g_filter_cache.size() > kFilterCacheSize) {
+            // Not one of the two in use.
+            for (auto it = g_filter_cache.end(); it != g_filter_cache.begin();) {
+                --it;
+                if (it->program.id != g_filter.program.id && it->program.id != g_card.program.id && it->program.id != out.program.id) {
+                    glDeleteProgram(it->program.id);
+                    g_filter_cache.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+    out.extent = glGetUniformLocation(out.program.id, "u_extent");
+    out.pixels = glGetUniformLocation(out.program.id, "u_pixels");
+    out.time = glGetUniformLocation(out.program.id, "u_time");
+    out.speed = glGetUniformLocation(out.program.id, "u_speed");
+    char line[256];
+    std::snprintf(line, sizeof(line), "%s: %s (built in %.0f ms)", what, filters::describe(active).c_str(), host_now_ms() - started);
+    trace(line);
+}
+
+// A ready-made postcard's texture (loaded once, a few kept), 0: none.
+GLuint postcard_image(int filter) {
+    if (g_postcard_dir.empty() || filter < 0 || filter >= static_cast<int>(filters::all().size())) return 0u;
+    const std::string id = filters::all()[static_cast<std::size_t>(filter)].id;
+    for (auto it = g_card_images.begin(); it != g_card_images.end(); ++it)
+        if (it->first == id) {
+            std::rotate(g_card_images.begin(), it, it + 1);
+            return g_card_images.front().second;
+        }
+    std::FILE *file = std::fopen((g_postcard_dir + "/" + id + ".jpg").c_str(), "rb");
+    if (file == nullptr) return 0u;
+    std::vector<std::uint8_t> bytes;
+    std::uint8_t chunk[16384];
+    for (std::size_t n; (n = std::fread(chunk, 1, sizeof(chunk), file)) > 0u;) bytes.insert(bytes.end(), chunk, chunk + n);
+    std::fclose(file);
+    int w = 0, h = 0, channels = 0;
+    stbi_uc *pixels = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 4);
+    if (pixels == nullptr) return 0u;
+    // Bottom row first (texture coordinates start at the bottom).
+    std::vector<std::uint8_t> rows(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
+    for (int y = 0; y < h; ++y)
+        std::memcpy(rows.data() + static_cast<std::size_t>(h - 1 - y) * static_cast<std::size_t>(w) * 4u,
+                    pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u, static_cast<std::size_t>(w) * 4u);
+    stbi_image_free(pixels);
+    GLuint texture = 0u;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rows.data());
+    g_gl_bound_texture = 0u;
+    g_card_images.insert(g_card_images.begin(), {id, texture});
+    if (g_card_images.size() > 6u) {
+        glDeleteTextures(1, &g_card_images.back().second);
+        g_card_images.pop_back();
+    }
+    trace(("postcard picture " + id).c_str());
+    return texture;
+}
+
 void update_filter_program() {
     const std::uint32_t version = g_filter_version.load(std::memory_order_acquire);
     if (version == g_filter_built) return;
     g_filter_built = version;
-    std::vector<int> active;
+    std::vector<int> active, card;
     {
         std::lock_guard lock(g_filter_mutex);
         active = g_filter_request;
+        card = g_card_request;
     }
-    if (g_filter.id != 0u) {
-        glDeleteProgram(g_filter.id);
-        g_filter = Program{};
+    static std::vector<int> built_active{-1}, built_card{-1};
+    if (active != built_active) {
+        built_active = active;
+        build_filter(g_filter, active, "filters");
     }
-    const std::string fragment = filters::fragment_shader(active);
-    if (fragment.empty()) {
-        trace("filters: none");
-        return;
+    if (card != built_card) {
+        built_card = card;
+        g_card_image = card.size() == 1u ? postcard_image(card[0]) : 0u;
+        if (g_card_image != 0u) g_card = FilterProgram{};
+        else build_filter(g_card, card, "postcard");
     }
-    const double started = host_now_ms();
-    std::string error;
-    if (!link(g_filter, kPresentVertexShader, fragment.c_str(), true, error)) {
-        g_filter = Program{};
-        trace(("filters: " + filters::describe(active) + " FAILED: " + error).c_str());
-        return;
-    }
-    g_filter_extent = glGetUniformLocation(g_filter.id, "u_extent");
-    g_filter_pixels = glGetUniformLocation(g_filter.id, "u_pixels");
-    g_filter_time = glGetUniformLocation(g_filter.id, "u_time");
-    char line[256];
-    std::snprintf(line, sizeof(line), "filters: %s (built in %.0f ms)", filters::describe(active).c_str(), host_now_ms() - started);
-    trace(line);
 }
 
 // The picture (u, v = texture coordinates of its far corner; pixels = its
 // size in its own pixels) drawn over the bound framebuffer, through the
 // filter program when there is one.
-void draw_picture(const Program &plain, GLuint texture, float u, float v, float pixels_x, float pixels_y) {
-    const float quad[16]{-1.0f, 1.0f, 0.0f, v, 1.0f, 1.0f, u, v, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, u, 0.0f};
-    const Program &program = g_filter.id != 0u ? g_filter : plain;
+// crop: the part of the picture drawn (x0, y0, x1, y1 as fractions, y from
+// the top), all of it when null.
+// corners: where the picture goes (clip space: top-left, top-right,
+// bottom-left, bottom-right), the whole viewport when null.
+void draw_picture(const Program &plain, GLuint texture, float u, float v, float pixels_x, float pixels_y, const FilterProgram *filter = &g_filter,
+                  const float *crop = nullptr, const float *corners = nullptr) {
+    const float x0 = crop != nullptr ? u * crop[0] : 0.0f, x1 = crop != nullptr ? u * crop[2] : u;
+    const float top = crop != nullptr ? v * (1.0f - crop[1]) : v, bottom = crop != nullptr ? v * (1.0f - crop[3]) : 0.0f;
+    static const float kWhole[8]{-1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f};
+    const float *c = corners != nullptr ? corners : kWhole;
+    const float quad[16]{c[0], c[1], x0, top, c[2], c[3], x1, top, c[4], c[5], x0, bottom, c[6], c[7], x1, bottom};
+    const bool filtered = filter != nullptr && filter->program.id != 0u;
+    const Program &program = filtered ? filter->program : plain;
     glUseProgram(program.id);
     g_bound = nullptr;
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture);
     glUniform1i(program.texture, 0);
-    if (&program == &g_filter) {
+    if (filtered) {
         static const double start = host_now_ms();
-        if (g_filter_extent >= 0) glUniform2f(g_filter_extent, u, v);
-        if (g_filter_pixels >= 0) glUniform2f(g_filter_pixels, pixels_x, pixels_y);
-        if (g_filter_time >= 0) glUniform1f(g_filter_time, static_cast<float>((host_now_ms() - start) / 1000.0));
+        if (filter->extent >= 0) glUniform2f(filter->extent, u, v);
+        if (filter->pixels >= 0) glUniform2f(filter->pixels, pixels_x, pixels_y);
+        if (filter->time >= 0) glUniform1f(filter->time, static_cast<float>((host_now_ms() - start) / 1000.0));
+        if (filter->speed >= 0) glUniform1f(filter->speed, g_car_speed.load(std::memory_order_relaxed));
     }
     glDisableVertexAttribArray(2);
     glDisableVertexAttribArray(3);
@@ -3745,11 +4868,456 @@ void draw_picture(const Program &plain, GLuint texture, float u, float v, float 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
+// The postcard: the picture through the postcard's filters in its box of the
+// 960x544 target bound (its frame and caption are overlay).
+bool card_shown() {
+    if (g_card.program.id == 0u && g_card_image == 0u) return false;
+    std::lock_guard lock(g_filter_mutex);
+    return !g_card_request.empty();
+}
+// The race beside the menu (not the menu, nor the banners).
+const float kCardCrop[4]{0.36f, 0.17f, 1.0f, 0.83f};
+
+// The photo taken from this picture, when asked (before the screen is bound).
+void take_snapshot(GLuint texture, float u, float v, float pixels_x, float pixels_y) {
+    if (!g_snapshot_request.exchange(false)) return;
+    if (g_snapshot_fbo == 0u) {
+        glGenTextures(1, &g_snapshot_texture);
+        glBindTexture(GL_TEXTURE_2D, g_snapshot_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kSnapshotW, kSnapshotH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glGenFramebuffers(1, &g_snapshot_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_snapshot_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_snapshot_texture, 0);
+        g_gl_bound_texture = 0u;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_snapshot_fbo);
+    glViewport(0, 0, kSnapshotW, kSnapshotH);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    draw_picture(g_present, texture, u, v, pixels_x, pixels_y, nullptr, kCardCrop);
+    trace("postcard photo taken");
+}
+
+void draw_card(GLuint texture, float u, float v, float pixels_x, float pixels_y) {
+    if (!card_shown()) return;
+    float box[5];
+    {
+        std::lock_guard lock(g_filter_mutex);
+        std::copy(g_card_box, g_card_box + 5, box);
+    }
+    // The card's corners turned around its centre, in clip space.
+    const float c = std::cos(box[4]), s = std::sin(box[4]);
+    float corners[8];
+    const float dx[4]{-0.5f, 0.5f, -0.5f, 0.5f}, dy[4]{-0.5f, -0.5f, 0.5f, 0.5f};
+    for (int i = 0; i < 4; ++i) {
+        const float x = dx[i] * box[2], y = dy[i] * box[3];
+        corners[i * 2] = (box[0] + x * c - y * s) / 480.0f - 1.0f;
+        corners[i * 2 + 1] = 1.0f - (box[1] + x * s + y * c) / 272.0f;
+    }
+    glViewport(0, 0, g_screen_w, g_screen_h);
+    if (g_card_image != 0u)
+        draw_picture(g_present, g_card_image, 1.0f, 1.0f, 352.0f, 176.0f, nullptr, nullptr, corners);
+    else if (g_snapshot_fbo != 0u)
+        draw_picture(g_present, g_snapshot_texture, 1.0f, 1.0f, static_cast<float>(kSnapshotW), static_cast<float>(kSnapshotH), &g_card, nullptr, corners);
+    else
+        draw_picture(g_present, texture, u, v, pixels_x, pixels_y, &g_card, kCardCrop, corners);
+}
+
+bool photo_shown() {
+    std::lock_guard lock(g_filter_mutex);
+    return !g_photo_path.empty();
+}
+
+// A PNG with its transparency as a texture (rows bottom-up); 0 if unreadable.
+// Mipmapped when asked: a large picture drawn small (the title logo).
+GLuint load_png_texture(const std::string &path, bool mipmaps, float *aspect = nullptr) {
+    std::vector<std::uint8_t> bytes;
+    if (std::FILE *file = std::fopen(path.c_str(), "rb")) {
+        std::uint8_t chunk[16384];
+        for (std::size_t n; (n = std::fread(chunk, 1, sizeof(chunk), file)) > 0u;) bytes.insert(bytes.end(), chunk, chunk + n);
+        std::fclose(file);
+    }
+    int w = 0, h = 0, channels = 0;
+    stbi_uc *pixels = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 4);
+    if (pixels == nullptr) {
+        trace(("picture missing: " + path).c_str());
+        return 0u;
+    }
+    std::vector<std::uint8_t> rows(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
+    for (int y = 0; y < h; ++y)
+        std::memcpy(rows.data() + static_cast<std::size_t>(h - 1 - y) * static_cast<std::size_t>(w) * 4u,
+                    pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u, static_cast<std::size_t>(w) * 4u);
+    stbi_image_free(pixels);
+    if (aspect != nullptr) *aspect = static_cast<float>(h) / static_cast<float>(w);
+    GLuint texture = 0u;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mipmaps ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rows.data());
+    if (mipmaps) glGenerateMipmap(GL_TEXTURE_2D);
+    g_gl_bound_texture = 0u;
+    trace(("picture " + path).c_str());
+    return texture;
+}
+
+// A transparent picture in a box (centre x, y in PSP pixels, size, angle).
+void draw_png(GLuint texture, const float box[5]) {
+    if (texture == 0u) return;
+    if (g_photo_program.id == 0u) {
+        static bool tried = false;
+        if (tried) return;
+        tried = true;
+        std::string error;
+        if (!link(g_photo_program, kPresentVertexShader, kPhotoFragmentShader, true, error)) {
+            trace(("photo program: " + error).c_str());
+            return;
+        }
+    }
+    const float c = std::cos(box[4]), s = std::sin(box[4]);
+    float corners[8];
+    const float dx[4]{-0.5f, 0.5f, -0.5f, 0.5f}, dy[4]{-0.5f, -0.5f, 0.5f, 0.5f};
+    for (int i = 0; i < 4; ++i) {
+        const float x = dx[i] * box[2], y = dy[i] * box[3];
+        corners[i * 2] = (box[0] + x * c - y * s) / 240.0f - 1.0f;
+        corners[i * 2 + 1] = 1.0f - (box[1] + x * s + y * c) / 136.0f;
+    }
+    // (Into the viewport set by the caller: the screen, or a 960x544 capture.)
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    draw_picture(g_photo_program, texture, 1.0f, 1.0f, 256.0f, 256.0f, nullptr, nullptr, corners);
+    glDisable(GL_BLEND);
+}
+
+// The photo over the screen (set_photo): a PNG with its transparency, turned
+// around its centre, loaded when its path changes.
+void draw_photo() {
+    std::string path;
+    float box[5];
+    {
+        std::lock_guard lock(g_filter_mutex);
+        path = g_photo_path;
+        std::copy(g_photo_box, g_photo_box + 5, box);
+    }
+    if (path.empty()) return;
+    if (path != g_photo_loaded_path) {
+        g_photo_loaded_path = path;
+        if (g_photo_texture != 0u) glDeleteTextures(1, &g_photo_texture);
+        g_photo_texture = load_png_texture(path, false);
+    }
+    draw_png(g_photo_texture, box);
+}
+
+bool title_logo_shown() {
+    std::lock_guard lock(g_filter_mutex);
+    return !g_logo_path.empty();
+}
+
+// The title logo (set_title_logo): drawn at the window's resolution over the
+// title movie, which then carries none itself (PC).
+void draw_title_logo() {
+    std::string path;
+    float box[5];
+    {
+        std::lock_guard lock(g_filter_mutex);
+        path = g_logo_path;
+        std::copy(g_logo_box, g_logo_box + 5, box);
+    }
+    if (path.empty()) return;
+    if (path != g_logo_loaded_path) {
+        g_logo_loaded_path = path;
+        if (g_logo_texture != 0u) glDeleteTextures(1, &g_logo_texture);
+        g_logo_texture = load_png_texture(path, true, &g_logo_aspect);
+    }
+    // Box: top-centre and width given (y = its top), height from the picture.
+    box[3] = box[2] * g_logo_aspect;
+    box[1] += box[3] / 2.0f;
+    draw_png(g_logo_texture, box);
+}
+
+bool pictures_shown() {
+    std::lock_guard lock(g_filter_mutex);
+    for (const Picture &p : g_pictures)
+        if (!p.path.empty()) return true;
+    return false;
+}
+
+// The pictures' files decoded on a thread of their own (2026-11-11: decoded
+// on the GL thread as they came, 540x460 PNGs held the Vita's award screens
+// for tens of milliseconds each); the GL thread only uploads them, and keeps
+// the last few textures for when they come back.
+struct DecodedPicture {
+    int w{}, h{};
+    std::vector<std::uint8_t> rows;  // RGBA, bottom-up; empty: unreadable
+};
+std::mutex g_decode_mutex;
+std::deque<std::string> g_decode_queue;
+std::unordered_map<std::string, std::shared_ptr<DecodedPicture>> g_decoded;  // done, not yet uploaded
+std::unordered_set<std::string> g_decoding;                                   // asked for
+bool g_decoder_started{};
+
+void picture_decoder() {
+    for (;;) {
+        std::string path;
+        {
+            std::lock_guard lock(g_decode_mutex);
+            if (!g_decode_queue.empty()) {
+                path = std::move(g_decode_queue.front());
+                g_decode_queue.pop_front();
+            }
+        }
+        // (Polled, as texture_pack.cpp's decoder: no condition variable.)
+        if (path.empty()) {
+            host_sleep_ms(5.0);
+            continue;
+        }
+        auto picture = std::make_shared<DecodedPicture>();
+        std::vector<std::uint8_t> bytes;
+        if (std::FILE *file = std::fopen(path.c_str(), "rb")) {
+            std::fseek(file, 0, SEEK_END);
+            const long size = std::ftell(file);
+            std::fseek(file, 0, SEEK_SET);
+            if (size > 0) {
+                bytes.resize(static_cast<std::size_t>(size));
+                bytes.resize(std::fread(bytes.data(), 1, bytes.size(), file));
+            }
+            std::fclose(file);
+        }
+        int w = 0, h = 0, channels = 0;
+        if (stbi_uc *pixels = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 4)) {
+            picture->w = w, picture->h = h;
+            picture->rows.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
+            for (int y = 0; y < h; ++y)
+                std::memcpy(picture->rows.data() + static_cast<std::size_t>(h - 1 - y) * static_cast<std::size_t>(w) * 4u,
+                            pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u, static_cast<std::size_t>(w) * 4u);
+            stbi_image_free(pixels);
+        } else {
+            trace(("picture missing: " + path).c_str());
+        }
+        std::lock_guard lock(g_decode_mutex);
+        g_decoded[path] = std::move(picture);
+    }
+}
+
+void request_picture(const std::string &path) {
+    std::lock_guard lock(g_decode_mutex);
+    if (!g_decoder_started) {
+        g_decoder_started = true;
+        // (start_detached: on the Vita std::thread throws "Enable
+        // multithreading", 0.0.77 died opening BONUS 2.0 on it.)
+        start_detached(picture_decoder, 512u * 1024u);
+    }
+    if (g_decoding.insert(path).second) {
+        g_decode_queue.push_back(path);
+    }
+}
+
+// GL thread: the textures made, most recent first.
+std::deque<std::pair<std::string, GLuint>> g_picture_textures;
+constexpr std::size_t kPictureTextures = 10;
+
+GLuint picture_texture(const std::string &path, bool wait) {
+    for (std::size_t i = 0; i < g_picture_textures.size(); ++i)
+        if (g_picture_textures[i].first == path) {
+            const auto found = g_picture_textures[i];
+            g_picture_textures.erase(g_picture_textures.begin() + static_cast<std::ptrdiff_t>(i));
+            g_picture_textures.push_front(found);
+            return found.second;
+        }
+    std::shared_ptr<DecodedPicture> decoded;
+    {
+        std::lock_guard lock(g_decode_mutex);
+        const auto it = g_decoded.find(path);
+        if (it != g_decoded.end()) {
+            decoded = it->second;
+            g_decoded.erase(it);
+            g_decoding.erase(path);
+        }
+    }
+    if (!decoded) {
+        request_picture(path);
+        if (!wait) return 0u;  // not yet: nothing drawn meanwhile
+        // (Captures, PC tests: drawn only then, so waited for, 3 s at most.)
+        for (int i = 0; i < 300 && !decoded; ++i) {
+            host_sleep_ms(10.0);
+            std::lock_guard lock(g_decode_mutex);
+            const auto it = g_decoded.find(path);
+            if (it != g_decoded.end()) {
+                decoded = it->second;
+                g_decoded.erase(it);
+                g_decoding.erase(path);
+            }
+        }
+        if (!decoded) return 0u;
+    }
+    GLuint texture = 0u;
+    if (!decoded->rows.empty()) {
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        // (No mip levels: vitaGL's glGenerateMipmap spoils textures whose
+        // sizes are not powers of two, 0.0.66.)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, decoded->w, decoded->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, decoded->rows.data());
+        g_gl_bound_texture = 0u;
+    }
+    g_picture_textures.push_front({path, texture});
+    while (g_picture_textures.size() > kPictureTextures) {
+        const auto old = g_picture_textures.back();
+        g_picture_textures.pop_back();
+        bool shown = false;
+        for (const Picture &p : g_pictures) shown = shown || p.loaded == old.first;
+        if (shown) {
+            g_picture_textures.push_front(old);  // (kept: still on screen)
+            break;
+        }
+        if (old.second != 0u) glDeleteTextures(1, &old.second);
+    }
+    return texture;
+}
+
+void draw_pictures(bool wait = false) {
+    // None shown for 2 s (out of BONUS 2.0 and the awards): the kept textures
+    // go, so they never weigh on a race (2026-11-11: the Vita's heap is short
+    // in the heaviest races).
+    {
+        static int idle = 0;
+        bool any = false;
+        {
+            std::lock_guard lock(g_filter_mutex);
+            for (const Picture &p : g_pictures) any = any || !p.path.empty();
+        }
+        idle = any ? 0 : idle + 1;
+        if (idle == 120 && !g_picture_textures.empty()) {
+            for (const auto &kept : g_picture_textures)
+                if (kept.second != 0u) glDeleteTextures(1, &kept.second);
+            g_picture_textures.clear();
+            for (Picture &p : g_pictures) p.loaded.clear();
+        }
+    }
+    for (Picture &picture : g_pictures) {
+        std::string path;
+        float box[5];
+        {
+            std::lock_guard lock(g_filter_mutex);
+            path = picture.path;
+            std::copy(picture.box, picture.box + 5, box);
+        }
+        if (path.empty()) {
+            picture.loaded.clear();
+            continue;
+        }
+        const GLuint texture = picture_texture(path, wait);
+        {
+            std::lock_guard lock(g_filter_mutex);
+            picture.loaded = texture != 0u ? path : std::string();
+        }
+        draw_png(texture, box);
+    }
+}
+
+// Our overlay over the picture just drawn (GL thread).
+void draw_overlay() {
+    if (!overlay::visible() || !overlay::ready()) return;
+    if (g_overlay.id == 0u) {
+        // Linked here: the font may be loaded after the renderer started.
+        static bool tried = false;
+        if (tried) return;
+        tried = true;
+        std::string error;
+        if (!link(g_overlay, kOverlayVertexShader, kOverlayFragmentShader, false, error)) {
+            trace(("overlay shader failed: " + error).c_str());
+            g_overlay = {};
+            return;
+        }
+        trace("overlay shader ready");
+    }
+    static std::vector<overlay::Vertex> vertices;
+    overlay::current(vertices);
+    if (vertices.empty()) return;
+    if (g_overlay_texture == 0u) {
+        const auto &alpha = overlay::atlas();
+        std::vector<std::uint8_t> rgba(alpha.size() * 4u, 255u);
+        for (std::size_t i = 0; i < alpha.size(); ++i) rgba[i * 4u + 3u] = alpha[i];
+        glGenTextures(1, &g_overlay_texture);
+        glBindTexture(GL_TEXTURE_2D, g_overlay_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, overlay::atlas_width(), overlay::atlas_height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    }
+    glUseProgram(g_overlay.id);
+    g_bound = nullptr;
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_overlay_texture);
+    glUniform1i(g_overlay.texture, 0);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glEnableVertexAttribArray(2);
+    glDisableVertexAttribArray(3);
+    const auto *base = reinterpret_cast<const float *>(vertices.data());
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(overlay::Vertex), base);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(overlay::Vertex), base + 2);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(overlay::Vertex), base + 4);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
+    glDisableVertexAttribArray(2);
+    glDisable(GL_BLEND);
+    g_gl_bound_texture = 0u;
+}
+
 void present_target(GLuint texture_id, int width, float fraction) {
     update_filter_program();
-#if defined(__vita__)
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, 960, 544);
+#if !defined(__vita__)
+    // PC: only the playable build shows a picture (in its window). It is
+    // made in a 960x544 target as on the Vita, then scaled into the window.
+    if (!window_visible()) {
+        (void)texture_id;
+        (void)width;
+        (void)fraction;
+        return;
+    }
+    static GLuint window_fbo = 0u, window_color = 0u;
+    if (window_fbo == 0u) {
+        glGenTextures(1, &window_color);
+        glBindTexture(GL_TEXTURE_2D, window_color);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_screen_w, g_screen_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glGenFramebuffers(1, &window_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, window_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, window_color, 0);
+        g_gl_bound_texture = 0u;
+    }
+    const GLuint screen = window_fbo;
+#else
+    const GLuint screen = 0u;
+#endif
+    if (texture_id != 0u && g_snapshot_request.load(std::memory_order_relaxed)) {
+        const float k = g_valid_region && g_dynamic_resolution ? fraction : 1.0f;
+        const float q = fraction * static_cast<float>(g_scale);
+        take_snapshot(gl_texture(texture_id), 480.0f / static_cast<float>(width) * k, k, 60.0f * q, 34.0f * q);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, screen);
+    glViewport(0, 0, g_screen_w, g_screen_h);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -3761,23 +5329,133 @@ void present_target(GLuint texture_id, int width, float fraction) {
         const float k = g_valid_region && g_dynamic_resolution ? fraction : 1.0f;  // drawn part of a valid-region target
         const float u = 480.0f / static_cast<float>(width) * k, v = k;
         // Sharpened only when the picture is enlarged.
-        const Program &present = fraction * static_cast<float>(g_scale) < 15.5f && g_present_sharp.id != 0u ? g_present_sharp : g_present;
+        // Anti-aliasing only at the full render resolution: below it the GPU
+        // is the limit (0.0.5: races at 720 most of the time with it on).
+        const bool full = fraction * static_cast<float>(g_scale) >= 15.5f;
+        const bool fxaa = full && g_antialias.load(std::memory_order_relaxed) && !g_frame_flat.load(std::memory_order_relaxed) && g_present_fxaa.id != 0u;
+        const Program &present = fxaa ? g_present_fxaa
+                                 : fraction * static_cast<float>(g_scale) < 15.5f && g_present_sharp.id != 0u ? g_present_sharp
+                                                                                                         : g_present;
         const float q = fraction * static_cast<float>(g_scale);  // eighths the picture was drawn at
-        draw_picture(present, gl_texture(texture_id), u, v, 60.0f * q, 34.0f * q);
+        // DISPLAY: PSP: the 480x272 picture shown as on the PSP, each pixel
+        // doubled (not smoothed nor sharpened like a lowered resolution).
+        const bool psp_look = g_dynamic_pin == 8 && q < 8.5f;
+        const GLuint picture = gl_texture(texture_id);
+        if (psp_look) {
+            glBindTexture(GL_TEXTURE_2D, picture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        draw_picture(psp_look ? g_present : present, picture, u, v, 60.0f * q, 34.0f * q,
+                     // (Menus: a widget up, or a picture without 3D at all, as the track
+                     // select screen, which is not a widget.)
+                     g_filters_suspended.load(std::memory_order_relaxed) || g_frame_flat.load(std::memory_order_relaxed)
+                         ? nullptr : &g_filter);
+        if (psp_look) {
+            // The game samples this target too: its filtering as before.
+            glBindTexture(GL_TEXTURE_2D, picture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+        draw_card(picture, u, v, 60.0f * q, 34.0f * q);
+        draw_photo();
+        draw_title_logo();
+        draw_pictures();
+        draw_overlay();
     }
-    swap_buffers();
-#else
-    (void)texture_id;
-    (void)width;
-    (void)fraction;
+#if !defined(__vita__)
+    // Into the window, its proportions kept (black bars).
+    int window_w = 960, window_h = 544;
+    window_size(window_w, window_h);
+    if (window_w > 0 && window_h > 0) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, window_w, window_h);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        int w = window_w, h = window_w * g_screen_h / g_screen_w;
+        if (h > window_h) {
+            h = window_h;
+            w = window_h * g_screen_w / g_screen_h;
+        }
+        glViewport((window_w - w) / 2, (window_h - h) / 2, w, h);
+        draw_picture(g_present, window_color, 1.0f, 1.0f, static_cast<float>(g_screen_w), static_cast<float>(g_screen_h), nullptr);
+    }
 #endif
+    swap_buffers();
+}
+
+// PC: every filter applied to a picture (cropped to the postcard's 2:1),
+// written as <id>.ppm (tools: converted to the VPK's postcards/<id>.jpg).
+void make_postcards() {
+    if (g_make_postcards_from.empty()) return;
+    const std::string from = g_make_postcards_from, to = g_make_postcards_to;
+    g_make_postcards_from.clear();
+    int w = 0, h = 0, channels = 0;
+    std::FILE *file = std::fopen(from.c_str(), "rb");
+    if (file == nullptr) return trace(("postcards: cannot read " + from).c_str());
+    std::vector<std::uint8_t> bytes;
+    std::uint8_t chunk[16384];
+    for (std::size_t n; (n = std::fread(chunk, 1, sizeof(chunk), file)) > 0u;) bytes.insert(bytes.end(), chunk, chunk + n);
+    std::fclose(file);
+    stbi_uc *pixels = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 4);
+    if (pixels == nullptr) return trace("postcards: not a PNG/JPEG picture");
+    std::vector<std::uint8_t> rows(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
+    for (int y = 0; y < h; ++y)
+        std::memcpy(rows.data() + static_cast<std::size_t>(h - 1 - y) * static_cast<std::size_t>(w) * 4u,
+                    pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u, static_cast<std::size_t>(w) * 4u);
+    stbi_image_free(pixels);
+    GLuint source = 0u, target = 0u, fbo = 0u;
+    glGenTextures(1, &source);
+    glBindTexture(GL_TEXTURE_2D, source);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rows.data());
+    constexpr int kW = 352, kH = 176;
+    glGenTextures(1, &target);
+    glBindTexture(GL_TEXTURE_2D, target);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kW, kH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
+    glViewport(0, 0, kW, kH);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    // The car and the road, without the HUD's corners: 2:1.
+    const float crop[4]{0.12f, 0.165f, 0.88f, 0.835f};
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(kW) * kH * 4u);
+    for (int i = 0; i < static_cast<int>(filters::all().size()); ++i) {
+        FilterProgram program;
+        build_filter(program, {i}, "postcard");
+        draw_picture(g_present, source, 1.0f, 1.0f, static_cast<float>(w), static_cast<float>(h), &program, crop);
+        glReadPixels(0, 0, kW, kH, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+        const std::string path = to + "/" + filters::all()[static_cast<std::size_t>(i)].id + ".ppm";
+        if (std::FILE *ppm = std::fopen(path.c_str(), "wb")) {
+            std::fprintf(ppm, "P6\n%d %d\n255\n", kW, kH);
+            for (int y = kH - 1; y >= 0; --y)
+                for (int x = 0; x < kW; ++x) std::fwrite(out.data() + (static_cast<std::size_t>(y) * kW + static_cast<std::size_t>(x)) * 4u, 1, 3, ppm);
+            std::fclose(ppm);
+        }
+    }
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &target);
+    glDeleteTextures(1, &source);
+    g_gl_bound_texture = 0u;
+    trace(("postcards written to " + to).c_str());
 }
 
 void capture_target(GLuint framebuffer_id, int height, const std::function<void(std::vector<std::uint8_t> &)> &done, int drawn_q) {
+    make_postcards();
     std::vector<std::uint8_t> rgb;
     update_filter_program();
-    if (g_filter.id != 0u && framebuffer_id < g_framebuffer_texture.size() && g_framebuffer_texture[framebuffer_id] != 0u) {
-        // Through the filters: drawn into a 960x544 target and read back.
+    const bool antialias = g_antialias.load(std::memory_order_relaxed) && (!g_dynamic_resolution || !g_frame_flat.load(std::memory_order_relaxed)) && g_present_fxaa.id != 0u;
+    if ((g_filter.program.id != 0u || overlay::visible() || antialias || photo_shown() || title_logo_shown() || pictures_shown()) && framebuffer_id < g_framebuffer_texture.size() && g_framebuffer_texture[framebuffer_id] != 0u) {
+        // Through the filters (and our overlay): drawn into a 960x544 target and read back.
         static GLuint fbo = 0u, color = 0u;
         if (fbo == 0u) {
             glGenTextures(1, &color);
@@ -3791,6 +5469,8 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
         if (framebuffer_id < g_framebuffer_drawn.size() && g_framebuffer_drawn[framebuffer_id] != 0) scale = g_framebuffer_drawn[framebuffer_id];
         if (drawn_q != 0) scale = drawn_q;
         const float k = g_valid_region && g_dynamic_resolution ? static_cast<float>(scale) / static_cast<float>(g_scale) : 1.0f;
+        take_snapshot(gl_texture(g_framebuffer_texture[framebuffer_id]), 480.0f / static_cast<float>(g_framebuffer_psp_width[framebuffer_id]) * k, k,
+                      60.0f * static_cast<float>(scale), 34.0f * static_cast<float>(scale));
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glViewport(0, 0, 960, 544);
         glDisable(GL_SCISSOR_TEST);
@@ -3799,8 +5479,14 @@ void capture_target(GLuint framebuffer_id, int height, const std::function<void(
         glDisable(GL_BLEND);
         glDisable(GL_CULL_FACE);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        draw_picture(g_present, gl_texture(g_framebuffer_texture[framebuffer_id]), 480.0f / static_cast<float>(g_framebuffer_psp_width[framebuffer_id]) * k,
+        draw_picture(antialias ? g_present_fxaa : g_present, gl_texture(g_framebuffer_texture[framebuffer_id]), 480.0f / static_cast<float>(g_framebuffer_psp_width[framebuffer_id]) * k,
                      k, 60.0f * static_cast<float>(scale), 34.0f * static_cast<float>(scale));
+        draw_card(gl_texture(g_framebuffer_texture[framebuffer_id]), 480.0f / static_cast<float>(g_framebuffer_psp_width[framebuffer_id]) * k, k,
+                  60.0f * static_cast<float>(scale), 34.0f * static_cast<float>(scale));
+        draw_photo();
+        draw_title_logo();
+        draw_pictures(true);
+        draw_overlay();
         std::vector<std::uint8_t> rgba(960u * 544u * 4u);
         glReadPixels(0, 0, 960, 544, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         rgb.resize(960u * 544u * 3u);
@@ -3860,6 +5546,94 @@ struct HitchOps {
     std::uint32_t slowest{}, a{}, b{}, textures{};
 };
 HitchOps g_hitch_ops;
+#if defined(PERF_COUNTERS)
+std::uint64_t g_perf_state_ops{};  // GL thread
+
+// State op census (PERF_LOG, list item 3): per op kind, how many are replayed
+// and how many repeat the arguments last replayed for the same state (so do
+// nothing). Keys: the op kind, plus the capability for Enable/Disable, the
+// bound texture and parameter for TexParameter, the slot for uniforms.
+struct CensusKind {
+    std::uint64_t total{}, redundant{};
+};
+std::array<CensusKind, 32> g_census{};
+std::map<std::uint64_t, std::vector<std::uint32_t>> g_census_last;
+std::uint64_t g_census_frames{};
+
+void perf_state_census(Op kind, const std::uint32_t *op) {
+    // op points at the kind; arguments follow.
+    const std::uint32_t *args = op + 1;
+    std::uint64_t key = static_cast<std::uint64_t>(kind) << 56u;
+    std::vector<std::uint32_t> value;
+    switch (kind) {
+    case Op::Enable: case Op::Disable:
+        key = (static_cast<std::uint64_t>(Op::Enable) << 56u) | args[0];  // one state per capability
+        value = {static_cast<std::uint32_t>(kind)};
+        break;
+    case Op::BlendFunc: case Op::ColorMask: case Op::Viewport: case Op::BindFramebuffer:
+        value.assign(args, args + 2);
+        break;
+    case Op::BlendEquation: case Op::DepthFunc: case Op::DepthMask: case Op::FrontFace: case Op::StencilMask:
+    case Op::UseProgram: case Op::BindTexture:
+        value.assign(args, args + 1);
+        break;
+    case Op::StencilFunc: case Op::StencilOp:
+        value.assign(args, args + 3);
+        break;
+    case Op::Scissor:
+        value.assign(args, args + 4);
+        break;
+    case Op::TexParameter:
+        key |= (static_cast<std::uint64_t>(g_gl_bound_texture) << 16u) | (args[0] & 0xFFFFu);
+        value = {args[1]};
+        break;
+    case Op::Uniform4:
+    case Op::UniformMatrix:
+        // Counted only: set_slot keeps the values, programs get them at draw
+        // time when they changed (sync_uniforms).
+        ++g_census[static_cast<unsigned>(kind) & 31u].total;
+        return;
+    default:
+        return;
+    }
+    CensusKind &census = g_census[static_cast<unsigned>(kind) & 31u];
+    ++census.total;
+    auto &last = g_census_last[key];
+    if (last == value) ++census.redundant;
+    else last = std::move(value);
+}
+void perf_census_frame() {
+    // A new frame starts from unknown state (forget_state on the decode side
+    // records it all again): keep the last values, they are still what GL has.
+    if (++g_census_frames % 600u != 0u) return;
+    static const char *const kNames[32] = {"Enable", "Disable", "BlendFunc", "BlendEquation", "DepthFunc", "DepthMask",
+                                           "ColorMask", "FrontFace", "Scissor", "Viewport", "UseProgram", "BindFramebuffer",
+                                           "BindTexture", "TexParameter"};
+    static const char *const kNames2[] = {"StencilFunc", "StencilOp", "StencilMask"};
+    std::string line = "state census (per frame: replayed / redundant):";
+    for (unsigned i = 0; i < 32u; ++i) {
+        if (g_census[i].total == 0u) continue;
+        const char *name = i < 14u ? kNames[i] : i == 16u ? "Uniform4" : i == 17u ? "UniformMatrix" : i >= 22u && i <= 24u ? kNames2[i - 22u] : "?";
+        char item[80];
+        std::snprintf(item, sizeof(item), " %s %.1f/%.1f", name, g_census[i].total / 600.0, g_census[i].redundant / 600.0);
+        line += item;
+    }
+    perf::note(line.c_str());
+    g_census = {};
+}
+#endif
+
+#if defined(PERF_COUNTERS)
+// GL thread's time per replayed op kind (PERF_LOG 2026-11-13, vitaGL fast path).
+constexpr const char *kOpNames[] = {"Enable", "Disable", "BlendFunc", "BlendEquation", "DepthFunc", "DepthMask", "ColorMask",
+                                    "FrontFace", "Scissor", "Viewport", "UseProgram", "BindFramebuffer", "BindTexture",
+                                    "TexParameter", "TexImage", "TexImageP8", "Uniform4", "UniformMatrix", "Draw", "CreateTarget",
+                                    "Present", "Capture", "StencilFunc", "StencilOp", "StencilMask", "Prepass", "ValidRegion",
+                                    "DeleteTexture", "TexImageIndexed", "RotateTexture"};
+constexpr std::size_t kOpKinds = sizeof(kOpNames) / sizeof(kOpNames[0]);
+double g_pf_op_ms[kOpKinds]{};
+std::uint64_t g_pf_op_count[kOpKinds]{};
+#endif
 
 void replay(const Frame &frame) {
     const std::uint32_t *op = frame.ops.data();
@@ -3867,7 +5641,7 @@ void replay(const Frame &frame) {
     const auto floats = [&](std::uint32_t at) { return reinterpret_cast<const float *>(frame.data.data() + at); };
     while (op < end) {
         const Op kind = static_cast<Op>(*op);
-        const bool timed = kind == Op::TexImage || kind == Op::TexImageP8 || kind == Op::CreateTarget || kind == Op::Present ||
+        const bool timed = kind == Op::TexImage || kind == Op::TexImageP8 || kind == Op::TexImageIndexed || kind == Op::CreateTarget || kind == Op::Present ||
                            kind == Op::Capture || kind == Op::DeleteTexture || kind == Op::BindFramebuffer;
         const double op_started = timed ? host_now_ms() : 0.0;
         const std::uint32_t arg0 = op + 1 < end ? op[1] : 0u, arg1 = op + 2 < end ? op[2] : 0u;
@@ -3879,13 +5653,37 @@ void replay(const Frame &frame) {
             ~TimeOp() {
                 if (!timed) return;
                 const double took = host_now_ms() - started;
-                if (kind == Op::TexImage || kind == Op::TexImageP8) {
+                if (kind == Op::TexImage || kind == Op::TexImageP8 || kind == Op::TexImageIndexed) {
                     g_hitch_ops.textures_ms += took;
                     ++g_hitch_ops.textures;
                 }
                 if (took > g_hitch_ops.slowest_ms) g_hitch_ops = {took, g_hitch_ops.textures_ms, static_cast<std::uint32_t>(kind), a, b, g_hitch_ops.textures};
             }
         } time_op{timed, kind, op_started, arg0, arg1};
+#if defined(PERF_COUNTERS)
+        struct PerfOp {
+            std::size_t kind;
+            double started;
+            ~PerfOp() {
+                if (g_gl_detail && kind < kOpKinds) {
+                    g_pf_op_ms[kind] += host_now_ms() - started;
+                    ++g_pf_op_count[kind];
+                }
+            }
+        } perf_op{static_cast<std::size_t>(kind), g_gl_detail ? host_now_ms() : 0.0};
+        if (g_gl_detail) perf_state_census(kind, op);
+        switch (kind) {  // GL state ops (perf_counters.hpp: state_changes)
+        case Op::Enable: case Op::Disable: case Op::BlendFunc: case Op::BlendEquation: case Op::DepthFunc:
+        case Op::DepthMask: case Op::ColorMask: case Op::FrontFace: case Op::Scissor: case Op::Viewport:
+        case Op::UseProgram: case Op::BindFramebuffer: case Op::BindTexture: case Op::TexParameter:
+        case Op::StencilFunc: case Op::StencilOp: case Op::StencilMask: case Op::Uniform4: case Op::UniformMatrix:
+        case Op::ValidRegion:
+            ++g_perf_state_ops;
+            break;
+        default:
+            break;
+        }
+#endif
         switch (static_cast<Op>(*op++)) {
         case Op::Enable: glEnable(op[0]); op += 1; break;
         case Op::Disable: glDisable(op[0]); op += 1; break;
@@ -3952,12 +5750,29 @@ void replay(const Frame &frame) {
             op += 2;
             break;
         case Op::DeleteTexture:
+            if (auto ring = g_rings.find(op[0]); ring != g_rings.end()) {
+                // The ring's other textures (the current one is deleted below).
+                for (int i = 0; i < ring->second.count; ++i)
+                    if (i != ring->second.current) {
+                        if (g_gl_bound_texture == ring->second.names[i]) g_gl_bound_texture = 0u;
+                        g_gl_filters.erase(ring->second.names[i]);
+                        glDeleteTextures(1, &ring->second.names[i]);
+                    }
+                for (int i = 0; i < ring->second.count; ++i) g_ring_sizes.erase(ring->second.names[i]);
+                g_rings.erase(ring);
+            }
             if (op[0] < g_gl_textures.size() && g_gl_textures[op[0]] != 0u) {
                 if (g_gl_bound_texture == g_gl_textures[op[0]]) g_gl_bound_texture = 0u;
                 g_gl_filters.erase(g_gl_textures[op[0]]);
                 glDeleteTextures(1, &g_gl_textures[op[0]]);
                 g_gl_textures[op[0]] = 0u;
             }
+            op += 1;
+            break;
+        case Op::RotateTexture:
+            rotate_texture(op[0]);
+            g_gl_bound_texture = gl_texture(op[0]);
+            glBindTexture(GL_TEXTURE_2D, g_gl_bound_texture);
             op += 1;
             break;
         case Op::BindTexture:
@@ -3975,8 +5790,9 @@ void replay(const Frame &frame) {
             op += 2;
             break;
         case Op::TexImage:
-            // Flag 2: same size as before, written in place (no new texture).
-            if ((op[3] & 2u) != 0u)
+            // Flag 2: same size as before, written in place (no new texture);
+            // a ring texture not allocated yet is made at that size.
+            if ((op[3] & 2u) != 0u && !fresh_ring_texture(g_gl_bound_texture, op[0], op[1]))
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), GL_RGBA,
                                 GL_UNSIGNED_BYTE, frame.blobs[op[2]].data());
             else
@@ -3985,6 +5801,32 @@ void replay(const Frame &frame) {
             if ((op[3] & 1u) != 0u) glGenerateMipmap(GL_TEXTURE_2D);
             op += 4;
             break;
+        case Op::TexImageIndexed: {
+            // 4/8-bit indices (rows of op[4] bytes) through the RGBA palette.
+            const std::uint32_t width = op[0], height = op[1], row_bytes = op[4];
+            const std::uint8_t *indices = frame.blobs[op[2]].data();
+            const std::uint8_t *palette = frame.blobs[op[2] + 1u].data();
+            static std::vector<std::uint8_t> rgba;
+            rgba.resize(static_cast<std::size_t>(width) * height * 4u);
+            const bool nibbles = (op[3] & 4u) != 0u;
+            for (std::uint32_t y = 0; y < height; ++y) {
+                const std::uint8_t *row = indices + static_cast<std::size_t>(y) * row_bytes;
+                std::uint8_t *out = &rgba[static_cast<std::size_t>(y) * width * 4u];
+                if (nibbles)
+                    for (std::uint32_t x = 0; x < width; ++x, out += 4) std::memcpy(out, palette + ((row[x / 2u] >> ((x & 1u) * 4u)) & 15u) * 4u, 4u);
+                else
+                    for (std::uint32_t x = 0; x < width; ++x, out += 4) std::memcpy(out, palette + row[x] * 4u, 4u);
+            }
+            if ((op[3] & 2u) != 0u && !fresh_ring_texture(g_gl_bound_texture, width, height))
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA,
+                                GL_UNSIGNED_BYTE, rgba.data());
+            else
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, rgba.data());
+            if ((op[3] & 1u) != 0u) glGenerateMipmap(GL_TEXTURE_2D);
+            op += 5;
+            break;
+        }
         case Op::TexImageP8:
 #if defined(__vita__)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_COLOR_INDEX8_EXT, static_cast<GLsizei>(op[0]), static_cast<GLsizei>(op[1]), 0,
@@ -4019,6 +5861,9 @@ void replay(const Frame &frame) {
         }
         case Op::Present: {
             g_gl_frame_draws = 0u;
+            ++g_geometry_frame;
+            ++g_gl_present_count;
+            if (g_geometry_frame % 60u == 0u || g_geometry_bytes > kGeometryBudget) evict_geometry(false);
             const double started = host_now_ms();
             present_target(op[0], static_cast<int>(op[1]), static_cast<float>(op[2]) / static_cast<float>(g_scale));
             g_fragment_stats_flush = true;
@@ -4039,17 +5884,32 @@ void replay(const Frame &frame) {
 }
 
 void gl_thread_main() {
+#if !defined(__vita__)
+    core_load::register_current_thread("gl");
+#endif
     {
         std::string error;
         bool ok = create_context(error);
         if (ok) trace("compiling the draw shaders");
         ok = ok && link(g_uber, kVertexShader, kFragmentShader, false, error);
         if (ok) trace("compiling the present shaders");
-        ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error, "#define SHARPEN 0\n");
+        ok = ok && link(g_present, kPresentVertexShader, kPresentFragmentShader, true, error, "#define SHARPEN 0\n#define FXAA 0\n");
+        if (ok) {
+            // Anti-aliasing: the scene's texels (the targets are drawn at the
+            // render scale, 512x272 PSP pixels).
+            char text[160];
+            std::snprintf(text, sizeof(text), "#define SHARPEN 0\n#define FXAA %d\n#define TEXEL_X %.8f\n#define TEXEL_Y %.8f\n",
+                          g_antialias_lite ? 2 : 1, 8.0 / (512.0 * g_scale), 8.0 / (272.0 * g_scale));
+            std::string fxaa_error;
+            if (!link(g_present_fxaa, kPresentVertexShader, kPresentFragmentShader, true, fxaa_error, text)) {
+                trace(("anti-aliasing shader failed: " + fxaa_error).c_str());
+                g_present_fxaa = {};
+            }
+        }
         if (ok && g_present_sharpen && (g_scale < 16 || g_dynamic_resolution)) {
             // The display target is 512x272 PSP pixels at the render scale.
             char text[160];
-            std::snprintf(text, sizeof(text), "#define SHARPEN 1\n#define TEXEL_X %.8f\n#define TEXEL_Y %.8f\n#define STRENGTH 0.5\n",
+            std::snprintf(text, sizeof(text), "#define SHARPEN 1\n#define FXAA 0\n#define TEXEL_X %.8f\n#define TEXEL_Y %.8f\n#define STRENGTH 0.5\n",
                           8.0 / (512.0 * g_scale), 8.0 / (272.0 * g_scale));
             ok = link(g_present_sharp, kPresentVertexShader, kPresentFragmentShader, true, error, text);
         }
@@ -4084,7 +5944,26 @@ void gl_thread_main() {
         }
         const double started = host_now_ms();
         g_hitch_ops = {};
+#if defined(PERF_COUNTERS)
+        const double perf_present = g_gl_present_ms.load();
+        const std::uint64_t perf_draws = g_gl_draws.load(), perf_states = g_perf_state_ops;
+        const std::uint64_t perf_present_count = g_gl_present_count;
+#endif
         replay(frame);
+#if defined(PERF_COUNTERS)
+        {
+            // GL thread, per replayed frame (perf_counters.hpp); frames without
+            // a Present (menus' partial submits) are left out.
+            const double swap = g_gl_present_ms.load() - perf_present;
+            if (g_gl_present_count != perf_present_count) {
+                perf::push(perf::Series::GlSubmit, host_now_ms() - started - swap);
+                perf::push(perf::Series::Swap, swap);
+                perf::push(perf::Series::Draws, static_cast<double>(g_gl_draws.load() - perf_draws));
+                perf::push(perf::Series::StateChanges, static_cast<double>(g_perf_state_ops - perf_states));
+                perf_census_frame();
+            }
+        }
+#endif
         {
             static int hitch_lines = 0;
             const double took = host_now_ms() - started;
@@ -4130,7 +6009,11 @@ void *gl_thread_entry(void *) {
 void submit_frame() {
     splice_deferred();
     std::unique_lock lock(g_gl.mutex);
+    phase = 12u;  // sampled: waiting for the GL thread (two frames queued)
+    const double wait_started = host_now_ms();
     g_gl.cv.wait(lock, [] { return g_gl.frames.size() < 2u; });
+    g_decode_waited_gl_ms += host_now_ms() - wait_started;
+    phase = 11u;
     // The next frame starts with the room this one needed, so recording it
     // does not regrow (and copy) its buffers from nothing.
     const std::size_t ops = g_frame.ops.size(), data = g_frame.data.size();
@@ -4189,18 +6072,97 @@ void set_dynamic_resolution(bool enabled, float min_scale, float pinned) {
         g_dynamic_q = g_dynamic_pin;
     }
 }
+void set_picture_scale(float scale) {
+    g_dynamic_pin = scale > 0.0f ? std::clamp(static_cast<int>(std::lround(scale * 8.0f)), 8, 32) : 0;
+    // Back to HD: the full resolution at once (the dynamic resolution only
+    // climbs a level after 1.5 s of spare time, which a race seldom has:
+    // 0.0.49 stayed near 480x272 after DISPLAY went back to HD).
+    if (g_dynamic_pin == 0) g_dynamic_q = g_scale;
+}
 void set_lazy_levels(bool enabled) { g_lazy_levels = enabled; }
+void set_probe_every(std::uint32_t frames) { g_probe_every = std::max<std::uint32_t>(1u, frames); }
 void set_effect_1x(bool enabled) { g_effect_1x = enabled; }
 void set_tight_regions(bool enabled) { g_tight_regions = g_tight_regions || enabled; }
 void set_valid_region(bool enabled) { g_valid_region = g_valid_region || enabled; }
 void set_only_current_level(bool enabled) { g_only_current_level = g_only_current_level || enabled; }
 void set_present_sharpen(bool enabled) { g_present_sharpen = g_present_sharpen || enabled; }
+void set_antialias(bool enabled) { g_antialias.store(enabled, std::memory_order_relaxed); }
+void set_trilinear(bool enabled) { g_trilinear = enabled; }
+void set_antialias_lite(bool lite) { g_antialias_lite = lite; }
+void set_car_speed(float mph) { g_car_speed.store(mph, std::memory_order_relaxed); }
+
+void set_filters_suspended(bool suspended) { g_filters_suspended.store(suspended, std::memory_order_relaxed); }
+void set_hide_3d(bool hide) { g_hide_3d.store(hide, std::memory_order_relaxed); }
 
 void set_filters(const std::vector<int> &active) {
     {
         std::lock_guard lock(g_filter_mutex);
         if (active == g_filter_request) return;
         g_filter_request = active;
+    }
+    g_filter_version.fetch_add(1u, std::memory_order_release);
+}
+void set_postcard_pictures(const std::string &directory) { g_postcard_dir = directory; }
+void set_present_size(int width, int height) {
+    g_screen_w = width;
+    g_screen_h = height;
+}
+void set_photo(const std::string &path, float x, float y, float width, float height, float angle) {
+    std::lock_guard lock(g_filter_mutex);
+    g_photo_path = path;
+    g_photo_box[0] = x;
+    g_photo_box[1] = y;
+    g_photo_box[2] = width;
+    g_photo_box[3] = height;
+    g_photo_box[4] = angle;
+}
+// The picture of this slot drawn (its file decoded and on screen):
+// BONUS 2.0 writes a Polaroid's caption only then (2026-11-13: captions
+// showed alone while the pictures were still decoding).
+bool picture_ready(int slot) {
+    if (slot < 0 || slot >= kPictures) return true;
+    std::lock_guard lock(g_filter_mutex);
+    const Picture &p = g_pictures[slot];
+    return p.path.empty() || p.loaded == p.path;
+}
+
+void set_picture(int slot, const std::string &path, float x, float y, float width, float height, float angle) {
+    if (slot < 0 || slot >= kPictures) return;
+    std::lock_guard lock(g_filter_mutex);
+    Picture &p = g_pictures[slot];
+    p.path = path;
+    // Given in 960x544 pixels (the Bonus menu's), kept in PSP pixels.
+    p.box[0] = x * 0.5f;
+    p.box[1] = y * 0.5f;
+    p.box[2] = width * 0.5f;
+    p.box[3] = height * 0.5f;
+    p.box[4] = angle;
+}
+void set_title_logo(const std::string &path, float x, float top, float width) {
+    std::lock_guard lock(g_filter_mutex);
+    g_logo_path = path;
+    g_logo_box[0] = x;
+    g_logo_box[1] = top;
+    g_logo_box[2] = width;
+    g_logo_box[3] = 0.0f;
+    g_logo_box[4] = 0.0f;
+}
+void make_postcards(const std::string &picture, const std::string &directory) {
+    g_make_postcards_from = picture;
+    g_make_postcards_to = directory;
+}
+void set_sun_glare(float scale) { g_sun_glare = scale; }
+void postcard_photo() { g_snapshot_request.store(true, std::memory_order_relaxed); }
+void set_postcard(const std::vector<int> &filters, float x, float y, float width, float height, float angle) {
+    {
+        std::lock_guard lock(g_filter_mutex);
+        g_card_box[0] = x;
+        g_card_box[1] = y;
+        g_card_box[2] = width;
+        g_card_box[3] = height;
+        g_card_box[4] = angle;
+        if (filters == g_card_request) return;
+        g_card_request = filters;
     }
     g_filter_version.fetch_add(1u, std::memory_order_release);
 }
@@ -4226,6 +6188,8 @@ void set_no_trees(bool enabled) { g_no_cutouts = g_no_cutouts || enabled; }
 void set_cutout_prepass(bool enabled) { g_cutout_prepass = g_cutout_prepass || enabled; }
 void set_draw_budget(unsigned budget) { g_draw_budget = budget; }
 void set_shader_cache(const std::string &directory) { g_shader_cache = directory; }
+void set_gxp_cache(const std::string &directory) { g_gxp_cache = directory; }
+void set_filter_shader_cache(const std::string &directory) { g_filter_shader_cache = directory; }
 void set_variant_list(const std::string &path) { g_variant_list = path; }
 void set_cached_memory(bool cached) { g_cached_memory = cached; }
 bool cached_memory() noexcept { return g_cached_memory; }
@@ -4271,11 +6235,71 @@ void finish() {
 // Commands that act even when they repeat the register's current word.
 constexpr std::array<bool, 256> kActsWhenRepeated = [] {
     std::array<bool, 256> acts{};
-    for (const std::uint32_t op : {0x01u, 0x02u, 0x04u, 0x0Cu, 0x2Au, 0x2Bu, 0x3Au, 0x3Bu, 0x3Cu, 0x3Du, 0x3Eu, 0x3Fu,
+    for (const std::uint32_t op : {0x01u, 0x02u, 0x04u, 0x07u, 0x0Cu, 0x2Au, 0x2Bu, 0x3Au, 0x3Bu, 0x3Cu, 0x3Du, 0x3Eu, 0x3Fu,
                                    0x40u, 0x41u, 0xC4u, 0xEAu})
         acts[op] = true;
     return acts;
 }();
+
+// GE bounding box test (BBOX, 0x07): false when every point of the box is
+// outside the same side of the view (left, right, top, bottom) or behind the
+// camera, so nothing in it can be seen. Not the far plane (the PSP may not
+// clip there). Through-mode, skinned and indexed boxes count as visible.
+bool bbox_visible(psprecomp::GuestMemory &memory, std::uint32_t count) {
+    const std::uint32_t vtype = cmd(0x12u);
+    if (count == 0u || (vtype & 0x800000u) != 0u || ((vtype >> 9u) & 3u) != 0u || ((vtype >> 11u) & 3u) != 0u) return true;
+    const VertexLayout layout = vertex_layout(vtype);
+    const std::uint32_t pos = (vtype >> 7u) & 3u;
+    if (pos == 0u) return true;
+    const std::uint8_t *raw = memory.raw_pointer(g_vertex_address, static_cast<std::size_t>(count) * layout.stride);
+    if (raw == nullptr) return true;
+    const float scale = pos == 1u ? 1.0f / 128.0f : pos == 2u ? 1.0f / 32768.0f : 1.0f;
+    bool out[5]{true, true, true, true, true};
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint8_t *at = raw + static_cast<std::size_t>(i) * layout.stride + layout.pos;
+        float p[3];
+        for (std::uint32_t k = 0; k < 3u; ++k) {
+            if (pos == 1u) p[k] = static_cast<float>(static_cast<std::int8_t>(at[k])) * scale;
+            else if (pos == 2u) {
+                std::int16_t v;
+                std::memcpy(&v, at + k * 2u, 2u);
+                p[k] = static_cast<float>(v) * scale;
+            } else std::memcpy(&p[k], at + k * 4u, 4u);
+        }
+        float w[3], e[3], c[4];
+        for (int j = 0; j < 3; ++j) w[j] = p[0] * g_world[j] + p[1] * g_world[3 + j] + p[2] * g_world[6 + j] + g_world[9 + j];
+        for (int j = 0; j < 3; ++j) e[j] = w[0] * g_view[j] + w[1] * g_view[3 + j] + w[2] * g_view[6 + j] + g_view[9 + j];
+        for (int j = 0; j < 4; ++j) c[j] = e[0] * g_projection[j] + e[1] * g_projection[4 + j] + e[2] * g_projection[8 + j] + g_projection[12 + j];
+        if (c[0] >= -c[3]) out[0] = false;
+        if (c[0] <= c[3]) out[1] = false;
+        if (c[1] >= -c[3]) out[2] = false;
+        if (c[1] <= c[3]) out[3] = false;
+        if (c[3] > 0.0f) out[4] = false;
+        if (!out[0] && !out[1] && !out[2] && !out[3] && !out[4]) return true;
+    }
+    return false;
+}
+
+std::uint64_t g_bbox_tests{}, g_bbox_hidden{}, g_bbox_hidden_prims{}, g_bbox_hidden_vertices{};
+bool g_bbox_hidden_now{};
+
+// Culling (BJUMP, 0x09): after a BBOX found its box out of view, the GE
+// jumps past the object; the commands up to the jump's target (the sub-lists
+// called in between included) are followed without drawing: state, pointers
+// and snapshot records kept as they are. Drawing resumes at the target, at
+// the first run of the list starting just after it (control words are not
+// forwarded), or at the end of the job. PC: PSPRECOMP_BURNOUT_NO_CULL.
+const bool g_cull = std::getenv("PSPRECOMP_BURNOUT_NO_CULL") == nullptr;
+std::uint32_t g_cull_end{};  // guest address drawing resumes at, 0: drawing
+bool g_cull_drawing{};       // g_drawing before
+std::uint64_t g_bbox_culled_prims{};
+
+void end_cull() {
+    if (g_cull_end == 0u) return;
+    g_cull_end = 0u;
+    g_drawing = g_cull_drawing;
+}
+
 
 void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_t base, std::uint32_t offset) {
     const std::uint32_t op = word >> 24u;
@@ -4305,6 +6329,23 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
     // (0x12 vertex type: decode_prim ends the batch if the type differs; 0x07/0x09 bounding box test and jump.)
     const bool world_only = (op == 0x3Au || op == 0x3Bu || op == 0x12u || op == 0x07u || op == 0x09u) && g_batch_world && g_batch_count != 0u;
     if (!world_only && !batch_neutral(op) && (matrix_changes() || g_commands[op] != word || op == 0xC4u || op == 0xEAu)) {
+#if !defined(__vita__)
+        // PSPRECOMP_BURNOUT_FLUSH_STATS: per frame, the commands that end a batch.
+        static const bool flush_stats = std::getenv("PSPRECOMP_BURNOUT_FLUSH_STATS") != nullptr;
+        if (flush_stats && g_batch_count != 0u && g_drawing) {
+            static std::array<std::uint64_t, 256> ended{};
+            static std::uint64_t last = 0;
+            ++ended[op];
+            if (g_stats.frames != last && g_stats.frames % 300u == 0u) {
+                last = g_stats.frames;
+                std::fprintf(stderr, "[flush] batches ended per frame by:");
+                for (std::uint32_t i = 0; i < 256u; ++i)
+                    if (ended[i] >= 300u) std::fprintf(stderr, " %02X=%.0f", i, ended[i] / 300.0);
+                std::fputc('\n', stderr);
+                ended.fill(0u);
+            }
+        }
+#endif
         static const bool merge_stats = std::getenv("PSPRECOMP_BURNOUT_MERGE_STATS") != nullptr;
         if (merge_stats && g_batch_world && g_batch_count != 0u) {
             static std::array<std::uint64_t, 256> by_op{};
@@ -4327,8 +6368,25 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
     case 0x02u: g_index_address = address(); break;
     case 0x04u:
         ++g_stats.primitives;
+        if (g_cull_end != 0u) {
+            ++g_bbox_hidden_prims;
+            g_bbox_hidden_vertices += data & 0xFFFFu;
+        }
         decode_prim(memory, data);
         break;
+    case 0x07u: {  // BBOX
+        ++g_bbox_tests;
+        g_bbox_hidden_now = !bbox_visible(memory, data & 0xFFFFu);
+        if (g_bbox_hidden_now) ++g_bbox_hidden;
+        static std::uint64_t last_frame = 0;
+        if (g_stats.frames != last_frame && g_stats.frames % 300u == 0u) {
+            last_frame = g_stats.frames;
+            std::fprintf(stderr, "[bbox] per frame: %.0f tests, %.0f out of view; %.0f PRIMs, %.0f vertices not drawn\n",
+                         g_bbox_tests / 300.0, g_bbox_hidden / 300.0, g_bbox_hidden_prims / 300.0, g_bbox_hidden_vertices / 300.0);
+            g_bbox_tests = g_bbox_hidden = g_bbox_hidden_prims = g_bbox_hidden_vertices = 0u;
+        }
+        break;
+    }
     case 0x2Au: g_bone_cursor = data & 0x7Fu; break;
     case 0x2Bu: if (g_bone_cursor < g_bones.size()) g_bones[g_bone_cursor++] = float24(data); break;
     case 0x3Au: g_world_cursor = data & 0xFu; break;
@@ -4357,6 +6415,9 @@ void ge_command(psprecomp::GuestMemory &memory, std::uint32_t word, std::uint32_
 }
 
 SnapshotState g_scan;
+GuestShadow g_shadow;
+std::uint64_t g_shadow_misses{};
+
 
 namespace {
 
@@ -4394,12 +6455,15 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
     }
     const auto record = static_cast<std::uint32_t>(arena.size());
     SnapshotHeader header;
+    header.tag_word = word;
+    header.tag_address = op == 0x04u ? (((g_scan.vtype >> 11u) & 3u) != 0u ? g_scan.index_address : g_scan.vertex_address)
+                                     : (g_scan.clut_low & 0xFFFFF0u) | ((g_scan.clut_high << 8u) & 0x0F000000u);
     arena.resize(arena.size() + sizeof(header));
     if (op == 0xC4u) {
         emulation_phase = 5u;
         const std::uint32_t clut = (g_scan.clut_low & 0xFFFFF0u) | ((g_scan.clut_high << 8u) & 0x0F000000u);
         const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
-        if (const std::uint8_t *p = memory.raw_pointer(clut, bytes)) {
+        if (const std::uint8_t *p = shadowed(memory, clut, bytes)) {
             header.index_bytes = bytes;
             // Palettes loaded with the track and cars do not change either.
             if (static_vertices(clut)) header.index_in_guest = 1u;
@@ -4415,7 +6479,7 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
         emulation_phase = 3u;
         if (index != 0u) {
             const std::uint32_t bytes = count * (index == 1u ? 1u : 2u);
-            const std::uint8_t *p = memory.raw_pointer(g_scan.index_address, bytes);
+            const std::uint8_t *p = shadowed(memory, g_scan.index_address, bytes);
             g_scan.index_address += bytes;
             readable = p != nullptr;
             if (readable) {
@@ -4430,11 +6494,15 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
         emulation_phase = 4u;
         if (readable) {
             const std::uint32_t bytes = vertex_count * stride;
-            if (const std::uint8_t *p = memory.raw_pointer(g_scan.vertex_address, bytes)) {
+            if (const std::uint8_t *p = shadowed(memory, g_scan.vertex_address, bytes)) {
                 if (header.index_bytes == UINT32_MAX) header.index_bytes = 0u;
                 header.vertex_bytes = bytes;
                 if (static_vertices(g_scan.vertex_address)) {
                     header.vertex_offset = kInGuestMemory;
+                } else if (bytes > (1u << 20u)) {
+                    // No real PRIM copies a megabyte; garbage words did, until
+                    // the heap ran out (0.0.37: std::bad_alloc).
+                    header.vertex_bytes = UINT32_MAX;
                 } else {
                     header.vertex_offset = static_cast<std::uint32_t>(snapshot.vertices.size());
                     append(snapshot.vertices, p, bytes);
@@ -4448,8 +6516,106 @@ std::uint32_t snapshot_command(const psprecomp::GuestMemory &memory, std::uint32
     return record;
 }
 
+// The most common PRIM (thousands a frame): a list, strip or fan of static
+// vertices that follow the batch's in place, in its vertex type. What
+// ge_command and decode_prim do for it, without their general machinery;
+// false (nothing done) for anything else. PC: PSPRECOMP_BURNOUT_NO_FAST_PRIM.
+const bool g_fast_prim = std::getenv("PSPRECOMP_BURNOUT_NO_FAST_PRIM") == nullptr;
+std::array<std::uint64_t, 9> g_prim_paths{};  // PC stats
+bool fast_prim(psprecomp::GuestMemory &memory, std::uint32_t word) {
+    if (!g_fast_prim) return false;
+    // Sampled phase 3 (the list loop's phase 10 after).
+    struct FastPhase {
+        FastPhase() { phase = 3u; }
+        ~FastPhase() { phase = 10u; }
+    } fast_phase;
+    const std::uint32_t vtype = cmd(0x12u);
+    const std::uint32_t data = word & 0x00FFFFFFu;
+    if (!g_drawing) {
+        // Not drawn (culled, or a skipped frame): the vertex pointer follows,
+        // as in decode_prim (static unindexed vertices: no snapshot record).
+        if (((vtype >> 11u) & 3u) != 0u || !static_vertices(g_vertex_address)) return false;
+        static std::uint32_t layout_vtype = UINT32_MAX, layout_stride = 0u;
+        if (vtype != layout_vtype) {
+            layout_vtype = vtype;
+            layout_stride = vertex_layout(vtype).stride;
+        }
+        g_commands[0x04u] = word;
+        ++g_stats.primitives;
+        if (g_cull_end != 0u) {
+            ++g_bbox_hidden_prims;
+            g_bbox_hidden_vertices += data & 0xFFFFu;
+        }
+        g_vertex_address += (data & 0xFFFFu) * layout_stride;
+        return true;
+    }
+    // Drawn: starting a batch, following it in place, or appended to a
+    // batch of copies.
+    if (g_thin_foliage || g_merge_cutouts || g_gpu_probe || (vtype & 0x01FE1E00u) != 0u) return false;  // weights, index, morphs, through
+    const bool start = g_batch_count == 0u;
+    if (start ? !g_batch_runs.empty() : (g_batch_world || vtype != g_batch_vtype)) return false;
+    const std::uint32_t primitive = (data >> 16u) & 7u, count = data & 0xFFFFu;
+    if (primitive < 3u || primitive > 5u || count < 3u || g_batch_count + count > 65535u) return false;
+    if ((cmd(0x50u) & 1u) == 0u && (cmd(0xD3u) & 1u) == 0u) return false;  // flat shading
+    if (!static_vertices(g_vertex_address)) return false;
+    if (start) {
+        // As decode_prim begins a batch.
+        g_batch_vtype = vtype;
+        g_layout = batch_layout(vtype);
+        g_batch_min_alpha = 255u;
+        g_batch_world = false;
+    }
+    // The PSP's layout; the batch's is the same (drawn in place or copied)
+    // or converted (copy_vertices).
+    static std::uint32_t source_from = UINT32_MAX;
+    static VertexLayout source;
+    if (source_from != vtype) {
+        source_from = vtype;
+        source = vertex_layout(vtype);
+    }
+    const BatchLayout &out = g_layout;
+    const bool same = out.same_as_psp;
+    const std::uint32_t stride = source.stride;
+    const std::uint8_t *raw = memory.raw_pointer(g_vertex_address, static_cast<std::size_t>(count) * stride);
+    if (raw == nullptr) return false;
+    if (start && same) g_batch_in_place = raw;
+    const bool in_place = g_batch_in_place != nullptr;
+    if (in_place && raw != g_batch_in_place + static_cast<std::size_t>(g_batch_count) * stride) return false;
+    if (!g_keep_discard && (cmd(0x22u) & 1u) != 0u) {
+        std::uint32_t lowest = cmd(0x58u) & 0xFFu;
+        const std::uint32_t col = (vtype >> 2u) & 7u;
+        if (col >= 5u) {
+            const std::uint8_t *at = raw + source.col;
+            for (std::uint32_t i = 0; i < count && lowest != 0u; ++i, at += stride) {
+                std::uint32_t a;
+                if (col == 7u) a = at[3];
+                else if (col == 6u) a = (at[1] >> 4u) * 17u;
+                else a = (at[1] & 0x80u) != 0u ? 255u : 0u;
+                lowest = std::min(lowest, a);
+            }
+        }
+        g_batch_min_alpha = std::min(g_batch_min_alpha, lowest);
+    }
+    g_commands[0x04u] = word;
+    ++g_stats.primitives;
+    if ((vtype & 0x800000u) == 0u && (cmd(0x17u) & 1u) != 0u) g_stats.lit_vertices += count;
+    g_batch_runs.push_back(g_batch_count);
+    g_batch_runs.push_back(count | primitive << 24u);
+    g_batch_index_total += (primitive == 3u ? count / 3u : count - 2u) * 3u;
+    if (in_place) g_batch_count += count;
+    else if (same) std::memcpy(append_vertices(count), raw, static_cast<std::size_t>(count) * stride);
+    else copy_vertices(append_vertices(count), raw, count, out, source);
+    g_vertex_address += count * stride;
+    return true;
+}
+
+extern bool g_record_desync;
+bool record_matches(const Snapshot &snapshot, const std::uint32_t *records, std::size_t next, std::uint32_t word,
+                    std::uint32_t at);
+
 void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uint32_t count, std::uint32_t base,
-            std::uint32_t offset, const Snapshot &snapshot, const std::uint32_t *records, std::size_t &next_record) {
+            std::uint32_t offset, std::uint32_t address, const Snapshot &snapshot, const std::uint32_t *records,
+            std::size_t &next_record) {
 #if !defined(__vita__)
     static const bool op_stats = std::getenv("PSPRECOMP_BURNOUT_OP_STATS") != nullptr;
     static std::array<std::uint64_t, 256> seen{}, called{};
@@ -4473,9 +6639,27 @@ void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uin
     }
 #endif
     phase = 10u;  // the loop itself
+    if (g_cull_end != 0u && address >= g_cull_end && address <= g_cull_end + 64u) end_cull();
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint32_t word = words[i];
         const std::uint32_t op = word >> 24u;
+        if (g_cull_end != 0u && address + i * 4u == g_cull_end) end_cull();
+        if (op == 0x09u) {  // BJUMP
+            g_commands[op] = word;
+            if (g_cull && g_bbox_hidden_now && address != 0u && g_cull_end == 0u) {
+                const std::uint32_t target = ((base | (word & 0x00FFFFFFu)) + offset) & 0x0FFFFFFCu;
+                // Forward, in the same list (the object's draws are in the
+                // sub-lists it calls before the target).
+                if (target > address + i * 4u && target - address < 0x10000u) {
+                    g_memory = &memory;
+                    g_cull_drawing = g_drawing;
+                    if (g_drawing) flush();
+                    g_drawing = false;
+                    g_cull_end = target;
+                }
+            }
+            continue;
+        }
 #if !defined(__vita__)
         if (op_stats) {
             ++seen[op];
@@ -4500,7 +6684,41 @@ void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uin
             if (g_world_cursor < 12u) g_world[g_world_cursor++] = value;
             continue;
         }
+        if (op == 0x04u && fast_prim(memory, word)) {
+#if !defined(__vita__)
+            ++g_prim_paths[0];
+#endif
+            continue;
+        }
+#if !defined(__vita__)
+        if (op == 0x04u) {
+            // Why the fast path was not taken (PSPRECOMP_BURNOUT_PRIM_PATHS).
+            const std::uint32_t vt = cmd(0x12u);
+            const std::uint32_t why = !g_drawing ? 1u : prim_has_record() ? 2u : g_batch_in_place == nullptr ? 3u
+                : vt != g_batch_vtype ? 4u : (vt & 0x01FE1E00u) != 0u ? 5u : ((word >> 16u) & 7u) < 3u || ((word >> 16u) & 7u) > 5u ? 6u
+                : ((cmd(0x50u) & 1u) == 0u && (cmd(0xD3u) & 1u) == 0u) ? 7u : 8u;
+            ++g_prim_paths[why];
+            static const bool show = std::getenv("PSPRECOMP_BURNOUT_PRIM_PATHS") != nullptr;
+            static std::uint64_t last = 0;
+            if (show && g_stats.frames != last && g_stats.frames % 300u == 0u) {
+                last = g_stats.frames;
+                std::fprintf(stderr, "[prim] per frame: fast %.0f, not drawn %.0f, recorded %.0f, batch start %.0f, other vtype %.0f, weights/index/through %.0f, prim kind %.0f, flat %.0f, other %.0f",
+                             g_prim_paths[0] / 300.0, g_prim_paths[1] / 300.0, g_prim_paths[2] / 300.0, g_prim_paths[3] / 300.0,
+                             g_prim_paths[4] / 300.0, g_prim_paths[5] / 300.0, g_prim_paths[6] / 300.0, g_prim_paths[7] / 300.0, g_prim_paths[8] / 300.0);
+                std::fputc('\n', stderr);
+                g_prim_paths.fill(0u);
+            }
+        }
+#endif
         if (op == 0xC4u || (op == 0x04u && prim_has_record())) {
+            if (!record_matches(snapshot, records, next_record, word, address != 0u ? address + i * 4u : 0u)) {
+                // Out of step with the scan: nothing more of this list is
+                // drawn (its records would be someone else's).
+                if (g_drawing) flush();
+                g_drawing = false;
+                g_record_desync = true;
+                continue;
+            }
             use_snapshot(&snapshot, records[next_record++]);
             ge_command(memory, word, base, offset);
             use_snapshot(nullptr, 0u);
@@ -4509,7 +6727,54 @@ void ge_run(psprecomp::GuestMemory &memory, const std::uint32_t *words, std::uin
             ge_command(memory, word, base, offset);
         }
     }
+    if (g_cull_end != 0u && address != 0u && address + count * 4u == g_cull_end) end_cull();  // a target at the run's end
     phase = 0u;
+}
+
+void end_culling() { end_cull(); }
+
+std::size_t g_record_count{};
+bool g_record_desync{};
+std::uint64_t g_record_desyncs{};
+std::atomic<bool> g_any_desync{false};
+bool records_desynced() noexcept { return g_any_desync.load(std::memory_order_relaxed); }
+void set_record_count(std::size_t count) {
+    g_record_count = count;
+    g_record_desync = false;
+}
+
+// The record the scan made for this command, and the worker's state agrees
+// with what the scan saw (0.0.34/0.0.35 on the Vita: draws went wrong, then a
+// crash reading vertices through a record that was not this PRIM's).
+bool record_matches(const Snapshot &snapshot, const std::uint32_t *records, std::size_t next, std::uint32_t word,
+                    std::uint32_t at) {
+    if (g_record_desync) return false;
+    const char *why = nullptr;
+    SnapshotHeader header;
+    std::uint32_t mine = 0u;
+    if (next >= g_record_count) {
+        why = "no record left";
+    } else if (records[next] + sizeof(header) > snapshot.records.size()) {
+        why = "record outside the snapshot";
+    } else {
+        std::memcpy(&header, snapshot.records.data() + records[next], sizeof(header));
+        const std::uint32_t op = word >> 24u;
+        mine = op == 0x04u ? (((cmd(0x12u) >> 11u) & 3u) != 0u ? g_index_address : g_vertex_address)
+                           : (cmd(0xB0u) & 0xFFFFF0u) | ((cmd(0xB1u) << 8u) & 0x0F000000u);
+        if (header.tag_word != word) why = "other command";
+        else if (header.tag_address != mine) why = "other address";
+    }
+    if (why == nullptr) return true;
+    g_any_desync.store(true, std::memory_order_relaxed);
+    if (g_record_desyncs++ < 20u) {
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "record desync (%s) frame %llu at %08X: word %08X addr %08X, record %u of %u: word %08X addr %08X",
+                      why, static_cast<unsigned long long>(g_stats.frames), at, word, mine, static_cast<unsigned>(next),
+                      static_cast<unsigned>(g_record_count), header.tag_word, header.tag_address);
+        trace(line);
+    }
+    return false;
 }
 
 bool prim_has_record() noexcept {
@@ -4552,6 +6817,7 @@ void evict_textures() {
             record(Op::DeleteTexture, {it->second.name});
             ++g_textures_evicted;
             it = g_textures.erase(it);
+            g_texture_slots.fill({});
         } else {
             ++it;
         }
@@ -4560,13 +6826,33 @@ void evict_textures() {
 }
 
 void present(std::uint32_t address) {
-    g_sun_box.valid = false;
-    g_sun_copy = UINT32_MAX;
     flush();
+    emit_held_draws();
+    // The sun box forgotten only now (2026-11-14): the copy of the box is a
+    // 2D draw, held and emitted just above; forgotten before, the copy was
+    // never recognised and the glare that samples it drew a bright
+    // rectangle in the sky. g_sun_copy is kept from frame to frame: the
+    // glare is drawn before the held copy, so a frame uses the last one
+    // (it only counts while a sun box is measured in the frame).
+    g_sun_box.valid = false;
+    g_screen_key = UINT32_MAX;
     splice_deferred();
     evict_textures();
     phase = 11u;
     ++g_stats.frames;
+#if defined(PERF_COUNTERS)
+    {
+        // Decode thread, per presented frame (perf_counters.hpp).
+        static double last_list = 0.0;
+        static std::uint64_t last_vertices = 0u, last_uploads = 0u;
+        perf::push(perf::Series::GeTranslate, g_stats.list_ms - last_list);
+        perf::push(perf::Series::Vertices, static_cast<double>(g_stats.vertices - last_vertices));
+        perf::push(perf::Series::TextureUploads, static_cast<double>(g_stats.texture_uploads - last_uploads));
+        last_list = g_stats.list_ms;
+        last_vertices = g_stats.vertices;
+        last_uploads = g_stats.texture_uploads;
+    }
+#endif
     {
         // Hitch probe (gl-106), decode thread: a frame much longer than 33 ms.
         static double last_wall = host_now_ms(), last_list = 0.0, last_idle = 0.0, last_draw = 0.0;
@@ -4628,6 +6914,78 @@ void present(std::uint32_t address) {
                       static_cast<double>(g_gl_draws.load() - last_draws) / n, static_cast<double>(g_gl_budget_dropped.load() - last_dropped) / n,
                       g_draw_budget, present, upload, draws_ms - upload, busy - present - draws_ms);
         trace(line);
+#if defined(PERF_COUNTERS)
+        {
+            static double l_hash = 0, l_expand = 0, l_scratch = 0, l_uniform = 0;
+            static std::uint64_t l_hash_bytes = 0, l_scratch_bytes = 0, l_dynamic = 0;
+            std::snprintf(line, sizeof(line),
+                          "  GL draw path (ms/frame): geometry hash %.2f (%.0f KiB), index expansion %.2f (%.0f dynamic draws), "
+                          "scratch copy %.2f (%.0f KiB), uniforms %.2f, vitaGL draw calls and state %.2f",
+                          (g_pf_hash_ms - l_hash) / n, (g_pf_hash_bytes - l_hash_bytes) / 1024.0 / n,
+                          (g_pf_expand_ms - l_expand) / n, static_cast<double>(g_pf_dynamic_draws - l_dynamic) / n,
+                          (g_pf_scratch_ms - l_scratch) / n, (g_pf_scratch_bytes - l_scratch_bytes) / 1024.0 / n,
+                          (g_pf_uniform_ms - l_uniform) / n, draws_ms - upload - (g_pf_uniform_ms - l_uniform) / n);
+            trace(line);
+            {
+                static double l_entry = 0, l_runs = 0, l_lookup = 0, l_bind = 0;
+                std::snprintf(line, sizeof(line), "  GL upload part (ms/frame): entry %.2f, runs hash %.2f, cache lookup %.2f, buffer binds %.2f",
+                              (g_pf_entry_ms - l_entry) / n, (g_pf_runs_hash_ms - l_runs) / n, (g_pf_lookup_ms - l_lookup) / n, (g_pf_bind_ms - l_bind) / n);
+                trace(line);
+                l_entry = g_pf_entry_ms, l_runs = g_pf_runs_hash_ms, l_lookup = g_pf_lookup_ms, l_bind = g_pf_bind_ms;
+            }
+            l_hash = g_pf_hash_ms, l_expand = g_pf_expand_ms, l_scratch = g_pf_scratch_ms, l_uniform = g_pf_uniform_ms;
+            l_hash_bytes = g_pf_hash_bytes, l_scratch_bytes = g_pf_scratch_bytes, l_dynamic = g_pf_dynamic_draws;
+            // Each replayed op kind (ms/frame, count/frame), largest first.
+            static double l_op_ms[kOpKinds]{};
+            static std::uint64_t l_op_count[kOpKinds]{};
+            std::vector<std::pair<double, std::size_t>> kinds;
+            for (std::size_t k = 0; k < kOpKinds; ++k) kinds.emplace_back((g_pf_op_ms[k] - l_op_ms[k]) / n, k);
+            std::sort(kinds.begin(), kinds.end(), [](auto &x, auto &y) { return x.first > y.first; });
+            int at = std::snprintf(line, sizeof(line), "  GL ops (ms/frame, count/frame):");
+            for (const auto &[ms, k] : kinds) {
+                if (ms < 0.05 || at < 0 || at > static_cast<int>(sizeof(line)) - 48) break;
+                at += std::snprintf(line + at, sizeof(line) - at, " %s %.2f (%.0f)", kOpNames[k], ms,
+                                    static_cast<double>(g_pf_op_count[k] - l_op_count[k]) / n);
+            }
+            trace(line);
+            for (std::size_t k = 0; k < kOpKinds; ++k) l_op_ms[k] = g_pf_op_ms[k], l_op_count[k] = g_pf_op_count[k];
+#if defined(__vita__)
+            // vitaGL's own glDrawElements, by part (patched vitaGL, vglGetDrawProfile).
+            std::uint32_t us[8];
+            vglGetDrawProfile(us);
+            const double draws = us[7] != 0u ? static_cast<double>(us[7]) : 1.0;
+            std::snprintf(line, sizeof(line),
+                          "  vitaGL glDrawElements (us/draw, %.0f draws/frame): fragment program %.1f, textures %.1f, attributes %.1f, "
+                          "vertex program %.1f, uniforms %.1f, streams %.1f, rest (scene, indices, sceGxmDraw) %.1f; whole %.1f",
+                          us[7] / n, us[0] / draws, us[1] / draws, us[2] / draws, us[3] / draws, us[4] / draws, us[5] / draws,
+                          (us[6] - us[0] - us[1] - us[2] - us[3] - us[4] - us[5]) / draws, us[6] / draws);
+            trace(line);
+            static const bool enabled = [] {
+                vglEnableDrawProfile(g_gl_detail ? GL_TRUE : GL_FALSE);
+                return true;
+            }();
+            (void)enabled;
+#endif
+        }
+#endif
+        {
+            static std::uint64_t last_hits = 0u, last_misses = 0u, last_stale = 0u;
+            const std::uint64_t hits = g_geometry_hits, misses = g_geometry_misses, stale = g_geometry_stale;
+            std::snprintf(line, sizeof(line), "  static geometry: %.0f draws/frame from GPU buffers, %.1f new, %.1f changed; %u buffers, %llu KiB; hashed 1 frame in %u, %llu pieces first seen changing late (total)",
+                          static_cast<double>(hits - last_hits) / n, static_cast<double>(misses - last_misses) / n,
+                          static_cast<double>(stale - last_stale) / n, g_geometry_count,
+                          static_cast<unsigned long long>(g_geometry_bytes / 1024u), g_probe_every,
+                          static_cast<unsigned long long>(g_geometry_late));
+            trace(line);
+            last_hits = hits;
+            last_misses = misses;
+            last_stale = stale;
+            if (!g_rings.empty()) {
+                std::snprintf(line, sizeof(line), "  texture rings: %u textures, %llu updates rotated, %llu in place", static_cast<unsigned>(g_rings.size()),
+                              static_cast<unsigned long long>(g_ring_rotations), static_cast<unsigned long long>(g_ring_waits));
+                trace(line);
+            }
+        }
         last_upload = g_gl_upload_ms.load();
         last_draw = g_gl_draw_ms.load();
         last_draws = g_gl_draws.load();
@@ -4638,6 +6996,22 @@ void present(std::uint32_t address) {
                       g_all_probe ? 100 * g_probe_set + static_cast<int>(((g_stats.frames - 1u) / 600u) % (g_probe_set == 2 ? 2u : 4u))
                       : g_gpu_probe ? static_cast<int>(((g_stats.frames - 1u) / 600u) % 6u) : -1);
         trace(line);
+        {
+            static double last_waited = 0.0;
+            std::snprintf(line, sizeof(line), "  decode thread waited %.1f ms/frame for the GL thread (two frames queued)", (g_decode_waited_gl_ms - last_waited) / n);
+            trace(line);
+            last_waited = g_decode_waited_gl_ms;
+            static double l_tex = 0, l_state = 0, l_tail = 0;
+            std::snprintf(line, sizeof(line), "  decode flush (ms/frame): state and uniforms %.2f (of which texture binding %.2f), vertices and draw record %.2f",
+                          (g_flush_state_ms - l_state) / n, (g_flush_texture_ms - l_tex) / n, (g_flush_tail_ms - l_tail) / n);
+            trace(line);
+            l_tex = g_flush_texture_ms, l_state = g_flush_state_ms, l_tail = g_flush_tail_ms;
+            static double l_mat = 0, l_vs = 0, l_tgt = 0;
+            std::snprintf(line, sizeof(line), "  decode flush, state part (ms/frame): target and start %.2f, matrices %.2f, vertex state (lighting) %.2f",
+                          (g_flush_target_ms - l_tgt) / n, (g_flush_matrices_ms - l_mat) / n, (g_flush_vertex_state_ms - l_vs) / n);
+            trace(line);
+            l_mat = g_flush_matrices_ms, l_vs = g_flush_vertex_state_ms, l_tgt = g_flush_target_ms;
+        }
 #if defined(__vita__)
         {
             // vitaGL scenes (render passes) begun, by target size (patched vitaGL).
@@ -4693,6 +7067,7 @@ void present(std::uint32_t address) {
         }
         trace(targets.c_str());
         g_gpu = GpuCounters{};
+        ++g_gpu_generation;
         g_prepassed = 0u;
         g_deferred_draws = 0u;
         g_deferred_splices = 0u;

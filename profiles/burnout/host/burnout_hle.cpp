@@ -20,20 +20,22 @@
 #include "audio_out.hpp"
 #include "burnout_bench.hpp"
 #include "music.hpp"
+#include "trax.hpp"
 #include "sas_core.hpp"
 #include "sas_worker.hpp"
 
 #include "workload_stats.hpp"
+#include "perf_counters.hpp"
 #if defined(BURNOUT_GE_RENDER)
 #include "ge_gl.hpp"
 #include "ge_render.hpp"
 #include "thread_sync.hpp"
 #if defined(__vita__)
 #include <psp2/kernel/cpu.h>
+#include <psp2/kernel/clib.h>
 #include <pthread.h>
-#else
-#include <thread>
 #endif
+#include <thread>
 #endif
 
 #include "psprecomp/common.hpp"
@@ -42,6 +44,8 @@
 #include <xmmintrin.h>
 #endif
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -131,10 +135,21 @@ struct MemoryBlock {
     std::string name;
 };
 
+// An sceIoReadAsync in flight (2026-11-14): read on a thread of its own,
+// the game runs on meanwhile and polls or waits, as on the PSP. Done before
+// as a plain read, it stalled the emulation for the track's streaming reads
+// (~8 ms/flip on average in Road Rage, in reads of tens of ms).
+struct AsyncRead {
+    std::atomic<bool> done{false};
+    std::int64_t result{};
+};
+
 struct OpenFile {
     std::FILE *file{};
     std::string psp_path;
     std::int64_t async_result{};
+    std::shared_ptr<AsyncRead> pending;
+    std::uint32_t riff_key{};  // an added EA Trax track's stand-in: its RIFF size field (trax.cpp)
 };
 
 struct DirectoryItem {
@@ -213,7 +228,33 @@ struct MpegMovie {
     std::uint32_t pixel_mode{3u};      // sceMpegAvcDecodeMode: 3 = 8888, 0 = 565, 1 = 5551, 2 = 4444
     std::uint32_t units{};             // access units handed out
     std::uint32_t past_end{};          // "no data" answers since the last frame
+    bool title_logo{};                 // its logo shown over it (set_title_logo)
 };
+
+// A title movie with a "<name>_logo.png" beside it (PC: the movie carries no
+// logo, a sharp one is drawn at the window's resolution): shown over it, where
+// make_title_movie.py lays it by default (260 px wide, top at 85, centred).
+bool show_title_logo(const std::string &movie_path) {
+#if defined(BURNOUT_GE_RENDER)
+    const std::size_t dot = movie_path.find_last_of('.');
+    if (dot == std::string::npos) return false;
+    const std::string png = movie_path.substr(0, dot) + "_logo.png";
+    struct stat info{};
+    if (stat(png.c_str(), &info) != 0) return false;
+    gl::set_title_logo(png, 240.0f, 85.0f, 260.0f);  // 2.0 logo (2026-11-13): 15 px higher, clear of the START line
+    std::fprintf(stderr, "[movie] logo %s\n", png.c_str());
+    return true;
+#else
+    (void)movie_path;
+    return false;
+#endif
+}
+
+void hide_title_logo() {
+#if defined(BURNOUT_GE_RENDER)
+    gl::set_title_logo(std::string(), 0.0f, 0.0f, 0.0f);
+#endif
+}
 
 // Movie cost on the emulation thread, logged every 150 frames: decode
 // (hardware decoder and copy out) and colour conversion into VRAM.
@@ -335,8 +376,33 @@ bool trace_hle_enabled() {
     return enabled;
 }
 
+#if defined(PERF_COUNTERS)
+// Host time of each import on the emulation thread, and the part of it inside
+// interrupt handlers (PERF_LOG 2026-11-13: the vblank handler 0x08A37B94
+// costs ~0.05 ms on the PC, 1.6-6 ms on the Vita). Reported by
+// thread_time_report.
+struct HleTime {
+    double ms{}, interrupt_ms{};
+    std::uint32_t calls{};
+};
+std::map<std::uint32_t, HleTime> g_hle_times;
+bool in_interrupt_slice();
+#endif
+
 void reg(Runtime &rt, const char *library, std::uint32_t nid, Runtime::HleFunction function) {
     k.implemented.emplace(library, nid);
+#if defined(PERF_COUNTERS)
+    function = [nid, inner = std::move(function)](Runtime &r, AllegrexContext &ctx) {
+        const bool interrupt = in_interrupt_slice();
+        const double started = host_now_ms();
+        inner(r, ctx);
+        HleTime &time = g_hle_times[nid];
+        const double ms = host_now_ms() - started;
+        time.ms += ms;
+        if (interrupt) time.interrupt_ms += ms;
+        ++time.calls;
+    };
+#endif
     if (trace_hle_enabled()) {
         const std::string name = rt.nids().resolve(library, nid).value_or(psprecomp::hex32(nid));
         function = [name, inner = std::move(function)](Runtime &r, AllegrexContext &ctx) {
@@ -557,6 +623,9 @@ struct Slice {
     double started{};
 } g_slice;
 std::uint32_t g_dispatches{};  // thread switches and interrupt entries (thread_time_report)
+#if defined(PERF_COUNTERS)
+bool in_interrupt_slice() { return g_slice.uid == kInterruptSlice; }
+#endif
 
 void close_slice() {
     if (g_slice.uid == kInterruptSlice) {
@@ -816,13 +885,43 @@ std::optional<std::pair<fs::path, std::uint64_t>> map_lbn_path(const std::string
     return std::make_pair(it->second, static_cast<std::uint64_t>(sector - it->first) * 2048u);
 }
 
+void finish_async(OpenFile &file);  // below: waits for a read in flight
+
+// The player's added EA Trax tracks (trax.cpp, 2026-11-14): music/EATraxNN.mus
+// for n >= 24 exists for the game as a copy of EATrax22.mus (the smallest)
+// whose RIFF size field, odd unlike every real one, tells music.cpp which
+// MP3 to play. Returns n, or -1.
+int added_track(const fs::path &host) {
+    const std::string name = lower(host.filename().string());
+    unsigned n = 0u;
+    char tail[8]{};
+    if (name.size() != 12u || std::sscanf(name.c_str(), "eatrax%2u%7s", &n, tail) != 2 || std::strcmp(tail, ".mus") != 0) return -1;
+    return n >= 24u && !trax::file_of(n).empty() ? static_cast<int>(n) : -1;
+}
+fs::path added_track_template(const fs::path &host) { return host.parent_path() / "EATrax22.mus"; }
+std::uint32_t added_track_key(const fs::path &stand_in, int n) {
+    std::uint32_t riff = 0u;
+    if (std::FILE *f = std::fopen(stand_in.string().c_str(), "rb")) {
+        std::uint8_t head[8]{};
+        if (std::fread(head, 1u, 8u, f) == 8u) riff = head[4] | (head[5] << 8u) | (head[6] << 16u) | (static_cast<std::uint32_t>(head[7]) << 24u);
+        std::fclose(f);
+    }
+    return riff == 0u ? 0u : (riff | 1u) + 2u * static_cast<std::uint32_t>(n - 24);
+}
+
 std::int64_t file_read(Runtime &rt, std::int32_t fd, std::uint32_t buffer, std::uint32_t size) {
     const auto it = k.files.find(fd);
     if (it == k.files.end() || it->second.file == nullptr) return static_cast<std::int32_t>(kErrorBadFile);
+    finish_async(it->second);
     std::uint8_t *host = rt.memory().raw_pointer(buffer, size);
     if (host == nullptr && size != 0u) return static_cast<std::int32_t>(kErrorBadFile);
     const double started = host_now_ms();
+    const long position = it->second.riff_key != 0u ? std::ftell(it->second.file) : 0L;
     const auto read = static_cast<std::int64_t>(std::fread(host, 1u, size, it->second.file));
+    // An added track's stand-in: its own RIFF size field (bytes 4-7).
+    if (it->second.riff_key != 0u && read > 0)
+        for (long b = 4; b < 8; ++b)
+            if (b >= position && b < position + read) host[b - position] = static_cast<std::uint8_t>(it->second.riff_key >> (8 * (b - 4)));
 #if defined(BURNOUT_GE_RENDER)
     const double took = host_now_ms() - started;
     gl::io_read_ms += took;
@@ -831,6 +930,74 @@ std::int64_t file_read(Runtime &rt, std::int32_t fd, std::uint32_t buffer, std::
     (void)started;  // no renderer trace in the headless builds
 #endif
     return read;
+}
+
+// Async reads on (the Vita), or off: read in the call as before (PC by
+// default, PSPRECOMP_BURNOUT_ASYNC_IO=1 to try; ux0:data/burnout/sync_io.txt
+// turns them off on the Vita).
+bool async_io_enabled() {
+    static const bool on = [] {
+#if defined(__vita__)
+        std::FILE *f = std::fopen("ux0:data/burnout/sync_io.txt", "rb");
+        if (f != nullptr) std::fclose(f);
+        return f == nullptr;
+#else
+        return std::getenv("PSPRECOMP_BURNOUT_ASYNC_IO") != nullptr;
+#endif
+    }();
+    return on;
+}
+
+// Reads on a thread of its own. The Vita's libstdc++ has no std::thread
+// ("Enable multithreading to use std::thread", 2026-11-14): a pthread there,
+// as the renderer's threads.
+struct AsyncJob {
+    std::shared_ptr<AsyncRead> op;
+    std::FILE *file;
+    std::uint8_t *host;
+    std::uint32_t size;
+};
+
+void run_async_read(AsyncJob *job) {
+    job->op->result = static_cast<std::int64_t>(job->size != 0u ? std::fread(job->host, 1u, job->size, job->file) : 0u);
+    job->op->done.store(true, std::memory_order_release);
+    delete job;
+}
+
+void start_async_read(const std::shared_ptr<AsyncRead> &op, std::FILE *file, std::uint8_t *host, std::uint32_t size) {
+    auto *job = new AsyncJob{op, file, host, size};
+#if defined(__vita__)
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, [](void *arg) -> void * {
+            run_async_read(static_cast<AsyncJob *>(arg));
+            return nullptr;
+        }, job) == 0) {
+        pthread_detach(thread);
+        return;
+    }
+    run_async_read(job);  // no thread: read now
+#else
+    std::thread([job] { run_async_read(job); }).detach();
+#endif
+}
+
+// Waits for the file's read in flight, if any; its result becomes the
+// file's async result.
+void finish_async(OpenFile &file) {
+    if (!file.pending) return;
+    if (!file.pending->done.load(std::memory_order_acquire)) {
+        const double started = host_now_ms();
+        while (!file.pending->done.load(std::memory_order_acquire)) host_sleep_ms(0.2);
+#if defined(BURNOUT_GE_RENDER)
+        const double took = host_now_ms() - started;
+        gl::io_read_ms += took;
+        gl::io_read_max_ms = std::max(gl::io_read_max_ms, took);
+#else
+        (void)started;
+#endif
+    }
+    file.async_result = file.pending->result;
+    file.pending.reset();
 }
 
 // Starts loading the cache line at `address` (no effect on the result).
@@ -894,20 +1061,41 @@ void ge_scan(Runtime &rt, GeList &list, std::vector<GeEvent> *events = nullptr) 
 #else
     const bool skip_plain = !workload::collecting();
 #endif
+#if !defined(__vita__)
+    // PC test: the front end's walk spread over time as on the Vita (one
+    // pause every 256 steps), so the game runs on in the middle of it.
+    static const int slow_walk_us = [] {
+        const char *env = std::getenv("PSPRECOMP_BURNOUT_FRONT_SLOW_WALK_US");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    std::uint32_t steps = 0u;
+#endif
     for (std::uint64_t count = 0; count < kCommandLimit && !list.done; ++count) {
+#if !defined(__vita__)
+        if (slow_walk_us > 0 && events != nullptr && (++steps & 255u) == 0u)
+            std::this_thread::sleep_for(std::chrono::microseconds(slow_walk_us));
+#endif
         const std::uint32_t pc = list.pc & 0x0FFFFFFFu;
         if (list.stall != 0u && pc == (list.stall & 0x0FFFFFFFu)) return;
         if (skip_plain) {
             std::uint64_t span = std::min<std::uint64_t>(4096u, kCommandLimit - count);
             const std::uint32_t stall = list.stall & 0x0FFFFFFFu;
             if (list.stall != 0u && stall > pc) span = std::min<std::uint64_t>(span, (stall - pc) / 4u);
+#if defined(BURNOUT_GE_RENDER)
+            // Inside the front end's copy of the buffer: read the copy, up to its end.
+            const gl::GuestShadow &shadow = gl::g_shadow;
+            if (shadow.data != nullptr && pc >= shadow.lo && pc < shadow.hi)
+                span = std::min<std::uint64_t>(span, (shadow.hi - pc) / 4u);
+            if (const std::uint8_t *words = gl::shadowed(rt.memory(), pc, static_cast<std::size_t>(span) * 4u)) {
+#else
             if (const std::uint8_t *words = rt.memory().raw_pointer(pc, static_cast<std::size_t>(span) * 4u)) {
+#endif
                 std::uint32_t plain = 0u;
 #if defined(BURNOUT_GE_RENDER)
                 if (render_runs) {
                     // One pass finds the run's end and hands it to the renderer.
                     plain = render::ge_plain_commands(rt.memory(), words, static_cast<std::uint32_t>(span), list.base,
-                                                      list.offset);
+                                                      list.offset, pc);
                 } else
 #endif
                     while (plain < span && !ge_is_control(words[plain * 4u + 3u])) ++plain;
@@ -919,8 +1107,16 @@ void ge_scan(Runtime &rt, GeList &list, std::vector<GeEvent> *events = nullptr) 
                 }
             }
         }
+#if defined(BURNOUT_GE_RENDER)
+        const std::uint8_t *at = gl::shadowed(rt.memory(), pc, 4u);
+        if (at == nullptr) { list.done = true; return; }
+        std::uint32_t word;
+        std::memcpy(&word, at, 4u);
+        (void)memory;
+#else
         if (!rt.memory().contains(pc, 4u)) { list.done = true; return; }
         const std::uint32_t word = memory.aot_load32(pc);
+#endif
         const std::uint32_t op = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
         list.pc = pc + 4u;
@@ -936,8 +1132,10 @@ void ge_scan(Runtime &rt, GeList &list, std::vector<GeEvent> *events = nullptr) 
         case 0x08u: list.pc = target(); break;                         // JUMP
         case 0x0Au: {  // CALL
 #if defined(BURNOUT_GE_RENDER)
-            // An unchanged sub-list seen before goes to the renderer whole.
-            if (events == nullptr && render_runs &&
+            // An unchanged sub-list seen before goes to the renderer whole
+            // (on the front end's thread too: such sub-lists are in the static
+            // range, outside the list buffers the game rewrites).
+            if (render_runs &&
                 render::ge_cached_call(rt.memory(), target(), list.base, list.offset, list.stall))
                 break;
 #endif
@@ -995,9 +1193,17 @@ void ge_scan(Runtime &rt, GeList &list, std::vector<GeEvent> *events = nullptr) 
 namespace front {
 
 struct Request {
-    enum class Kind : std::uint8_t { List, Stall, Flip } kind{};
+    enum class Kind : std::uint8_t { List, Stall, Flip, CopyPart } kind{};
+    // CopyPart: the front end's share of a list copy (copy split, see
+    // ge_front_post_list); the emulation thread waits for it.
+    std::uint8_t *copy_to{};
+    const std::uint8_t *copy_from{};
+    std::size_t copy_size{};
     std::int32_t id{};
     GeList list;
+    // The list's buffer as it was queued (see gl::GuestShadow); empty: none.
+    std::vector<std::uint8_t> shadow;
+    std::uint32_t shadow_lo{};
     std::uint32_t address{}, stride{}, format{};
     std::uint64_t vblank{};
 };
@@ -1009,6 +1215,9 @@ SyncMutex g_mutex{"ge_front"};
 SyncCondition g_cv{"ge_front", g_mutex};
 std::deque<Request> g_requests;
 std::vector<GeEvent> g_events;
+std::vector<std::vector<std::uint8_t>> g_shadow_spares;  // under g_mutex: buffers for the next copies
+std::uint64_t g_shadowed_lists{}, g_unshadowed_lists{}, g_shadow_bytes{};
+double g_prepass_ms{}, g_copy_ms{};  // emulation thread: early_transfers' walk, the copy
 bool g_busy{};                     // a request is being handled
 std::uint32_t g_queued_flips{};
 volatile bool g_has_events{};
@@ -1023,7 +1232,11 @@ void handle(Request &request, std::vector<GeEvent> &events) {
     Runtime &rt = *g_runtime;
     switch (request.kind) {
     case Request::Kind::List:
+        if (!request.shadow.empty())
+            gl::g_shadow = {request.shadow_lo, request.shadow_lo + static_cast<std::uint32_t>(request.shadow.size()),
+                            request.shadow.data()};
         ge_scan(rt, request.list, &events);
+        gl::g_shadow = {};
         if (request.list.done) events.push_back({-1, false, 0u, request.id});
         else g_lists[request.id] = std::move(request.list);
         break;
@@ -1041,15 +1254,86 @@ void handle(Request &request, std::vector<GeEvent> &events) {
     case Request::Kind::Flip:
         render::frame_buffer_set(rt.memory(), request.address, request.stride, request.format, request.vblank);
         break;
+    case Request::Kind::CopyPart:
+#if defined(__vita__)
+        sceClibMemcpy(request.copy_to, request.copy_from, request.copy_size);
+#else
+        std::memcpy(request.copy_to, request.copy_from, request.copy_size);
+#endif
+        break;
     }
 }
 
+#if defined(PERF_COUNTERS)
+// Piste 1 (PERF_LOG 2026-11-13): which parts of the list buffer the game has
+// rewritten by the end of the walk, against the copy taken at enqueue. If it
+// is a small, fixed region, only that needs copying on the emulation thread.
+// Front end thread only (core 2).
+void rewrite_census(const Request &request) {
+    static std::uint32_t lists = 0u, rewritten_lists = 0u;
+    static std::uint64_t bytes = 0u, rewritten_bytes = 0u;
+    static std::map<std::uint32_t, std::uint32_t> pages;  // 4 KiB page address -> lists with a change there
+    static std::uint32_t lo_min = ~0u, lo_max = 0u;
+    const std::uint32_t lo = request.shadow_lo;
+    const std::size_t size = request.shadow.size();
+    const std::uint8_t *live = g_runtime->memory().raw_pointer(lo, static_cast<std::uint32_t>(size));
+    if (live == nullptr) return;
+    ++lists;
+    bytes += size;
+    lo_min = std::min(lo_min, lo);
+    lo_max = std::max(lo_max, lo);
+    bool changed = false;
+    std::uint32_t last_page = ~0u;
+    for (std::size_t i = 0; i + 4u <= size; i += 4u) {
+        std::uint32_t a, b;
+        std::memcpy(&a, request.shadow.data() + i, 4u);
+        std::memcpy(&b, live + i, 4u);
+        if (a == b) continue;
+        changed = true;
+        rewritten_bytes += 4u;
+        const std::uint32_t page = (lo + static_cast<std::uint32_t>(i)) & ~0xFFFu;
+        if (page != last_page) ++pages[page], last_page = page;
+    }
+    rewritten_lists += changed ? 1u : 0u;
+    if (lists < 300u) return;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> top(pages.begin(), pages.end());
+    std::sort(top.begin(), top.end(), [](auto &x, auto &y) { return x.second > y.second; });
+    char line[1024];
+    int n = std::snprintf(line, sizeof(line),
+                          "list rewrites: %u of %u lists rewritten during the walk, %.1f KiB of %.1f KiB a list, "
+                          "lists start 0x%08X-0x%08X, %zu pages touched; top:",
+                          rewritten_lists, lists, rewritten_bytes / 1024.0 / lists, bytes / 1024.0 / lists, lo_min, lo_max,
+                          pages.size());
+    for (std::size_t k = 0; k < top.size() && k < 16u && n > 0 && n < static_cast<int>(sizeof(line)) - 24; ++k)
+        n += std::snprintf(line + n, sizeof(line) - n, " %08X:%u", top[k].first, top[k].second);
+    perf::note(line);
+    lists = rewritten_lists = 0u;
+    bytes = rewritten_bytes = 0u;
+    pages.clear();
+    lo_min = ~0u;
+    lo_max = 0u;
+}
+#endif
+
 void *thread_main(void *) {
 #if defined(__vita__)
-    // Core 1, beside the decode worker it feeds (core 2 already has the GL
-    // thread, the SAS mixer and the audio output), ahead of it in priority.
-    const int changed = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_1);
-    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 150);
+    // Core 2, beside the GL thread (core 1's decode worker is the busier,
+    // ~85%), ahead of it in priority: the game may wait for the walk.
+    int mask = SCE_KERNEL_CPU_MASK_USER_2, priority = 150;
+#if defined(PERF_COUNTERS)
+    // Test (2026-11-13): core 2 is the busiest in 60 fps races and the
+    // emulation waits ~4.5 ms a frame for this walk; on core 0 the walk fills
+    // those waits. ux0:data/burnout/front_core0.txt ("h": ahead of the
+    // emulation, otherwise behind it).
+    if (std::FILE *f = std::fopen("ux0:data/burnout/front_core0.txt", "rb")) {
+        const int c = std::fgetc(f);
+        std::fclose(f);
+        mask = SCE_KERNEL_CPU_MASK_USER_0;
+        priority = c == 'h' ? 150 : 170;
+    }
+#endif
+    const int changed = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), mask);
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), priority);
     core_load::register_current_thread("ge_front");
     char line[128];
     std::snprintf(line, sizeof(line), "GE front end started: affinity change 0x%x, mask 0x%x, priority %d, cpu %d",
@@ -1071,8 +1355,31 @@ void *thread_main(void *) {
 #if defined(__vita__)
         ++g_cpu_samples[sceKernelGetCpuId() & 3];
 #endif
+#if !defined(__vita__)
+        // PC test: a walk as slow as on the Vita (the game runs on meanwhile).
+        static const int slow_ms = [] {
+            const char *env = std::getenv("PSPRECOMP_BURNOUT_FRONT_SLOW_MS");
+            return env != nullptr ? std::atoi(env) : 0;
+        }();
+        if (slow_ms > 0 && request.kind == Request::Kind::List)
+            std::this_thread::sleep_for(std::chrono::milliseconds(slow_ms));
+#endif
         handle(request, events);
+#if defined(PERF_COUNTERS)
+        // (0.0.83-perfc measurement: it re-reads each list on this core.)
+        static const bool census = [] {
+#if defined(__vita__)
+            std::FILE *f = std::fopen("ux0:data/burnout/rewrite_census.txt", "rb");
+#else
+            std::FILE *f = std::getenv("PSPRECOMP_BURNOUT_REWRITE_CENSUS") ? std::fopen("NUL", "rb") : nullptr;
+#endif
+            if (f != nullptr) std::fclose(f);
+            return f != nullptr;
+        }();
+        if (census && !request.shadow.empty()) rewrite_census(request);
+#endif
         std::lock_guard lock(g_mutex);
+        if (!request.shadow.empty() && g_shadow_spares.size() < 3u) g_shadow_spares.push_back(std::move(request.shadow));
         if (request.kind == Request::Kind::Flip) --g_queued_flips;
         g_busy = false;
         if (!events.empty()) {
@@ -1093,6 +1400,18 @@ void post(Request request) {
 
 bool idle_locked() { return g_requests.empty() && !g_busy; }
 
+// Copy split (PERF_LOG 2026-11-13): the list copy taken at enqueue (~350 KiB,
+// 2.0 ms a race frame on the Vita's core 0) shared with the front end's
+// thread, idle at that point (the enqueue waits for it): each copies half.
+// 0 off, 1 on; g_copy_split_alternate switches it at each thread time report
+// (A/B within one run).
+int g_copy_split{1};  // on: measured 2026-11-13 (PERF_LOG)
+bool g_copy_split_alternate{};
+// Measurement (PERF builds): every other thread time report, the GL thread
+// drops its draws (GPU and GL thread nearly idle, black picture) while the
+// game runs on: core 0's load with and without that memory traffic.
+bool g_draw_skip_alternate{}, g_draw_skip{};
+
 // Blocks the emulation thread until `done` holds (under the lock).
 template <typename Predicate> void wait(Predicate done) {
     const double started = host_now_ms();
@@ -1101,6 +1420,7 @@ template <typename Predicate> void wait(Predicate done) {
         g_cv.wait(lock, done);
     }
     g_wait_ms += host_now_ms() - started;
+    PERF_ONLY(perf::emulation_blocked(host_now_ms() - started));
 }
 #endif
 
@@ -1109,12 +1429,95 @@ template <typename Predicate> void wait(Predicate done) {
 bool ge_front_post_list(std::int32_t id, GeList &list) {
 #if defined(BURNOUT_GE_RENDER)
     if (!front::g_enabled) return false;
-    if (!render::early_transfers(front::g_runtime->memory(), list.pc, list.stall, list.base, list.offset)) {
+    // The game reports a list complete at once (see ge_front_sync) and keeps
+    // two list buffers: it rewrites one only after queuing the other. So the
+    // walk of every earlier list ends before this one is accepted: the game
+    // builds a frame while the previous one is walked, never more (gl-47
+    // allowed two frames of lag, and lists were rewritten mid-walk).
+    front::wait([] { return front::idle_locked(); });
+    bool desynced = gl::records_desynced();
+#if !defined(__vita__)
+    // PC test of the fallback: as if the records fell out of step at this vblank.
+    static const std::uint64_t fake_at = [] {
+        const char *env = std::getenv("PSPRECOMP_BURNOUT_FRONT_OFF_AT");
+        return env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
+    }();
+    if (fake_at != 0u && k.vblanks >= fake_at) desynced = true;
+#endif
+    if (desynced) {
+        // The walk on the other core went wrong once: inline from now on
+        // (the front end is idle; later lists are walked here, as in 0.0.36).
+        front::g_enabled = false;
+        gl::trace("GE front end off: a list's records fell out of step");
+        return false;
+    }
+    std::uint32_t end = 0u;
+    const double prepass_started = host_now_ms();
+    if (!render::early_transfers(front::g_runtime->memory(), list.pc, list.stall, list.base, list.offset, &end)) {
         front::g_uncovered_lists.insert(id);
         ++front::g_uncovered_count;
     }
+    const double copy_started = host_now_ms();
+    front::g_prepass_ms += copy_started - prepass_started;
     front::g_open_lists.insert(id);
     front::Request request;
+    // The game may rewrite the buffer while the front end walks it (it does
+    // on the Vita, never on the PC): the walk reads a copy of [pc, END].
+    const std::uint32_t lo = list.pc & 0x0FFFFFFCu;
+    const std::uint8_t *live = end > lo ? front::g_runtime->memory().raw_pointer(lo, end - lo) : nullptr;
+    if (live != nullptr) {
+        {
+            std::lock_guard lock(front::g_mutex);
+            if (!front::g_shadow_spares.empty()) {
+                request.shadow = std::move(front::g_shadow_spares.back());
+                front::g_shadow_spares.pop_back();
+            }
+        }
+        // 0.0.42: assign() through newlib's memcpy took 5.9 ms a flip for
+        // ~390 KiB on the Vita. Buffers keep 1 MiB (no reallocation as the
+        // size moves) and sceClibMemcpy (the system's NEON copy) does it.
+        const std::size_t size = end - lo;
+        if (request.shadow.capacity() < size) request.shadow.reserve(std::max<std::size_t>(size, 1u << 20u));
+        request.shadow.resize(size);
+#if defined(__vita__)
+        static const bool timed = [] {
+            // Once: what each copy costs here, for the log.
+            std::vector<std::uint8_t> from(400u << 10u, 1u), to(400u << 10u);
+            double t0 = host_now_ms();
+            for (int i = 0; i < 8; ++i) std::memcpy(to.data(), from.data(), from.size());
+            double t1 = host_now_ms();
+            for (int i = 0; i < 8; ++i) sceClibMemcpy(to.data(), from.data(), from.size());
+            double t2 = host_now_ms();
+            char line[160];
+            std::snprintf(line, sizeof(line), "400 KiB copy: memcpy %.2f ms, sceClibMemcpy %.2f ms", (t1 - t0) / 8.0, (t2 - t1) / 8.0);
+            gl::trace(line);
+            return true;
+        }();
+        (void)timed;
+        const auto copy = [](std::uint8_t *to, const std::uint8_t *from, std::size_t bytes) { sceClibMemcpy(to, from, bytes); };
+#else
+        const auto copy = [](std::uint8_t *to, const std::uint8_t *from, std::size_t bytes) { std::memcpy(to, from, bytes); };
+#endif
+        if (front::g_copy_split != 0 && size >= (64u << 10u)) {
+            const std::size_t half = (size / 2u) & ~static_cast<std::size_t>(63u);
+            front::Request part;
+            part.kind = front::Request::Kind::CopyPart;
+            part.copy_to = request.shadow.data() + half;
+            part.copy_from = live + half;
+            part.copy_size = size - half;
+            front::post(std::move(part));
+            copy(request.shadow.data(), live, half);
+            front::wait([] { return front::idle_locked(); });
+        } else {
+            copy(request.shadow.data(), live, size);
+        }
+        request.shadow_lo = lo;
+        ++front::g_shadowed_lists;
+        front::g_shadow_bytes += end - lo;
+    } else {
+        ++front::g_unshadowed_lists;
+    }
+    front::g_copy_ms += host_now_ms() - copy_started;
     request.kind = front::Request::Kind::List;
     request.id = id;
     request.list = std::move(list);
@@ -1542,8 +1945,30 @@ void install_io(Runtime &rt) {
         if (!host) { ret(ctx, kErrorFileNotFound); return; }
         const bool write = (flags & 2u) != 0u;
         std::FILE *file = nullptr;
+        std::uint32_t riff_key = 0u;
+        std::string opened = host->string();
         if (!write) {
+#if defined(__vita__)
+            // The title movie with the 2.0 logo ships in the VPK
+            // (2026-11-13): read before the player's copy of the game's.
+            if (lower(host->generic_string()).find("ovid/startb.pmf") != std::string::npos) {
+                file = std::fopen("app0:ovid/startB.pmf", "rb");
+                if (file != nullptr) opened = "app0:ovid/startB.pmf";
+            }
+            if (file == nullptr)
+#endif
             file = std::fopen(host->string().c_str(), "rb");
+            if (file == nullptr) {
+                if (const int n = added_track(*host); n >= 0) {
+                    const fs::path stand_in = added_track_template(*host);
+                    riff_key = added_track_key(stand_in, n);
+                    if (riff_key != 0u) file = std::fopen(stand_in.string().c_str(), "rb");
+                    if (file != nullptr) {
+                        music::add_mp3(riff_key, trax::file_of(static_cast<std::uint32_t>(n)));
+                        opened = stand_in.string();
+                    }
+                }
+            }
             if (file != nullptr && lbn) std::fseek(file, static_cast<long>(lbn->second), SEEK_SET);
         } else {
             std::error_code ec;
@@ -1558,15 +1983,22 @@ void install_io(Runtime &rt) {
         if (file == nullptr) { ret(ctx, kErrorFileNotFound); return; }
         const std::int32_t fd = k.next_fd++;
         k.files[fd] = OpenFile{file, psp_path, 0};
+        k.files[fd].riff_key = riff_key;
         {
             const std::string name = lower(host->generic_string());
-            if (name.size() > 4u && name.compare(name.size() - 4u, 4u, ".pmf") == 0) k.movie_path = host->string();
+            const bool credits = name.size() >= 11u && name.compare(name.size() - 11u, 11u, "credits.pmf") == 0;
+            // The credits' movie (2026-11-11): not played, the names scroll on
+            // black. With it (~300 texture uploads a frame) the Vita ran out of
+            // memory in the credits (0.0.69); PSPRECOMP_BURNOUT_CREDITS_MOVIE=1 keeps it.
+            if (credits && std::getenv("PSPRECOMP_BURNOUT_CREDITS_MOVIE") == nullptr) std::fprintf(stderr, "[movie] credits: no movie\n");
+            else if (name.size() > 4u && name.compare(name.size() - 4u, 4u, ".pmf") == 0) k.movie_path = opened;
         }
         ret(ctx, static_cast<std::uint32_t>(fd));
     });
     reg(rt, lib, 0x810C4BC3u, [](Runtime &, AllegrexContext &ctx) {  // sceIoClose
         const auto it = k.files.find(static_cast<std::int32_t>(arg(ctx, 0)));
         if (it == k.files.end()) { ret(ctx, kErrorBadFile); return; }
+        finish_async(it->second);
         std::fclose(it->second.file);
         k.files.erase(it);
         ret(ctx, 0u);
@@ -1576,18 +2008,39 @@ void install_io(Runtime &rt) {
     });
     reg(rt, lib, 0xA0B5A7C2u, [](Runtime &r, AllegrexContext &ctx) {  // sceIoReadAsync
         const auto fd = static_cast<std::int32_t>(arg(ctx, 0));
+        const auto it = k.files.find(fd);
+        if (async_io_enabled() && it != k.files.end() && it->second.file != nullptr && it->second.riff_key == 0u) {
+            finish_async(it->second);
+            const std::uint32_t size = arg(ctx, 2);
+            std::uint8_t *host = r.memory().raw_pointer(arg(ctx, 1), size);
+            if (host != nullptr || size == 0u) {
+                auto op = std::make_shared<AsyncRead>();
+                std::FILE *file = it->second.file;
+                it->second.pending = op;
+                start_async_read(op, file, host, size);
+                ret(ctx, 0u);
+                return;
+            }
+        }
         const std::int64_t result = file_read(r, fd, arg(ctx, 1), arg(ctx, 2));
-        if (const auto it = k.files.find(fd); it != k.files.end()) it->second.async_result = result;
+        if (const auto at = k.files.find(fd); at != k.files.end()) at->second.async_result = result;
         ret(ctx, result < 0 ? static_cast<std::uint32_t>(result) : 0u);
     });
-    const auto async_result = [](Runtime &r, AllegrexContext &ctx) {  // PollAsync / WaitAsyncCB
+    reg(rt, lib, 0x3251EA56u, [](Runtime &r, AllegrexContext &ctx) {  // sceIoPollAsync: 1 while busy
         const auto it = k.files.find(static_cast<std::int32_t>(arg(ctx, 0)));
         if (it == k.files.end()) { ret(ctx, kErrorBadFile); return; }
+        if (it->second.pending && !it->second.pending->done.load(std::memory_order_acquire)) { ret(ctx, 1u); return; }
+        finish_async(it->second);
         if (arg(ctx, 1) != 0u) store64(r, arg(ctx, 1), static_cast<std::uint64_t>(it->second.async_result));
         ret(ctx, 0u);
-    };
-    reg(rt, lib, 0x3251EA56u, async_result);
-    reg(rt, lib, 0x35DBD746u, async_result);
+    });
+    reg(rt, lib, 0x35DBD746u, [](Runtime &r, AllegrexContext &ctx) {  // sceIoWaitAsyncCB
+        const auto it = k.files.find(static_cast<std::int32_t>(arg(ctx, 0)));
+        if (it == k.files.end()) { ret(ctx, kErrorBadFile); return; }
+        finish_async(it->second);
+        if (arg(ctx, 1) != 0u) store64(r, arg(ctx, 1), static_cast<std::uint64_t>(it->second.async_result));
+        ret(ctx, 0u);
+    });
     reg(rt, lib, 0x42EC03ACu, [](Runtime &r, AllegrexContext &ctx) {  // sceIoWrite
         const auto fd = static_cast<std::int32_t>(arg(ctx, 0));
         const std::uint32_t size = arg(ctx, 2);
@@ -1600,11 +2053,13 @@ void install_io(Runtime &rt) {
         }
         const auto it = k.files.find(fd);
         if (it == k.files.end()) { ret(ctx, kErrorBadFile); return; }
+        finish_async(it->second);
         ret(ctx, static_cast<std::uint32_t>(std::fwrite(data, 1u, size, it->second.file)));
     });
     reg(rt, lib, 0x27EB27B8u, [](Runtime &, AllegrexContext &ctx) {  // sceIoLseek
         const auto it = k.files.find(static_cast<std::int32_t>(arg(ctx, 0)));
         if (it == k.files.end()) { ret64(ctx, static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(kErrorBadFile)))); return; }
+        finish_async(it->second);
         const auto offset = static_cast<std::int64_t>(static_cast<std::uint64_t>(arg(ctx, 2)) |
                                                       (static_cast<std::uint64_t>(arg(ctx, 3)) << 32u));
         const int whence = arg(ctx, 4) == 1u ? SEEK_CUR : arg(ctx, 4) == 2u ? SEEK_END : SEEK_SET;
@@ -1620,6 +2075,11 @@ void install_io(Runtime &rt) {
         const auto host = map_path(r.memory().read_c_string(arg(ctx, 0), 256u));
         std::error_code ec;
         if (host && is_virtual_directory(*host)) { write_stat(r, arg(ctx, 1), true, 2048u); ret(ctx, 0u); return; }
+        if (host && !fs::exists(*host, ec) && added_track(*host) >= 0) {
+            write_stat(r, arg(ctx, 1), false, fs::file_size(added_track_template(*host), ec));
+            ret(ctx, 0u);
+            return;
+        }
         if (!host || !fs::exists(*host, ec)) { ret(ctx, kErrorFileNotFound); return; }
         const bool directory = fs::is_directory(*host, ec);
         write_stat(r, arg(ctx, 1), directory, directory ? 0u : fs::file_size(*host, ec));
@@ -1642,6 +2102,17 @@ void install_io(Runtime &rt) {
             const bool is_directory = entry.is_directory(ec);
             items.push_back({entry.path().filename().string(), entry.path(), is_directory,
                              is_directory ? 2048u : entry.file_size(ec)});
+        }
+        // The added EA Trax tracks' stand-ins (trax.cpp) in the music folder.
+        if (trax::added() > 0 && lower(host->filename().string()) == "music" ||
+            (trax::added() > 0 && host->filename().empty() && lower(host->parent_path().filename().string()) == "music")) {
+            const fs::path folder = host->filename().empty() ? host->parent_path() : *host;
+            const auto size = fs::file_size(added_track_template(folder / "x"), ec);
+            for (std::uint32_t n = 24u; !ec && !trax::file_of(n).empty(); ++n) {
+                char name[32];
+                std::snprintf(name, sizeof(name), "EATrax%02u.mus", n);
+                items.push_back({name, folder / name, false, size});
+            }
         }
         std::sort(items.begin(), items.end(), [](const auto &a, const auto &b) { return lower(a.name) < lower(b.name); });
         directory.entries.insert(directory.entries.end(), items.begin(), items.end());
@@ -1694,10 +2165,15 @@ void install_io(Runtime &rt) {
     reg_value(rt, lib, 0x779103A0u, 0u);  // Rename
 }
 
+
+void call_guest(AllegrexContext &ctx, std::uint32_t function, std::initializer_list<std::uint32_t> args,
+                std::function<std::uint32_t(Runtime &, std::uint32_t)> on_return);
+
 void install_display_input(Runtime &rt) {
     reg_value(rt, "sceDisplay", 0x0E20F177u, 0u);  // SetMode
     reg(rt, "sceDisplay", 0x289D82FEu, [](Runtime &r, AllegrexContext &ctx) {  // SetFrameBuf
         workload::end_frame(r.memory());
+        PERF_ONLY(perf::emulation_flip(k.vblanks, 0.0, sas_worker::active()));
 #if defined(BURNOUT_GE_RENDER)
         if (front::g_enabled) {
             // At most two frames ahead of the front end.
@@ -1742,6 +2218,9 @@ void install_display_input(Runtime &rt) {
             r.memory().store8(pad + 9u, static_cast<std::uint8_t>((analog >> 8u) & 0xFFu));
         }
         ret(ctx, count);
+        std::uint32_t function = 0u, a0 = 0u, a1 = 0u;
+        if (k.observer.guest_call && k.observer.guest_call(function, a0, a1))
+            call_guest(ctx, function, {a0, a1}, [count](Runtime &, std::uint32_t) { return count; });
     });
 }
 
@@ -1914,11 +2393,13 @@ void install_audio(Runtime &rt) {
                 const double started = host_now_ms();
                 sas::mix(out);  // the shadow voices' state only
                 g_sas_ms += host_now_ms() - started;
+                PERF_ONLY(perf::add_audio_ms(host_now_ms() - started));
                 sas_worker::post([out] { sas::mix(out); });
             } else {
                 const double started = host_now_ms();
                 sas::mix(out);
                 g_sas_ms += host_now_ms() - started;
+                PERF_ONLY(perf::add_audio_ms(host_now_ms() - started));
             }
         }
         else r.memory().zero(arg(ctx, 1), k.sas_grain * 4u);
@@ -2092,6 +2573,7 @@ void install_mpeg(Runtime &rt) {
         ret(ctx, 0u);
     });
     reg(rt, lib, 0x606A4649u, [](Runtime &, AllegrexContext &ctx) {  // sceMpegDelete
+        if (const auto it = k.mpeg_movies.find(arg(ctx, 0)); it != k.mpeg_movies.end() && it->second.title_logo) hide_title_logo();
         k.mpeg_movies.erase(arg(ctx, 0));
         ret(ctx, 0u);
     });
@@ -2227,6 +2709,7 @@ void install_mpeg(Runtime &rt) {
             movie->second.movie = movie::open(k.movie_path, error);
             const std::string what = movie->second.movie ? std::to_string(movie->second.movie->frame_count()) + " frames" : error;
             std::fprintf(stderr, "[movie] %s: %s\n", k.movie_path.c_str(), what.c_str());
+            if (movie->second.movie) movie->second.title_logo = show_title_logo(k.movie_path);
             k.movie_path.clear();
         }
         if (movie != k.mpeg_movies.end() && movie->second.movie) {
@@ -2597,6 +3080,58 @@ std::uint32_t savedata_perform(Runtime &r, std::uint32_t params, std::uint32_t m
         } else if (psp_savedata::crypt_mode(sfo) != 0) {
             how = "UNSUPPORTED hash mode " + std::to_string(psp_savedata::crypt_mode(sfo));
         }
+#if !defined(__vita__)
+        // PC tests: the decrypted profile written to PSPRECOMP_BURNOUT_DUMP_SAVE.
+        if (const char *dump = std::getenv("PSPRECOMP_BURNOUT_DUMP_SAVE"))
+            write_whole(dump, data.data(), data.size());
+        // PC tests: the profile completed (World Tour golds, Signatures,
+        // Trophy objectives, cars), PSPRECOMP_BURNOUT_COMPLETE_SAVE=1.
+        // Or PSPRECOMP_BURNOUT_CLEAR_SIGNATURES=1: every Signature Takedown
+        // undone (a test save whose next "every reward" shows them again).
+        // Or PSPRECOMP_BURNOUT_SAVE_FROM=<file>: the profile replaced by that
+        // decrypted one (made by a script), written back as the PSP's.
+        const bool complete = std::getenv("PSPRECOMP_BURNOUT_COMPLETE_SAVE") != nullptr;
+        const char *from = std::getenv("PSPRECOMP_BURNOUT_SAVE_FROM");
+        if ((complete || from != nullptr || std::getenv("PSPRECOMP_BURNOUT_CLEAR_SIGNATURES") != nullptr) && data.size() >= 0xF6E0u) {
+            if (from != nullptr) {
+                const std::vector<std::uint8_t> given = read_whole(from);
+                if (given.size() == data.size()) data = given;
+                else save_log("savedata load: SAVE_FROM has the wrong size");
+            } else if (complete) {
+                std::fill(data.begin() + 0xF56A, data.begin() + 0xF5B5, std::uint8_t{3});
+                std::fill(data.begin() + 0xF5BA, data.begin() + 0xF61E, std::uint8_t{3});
+                std::fill(data.begin() + 0xF61E, data.begin() + 0xF61E + 20, std::uint8_t{1});
+                std::fill(data.begin() + 0xF63C, data.begin() + 0xF63C + 89, std::uint8_t{1});
+                std::fill(data.begin() + 0xF6C9, data.begin() + 0xF6C9 + 20, std::uint8_t{1});
+            } else {
+                std::fill(data.begin() + 0xF61E, data.begin() + 0xF61E + 20, std::uint8_t{0});
+                // (And PSPRECOMP_BURNOUT_UNDO_EVENT=<offset>: that event undone.)
+                if (const char *undo = std::getenv("PSPRECOMP_BURNOUT_UNDO_EVENT")) {
+                    const unsigned long at = std::strtoul(undo, nullptr, 16);
+                    if (at >= 0xF56Au && at < 0xF61Eu) data[at] = 0xFFu;
+                }
+            }
+            // The game's check: the sum of the words before 0xF6DC, stored there.
+            std::uint32_t sum = 0u;
+            for (std::size_t at = 0; at < 0xF6DCu; at += 4u) {
+                std::uint32_t word;
+                std::memcpy(&word, data.data() + at, 4u);
+                sum += word;
+            }
+            std::memcpy(data.data() + 0xF6DCu, &sum, 4u);
+            // Written back as the PSP writes it, so the completed profile stays.
+            if (psp_savedata::crypt_mode(sfo) == 1) {
+                psp_savedata::SfoInfo info;
+                psp_savedata::read_sfo(sfo, info);
+                psp_savedata::Hash written{};
+                const auto stored = psp_savedata::encrypt(data.data(), data.size(), written);
+                const auto new_sfo = psp_savedata::build_sfo(info, file, written, sfo);
+                const bool ok = write_whole(path, stored.data(), stored.size()) && write_whole(folder / "PARAM.SFO", new_sfo.data(), new_sfo.size());
+                save_log(std::string("savedata load: completed profile written back ") + (ok ? "ok" : "FAILED"));
+            }
+            save_log("savedata load: profile completed (test)");
+        }
+#endif
         const std::size_t read = std::min<std::size_t>(data.size(), buffer_size);
         if (std::uint8_t *host = memory.raw_pointer(buffer, static_cast<std::uint32_t>(read)); host != nullptr && read != 0u)
             std::memcpy(host, data.data(), read);
@@ -2690,7 +3225,7 @@ void install_utility(Runtime &rt) {
     reg(rt, lib, 0xA5DA2406u, [](Runtime &r, AllegrexContext &ctx) {  // GetSystemParamInt
         std::uint32_t value = 0u;
         switch (arg(ctx, 0)) {
-        case 8u: value = 1u; break;  // language: English
+        case 8u: value = static_cast<std::uint32_t>(save_dialog::system_language()); break;  // the console's language
         case 9u: value = 1u; break;  // confirm button: cross
         default: break;
         }
@@ -2831,6 +3366,10 @@ bool ge_front_start(psprecomp::Runtime &runtime) {
     std::thread(front::thread_main, nullptr).detach();
 #endif
     front::g_enabled = true;
+#if !defined(__vita__)
+    // PC: PSPRECOMP_BURNOUT_COPY_SPLIT=1 (on) or 2 (alternating).
+    if (const char *split = std::getenv("PSPRECOMP_BURNOUT_COPY_SPLIT")) ge_front_copy_split(std::atoi(split));
+#endif
     return true;
 #else
     (void)runtime;
@@ -2838,11 +3377,28 @@ bool ge_front_start(psprecomp::Runtime &runtime) {
 #endif
 }
 
+void ge_front_copy_split(int mode) {
+#if defined(BURNOUT_GE_RENDER)
+    front::g_copy_split = mode != 0 ? 1 : 0;
+    front::g_copy_split_alternate = mode == 2;
+#else
+    (void)mode;
+#endif
+}
+
+void ge_front_draw_skip_alternate() {
+#if defined(BURNOUT_GE_RENDER)
+    front::g_draw_skip_alternate = true;
+#endif
+}
+
 void ge_front_drain() {
 #if defined(BURNOUT_GE_RENDER)
     if (!front::g_enabled) return;
+    PERF_ONLY(const double started = host_now_ms());
     std::unique_lock lock(front::g_mutex);
     front::g_cv.wait(lock, [] { return front::idle_locked(); });
+    PERF_ONLY(perf::emulation_blocked(host_now_ms() - started));
 #endif
 }
 
@@ -2881,7 +3437,7 @@ std::string thread_time_report(double frames) {
         g_sas_ms = 0.0;
         g_sas_grains = 0u;
     }
-    char item[96];
+    char item[256];
     std::snprintf(item, sizeof(item), "; interrupts %.1f, outside threads %.1f; %.0f dispatches", g_interrupt_ms / frames,
                   (now - last_report - accounted) / frames, g_dispatches / frames);
     g_dispatches = 0u;
@@ -2893,6 +3449,22 @@ std::string thread_time_report(double frames) {
                       front::g_cpu_samples[3], front::g_uncovered_count);
         front::g_uncovered_count = 0u;
         report += item;
+        std::snprintf(item, sizeof(item), "; lists walked from a copy %llu (%.0f KiB each, %llu reads outside), live %llu; prepass %.2f, copy %.2f ms/flip (split %s)",
+                      static_cast<unsigned long long>(front::g_shadowed_lists),
+                      front::g_shadowed_lists != 0u ? front::g_shadow_bytes / 1024.0 / static_cast<double>(front::g_shadowed_lists) : 0.0,
+                      static_cast<unsigned long long>(gl::g_shadow_misses),
+                      static_cast<unsigned long long>(front::g_unshadowed_lists), front::g_prepass_ms / frames,
+                      front::g_copy_ms / frames, front::g_copy_split != 0 ? "on" : "off");
+        if (front::g_copy_split_alternate) front::g_copy_split = front::g_copy_split != 0 ? 0 : 1;
+        if (front::g_draw_skip_alternate) {
+            report += front::g_draw_skip ? "; draws skipped" : "; draws on";
+            front::g_draw_skip = !front::g_draw_skip;
+            gl::set_draw_budget(front::g_draw_skip ? 1u : 0u);
+        }
+        front::g_prepass_ms = front::g_copy_ms = 0.0;
+        report += item;
+        front::g_shadowed_lists = front::g_unshadowed_lists = front::g_shadow_bytes = 0u;
+        gl::g_shadow_misses = 0u;
         for (auto &count : front::g_cpu_samples) count = 0u;
         front::g_wait_ms = 0.0;
     }
@@ -2904,6 +3476,20 @@ std::string thread_time_report(double frames) {
         report += item;
     }
     g_interrupt_times.clear();
+#if defined(PERF_COUNTERS)
+    {
+        std::vector<std::pair<std::uint32_t, HleTime>> top(g_hle_times.begin(), g_hle_times.end());
+        std::sort(top.begin(), top.end(), [](auto &a, auto &b) { return a.second.ms > b.second.ms; });
+        report += "; imports ms/flip (in interrupts, calls/flip):";
+        for (std::size_t i = 0; i < top.size() && i < 10u; ++i) {
+            if (top[i].second.ms / frames < 0.05) break;
+            std::snprintf(item, sizeof(item), " %08X %.2f (%.2f, %.1f)", static_cast<unsigned>(top[i].first),
+                          top[i].second.ms / frames, top[i].second.interrupt_ms / frames, top[i].second.calls / frames);
+            report += item;
+        }
+        g_hle_times.clear();
+    }
+#endif
     g_interrupt_ms = 0.0;
     last_report = now;
     return report;
@@ -2923,4 +3509,55 @@ void print_hle_summary() {
     for (const auto &[name, calls] : k.stub_calls) std::cerr << "[hle] stub " << name << " x" << calls << "\n";
 }
 
+// 60 frames a second (tools/patch_frame_rate.py). The game picks 30 frames a
+// second in menus and 60 in races (time step 1/60 s, 0x08A4A144), but its
+// vblank handler still shows a race frame every second vblank. With the
+// option on, a frame goes every vblank while the step is 1/60 s.
+namespace {
+bool g_sixty = false;
+bool g_single_step = false;  // measuring: one step a frame whatever the time gone
+}
+void set_sixty_fps(bool on) noexcept { g_sixty = on; }
+void set_single_step(bool on) noexcept { g_single_step = on; }
+bool single_step() noexcept { return g_single_step; }
+bool sixty_fps() noexcept { return g_sixty; }
 } // namespace burnout
+
+// Called at each screen change: logged every time. Left as the game asks
+// (forcing 60 from the boot call held the title screen).
+std::uint32_t burnout_frame_rate(std::uint32_t half_rate) {
+    std::fprintf(stderr, "[fps] vblank %llu: the game sets %u frames a second\n",
+                 static_cast<unsigned long long>(burnout::vblank_count()), half_rate != 0u ? 30u : 60u);
+    return half_rate;
+}
+
+// The vblank handler's 2 vblanks a frame (0x088553F4, every vblank while the
+// byte at 0x08DCC999 is 0). display: the object holding them (+1332).
+std::uint32_t burnout_vblanks_per_frame(psprecomp::GuestMemory &memory, std::uint32_t display, std::uint32_t vblanks) {
+    const std::uint32_t step_ms = memory.load32(0x08ED6B00u);
+    const std::uint32_t chosen = burnout::sixty_fps() && step_ms == 16u ? 1u : vblanks;
+    static std::uint32_t calls = 0u;
+    if (++calls % 600u == 1u)
+        std::fprintf(stderr, "[fps] vblank %llu: step %u ms, %u vblanks a frame, game frames %u\n",
+                     static_cast<unsigned long long>(burnout::vblank_count()), step_ms, chosen,
+                     memory.load32(0x08BB3D50u));
+    (void)display;
+    return chosen;
+}
+
+// 0x0880F48C: the steps of 1/60 s the next frame runs (2 in races). At 60
+// frames a second: the vblanks gone since the last frame (1 to 4), so the
+// race keeps its speed when a frame is late.
+std::uint32_t burnout_frame_steps(psprecomp::GuestMemory &memory, std::uint32_t steps) {
+    static std::uint64_t last = 0u;
+    const std::uint64_t now = burnout::vblank_count();
+    std::uint32_t chosen = steps;
+    if (burnout::sixty_fps() && memory.load32(0x08ED6B00u) == 16u && last != 0u)
+        chosen = burnout::single_step() ? 1u : static_cast<std::uint32_t>(std::clamp<std::uint64_t>(now - last, 1u, 4u));
+    last = now;
+    static std::uint32_t calls = 0u;
+    if (++calls % 600u == 1u)
+        std::fprintf(stderr, "[fps] vblank %llu: the game's steps %u, run %u\n", static_cast<unsigned long long>(now),
+                     steps, chosen);
+    return chosen;
+}

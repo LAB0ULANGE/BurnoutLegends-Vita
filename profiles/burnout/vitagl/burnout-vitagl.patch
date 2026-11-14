@@ -1,0 +1,431 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index e5b3d82..c8686da 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -224,7 +224,7 @@ char vgl_file_cache_path[256];
+ 		p->blend_info.raw = blend_info.raw; \
+ 		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4); \
+ 	} \
+-	sceGxmSetFragmentProgram(gxm_context, p->fprog);
++	if (!vgl_state_cache || vgl_cur_fprog != p->fprog) { 		sceGxmSetFragmentProgram(gxm_context, p->fprog); 		vgl_cur_fprog = p->fprog; 	}
+ 	
+ #define align_attributes(attributes, streams) \
+ 	if (p->has_unaligned_attrs) { \
+@@ -1144,14 +1144,36 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ 	return GL_TRUE;
+ }
+ 
++// burnout patch: time of each part of the draw path (microseconds), when
++// vgl_draw_profile is set (vglEnableDrawProfile), read by vglGetDrawProfile.
++GLboolean vgl_draw_profile = GL_FALSE;
++GLboolean vgl_state_cache = GL_TRUE;
++const void *vgl_cur_vprog = NULL;
++const void *vgl_cur_fprog = NULL;
++SceGxmTexture vgl_cur_ftex[16];
++void vglEnableStateCache(GLboolean on) { vgl_state_cache = on; vgl_state_cache_reset(); }
++uint32_t vgl_draw_profile_us[8];
++static uint32_t vgl_prof_last;
++#define VGL_PROF_START() if (vgl_draw_profile) vgl_prof_last = sceKernelGetProcessTimeLow()
++#define VGL_PROF_MARK(k) if (vgl_draw_profile) { uint32_t vgl_prof_now = sceKernelGetProcessTimeLow(); vgl_draw_profile_us[k] += vgl_prof_now - vgl_prof_last; vgl_prof_last = vgl_prof_now; }
++void vglEnableDrawProfile(GLboolean on) { vgl_draw_profile = on; }
++void vglGetDrawProfile(uint32_t *us) {
++	for (int i = 0; i < 8; i++) {
++		us[i] = vgl_draw_profile_us[i];
++		vgl_draw_profile_us[i] = 0;
++	}
++}
++
+ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, SceGxmIndexSource index_type) {
+ #ifdef HAVE_PROFILING
+ 	uint32_t draw_start = sceKernelGetProcessTimeLow();
+ #endif
++	VGL_PROF_START();
+ 	program *p = &progs[cur_program - 1];
+ 
+ 	// Check if a blend info rebuild is required and upload fragment program
+ 	setup_frag_program();
++	VGL_PROF_MARK(0)
+ 
+ 	// Uploading fragment textures on relative texture units
+ 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
+@@ -1187,7 +1209,10 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
+ 				tex->overridden = GL_FALSE;
+ 			}
+-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++			if (!vgl_state_cache || i >= 16 || memcmp(&vgl_cur_ftex[i], &tex->gxm_tex, sizeof(SceGxmTexture))) {
++				sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++				if (i < 16) vgl_cur_ftex[i] = tex->gxm_tex;
++			}
+ #ifdef HAVE_GLSL_TEXTURE_SIZE
+ 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
+ 			if (info) {
+@@ -1238,6 +1263,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ #endif
+ 	}
+ 
++	VGL_PROF_MARK(1)
+ 	// Aligning attributes
+ 	SceGxmVertexAttribute *attributes;
+ 	SceGxmVertexStream *streams;
+@@ -1384,12 +1410,30 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 	}
+ #endif
+ 
+-	// Uploading new vertex program
+-	patch_vertex_program(p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+-	sceGxmSetVertexProgram(gxm_context, p->vprog);
++	VGL_PROF_MARK(2)
++	// Uploading new vertex program (Burnout: not re-patched when the program
++	// and its attribute layout are those of the previous draw)
++	{
++		static program *last_p = NULL;
++		static SceGxmVertexAttribute last_attr[VERTEX_ATTRIBS_NUM];
++		static SceGxmVertexStream last_stream[VERTEX_ATTRIBS_NUM];
++		const size_t attr_bytes = p->attr_num * sizeof(SceGxmVertexAttribute), stream_bytes = p->attr_num * sizeof(SceGxmVertexStream);
++		if (!vgl_state_cache || last_p != p || memcmp(last_attr, attributes, attr_bytes) || memcmp(last_stream, streams, stream_bytes)) {
++			patch_vertex_program(p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
++			last_p = p;
++			vgl_fast_memcpy(last_attr, attributes, attr_bytes);
++			vgl_fast_memcpy(last_stream, streams, stream_bytes);
++		}
++	}
++	if (!vgl_state_cache || vgl_cur_vprog != p->vprog) {
++		sceGxmSetVertexProgram(gxm_context, p->vprog);
++		vgl_cur_vprog = p->vprog;
++	}
++	VGL_PROF_MARK(3)
+ 
+ 	// Uploading both fragment and vertex uniforms data
+ 	upload_uniforms();
++	VGL_PROF_MARK(4)
+ 
+ 	// Uploading vertex streams
+ 	for (int i = 0; i < p->attr_num; i++) {
+@@ -1417,6 +1461,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			}
+ 		}
+ 	}
++	VGL_PROF_MARK(5)
+ #ifdef HAVE_PROFILING
+ 	shaders_draw_profiler_cnt += sceKernelGetProcessTimeLow() - draw_start;
+ 	shaders_draw_cnt++;
+diff --git a/source/draw.c b/source/draw.c
+index e9e6c8c..061a1ae 100644
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -330,6 +330,9 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei prim
+ 
+ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_indices) {
+ 	THREAD_SAFE()
++	extern GLboolean vgl_draw_profile;
++	extern uint32_t vgl_draw_profile_us[8];
++	const uint32_t vgl_outer_start = vgl_draw_profile ? sceKernelGetProcessTimeLow() : 0;
+ 
+ #ifdef HAVE_DLISTS
+ 	// Enqueueing function to a display list if one is being compiled
+@@ -388,6 +391,10 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
+ 		}
+ 	}
+ 	restore_polygon_mode(gxm_p);
++	if (vgl_draw_profile) {
++		vgl_draw_profile_us[6] += sceKernelGetProcessTimeLow() - vgl_outer_start; // whole glDrawElements
++		vgl_draw_profile_us[7]++;
++	}
+ }
+ 
+ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_indices, GLint baseVertex) {
+@@ -596,6 +603,7 @@ void vglDrawObjects(GLenum mode, GLsizei count) {
+ 			texture_slots[tex_unit->tex_id[0]].last_frame = vgl_framecount;
+ #endif
+ 			sceGxmSetFragmentTexture(gxm_context, 0, &texture_slots[tex_unit->tex_id[0]].gxm_tex);
++			vgl_state_cache_reset();
+ 			sceGxmSetVertexStream(gxm_context, 1, texture_object);
+ 			if (ffp_vertex_num_params > 2)
+ 				sceGxmSetVertexStream(gxm_context, 2, color_object);
+diff --git a/source/ffp.c b/source/ffp.c
+index 11937c4..aa56b50 100644
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -1181,7 +1181,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 	}
+ 
+ 	sceGxmSetVertexProgram(gxm_context, ffp_vertex_program_patched);
++	vgl_state_cache_reset();
+ 	sceGxmSetFragmentProgram(gxm_context, ffp_fragment_program_patched);
++	vgl_state_cache_reset();
+ 
+ 	// Recalculating MVP matrix if necessary
+ 	if (mvp_modified) {
+@@ -1356,6 +1358,7 @@ void _glDrawArrays_FixedFunctionIMPL(GLint first, GLsizei count) {
+ 			tex->overridden = GL_FALSE;
+ 		}
+ 		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++		vgl_state_cache_reset();
+ 	}
+ 	
+ 	// Preparing materials temp buffer if lights are enabled
+@@ -1495,6 +1498,7 @@ void _glMultiDrawArrays_FixedFunctionIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
+ 			tex->overridden = GL_FALSE;
+ 		}
+ 		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++		vgl_state_cache_reset();
+ 	}
+ 	
+ 	// Preparing materials temp buffer if lights are enabled
+@@ -1709,6 +1713,7 @@ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_
+ 			tex->overridden = GL_FALSE;
+ 		}
+ 		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++		vgl_state_cache_reset();
+ 	}
+ 
+ 	// Preparing materials temp buffer if lights are enabled
+@@ -2778,6 +2783,7 @@ void glEnd(void) {
+ 				tex->overridden = GL_FALSE;
+ 			}
+ 			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++			vgl_state_cache_reset();
+ 		}
+ 	} else if (texture_units[0].state) { // Texturing usage
+ 		ffp_vertex_attrib_state = (1 << FFP_ATTRIB_POSITION) | (1 << FFP_ATTRIB_TEX0) | (1 << FFP_ATTRIB_COLOR);
+@@ -2810,6 +2816,7 @@ void glEnd(void) {
+ 			tex->overridden = GL_FALSE;
+ 		}
+ 		sceGxmSetFragmentTexture(gxm_context, 0, &tex->gxm_tex);
++		vgl_state_cache_reset();
+ 	} else { // No texturing usage
+ 		ffp_vertex_attrib_state = (1 << FFP_ATTRIB_POSITION) | (1 << FFP_ATTRIB_COLOR);
+ 		if (zero_lights) {
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 15e59ea..039e0ac 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -216,6 +216,8 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
+ 			framebuffers[i].depthbuffer_state = DEPTHBUFFER_MISSING;
+ 			framebuffers[i].depthbuffer_ptr = NULL;
+ 			framebuffers[i].target = NULL;
++			framebuffers[i].valid_w = framebuffers[i].valid_h = 0;
++			framebuffers[i].depth_keep = 0;
+ 			framebuffers[i].tex = NULL;
+ 		}
+ 		if (j >= n)
+@@ -322,6 +324,21 @@ void glBindFramebuffer(GLenum target, GLuint fb) {
+ 	}
+ }
+ 
++// burnout patch: scenes on the bound draw framebuffer only process the tiles
++// of its top-left w x h pixels (GL: lower-left, FBOs are flipped); 0 = all.
++void vglSetFramebufferValidRegion(GLsizei w, GLsizei h) {
++	if (!active_write_fb)
++		return;
++	active_write_fb->valid_w = w;
++	active_write_fb->valid_h = h;
++}
++
++void vglSetFramebufferDepthKeep(GLboolean load, GLboolean store) {
++	if (!active_write_fb)
++		return;
++	active_write_fb->depth_keep = (load ? 1 : 0) | (store ? 2 : 0);
++}
++
+ void glBindRenderbuffer(GLenum target, GLuint rb) {
+ 	THREAD_SAFE()
+ 
+@@ -841,10 +858,12 @@ void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLin
+ 
+ 	// Set framebuffer blit shader
+ 	sceGxmSetVertexProgram(gxm_context, blit_vertex_program_patched);
++	vgl_state_cache_reset();
+ 	if (is_fbo_float)
+ 		sceGxmSetFragmentProgram(gxm_context, blit_fragment_program_float_patched);
+ 	else
+ 		sceGxmSetFragmentProgram(gxm_context, blit_fragment_program_patched);
++	vgl_state_cache_reset();
+ 	
+ 	// Set fragment texture to read framebuffer bound color attachment
+ 	framebuffer *read_fb = (framebuffer *)readFramebuffer;
+@@ -859,6 +878,7 @@ void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLin
+ 		vglSetTexMipmapCount(tex, 0);
+ 	}
+ 	sceGxmSetFragmentTexture(gxm_context, 0, tex);
++	vgl_state_cache_reset();
+ 	
+ 	// Set stencil func to keep original data
+ 	sceGxmSetFrontStencilFunc(gxm_context,
+diff --git a/source/gxm.c b/source/gxm.c
+index 7bcce62..65983e1 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "shared.h"
++#include <stdio.h>
+ 
+ #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
+ 
+@@ -566,6 +567,34 @@ void start_shader_patcher(void) {
+ #endif
+ }
+ 
++// burnout patch: scenes begun, by target size, since the last vglGetSceneStats.
++#define VGL_SCENE_STAT_SLOTS 12
++static struct { int w, h; uint32_t scenes; } vgl_scene_stats[VGL_SCENE_STAT_SLOTS];
++static uint32_t vgl_scene_frames;
++static void vgl_count_scene(int w, int h) {
++	for (int i = 0; i < VGL_SCENE_STAT_SLOTS; i++) {
++		if (vgl_scene_stats[i].scenes == 0 && vgl_scene_stats[i].w == 0) {
++			vgl_scene_stats[i].w = w;
++			vgl_scene_stats[i].h = h;
++		}
++		if (vgl_scene_stats[i].w == w && vgl_scene_stats[i].h == h) {
++			vgl_scene_stats[i].scenes++;
++			return;
++		}
++	}
++}
++int vglGetSceneStats(char *buf, int size) {
++	int n = snprintf(buf, size, "%lu frames:", (unsigned long)vgl_scene_frames);
++	for (int i = 0; i < VGL_SCENE_STAT_SLOTS && n < size; i++) {
++		if (vgl_scene_stats[i].w == 0)
++			break;
++		n += snprintf(buf + n, size - n, " %dx%d %lu", vgl_scene_stats[i].w, vgl_scene_stats[i].h, (unsigned long)vgl_scene_stats[i].scenes);
++	}
++	vgl_memset(vgl_scene_stats, 0, sizeof(vgl_scene_stats));
++	vgl_scene_frames = 0;
++	return n;
++}
++
+ static inline __attribute__((always_inline)) void scene_end(void) {
+ 	// Ends current gxm scene
+ 	query_fence.value++;
+@@ -616,6 +645,7 @@ void scene_reset(void) {
+ 				shared_fb_info.vsync = vsync_interval;
+ 				gxm_back_buffer_index = (shared_fb_info.index + 1) % 2;
+ 			}
++			vgl_count_scene(DISPLAY_WIDTH, DISPLAY_HEIGHT);
+ 			int r = sceGxmBeginScene(gxm_context, 0, gxm_render_target,
+ 				NULL, NULL,
+ 				gxm_sync_objects[gxm_back_buffer_index],
+@@ -661,6 +691,22 @@ void scene_reset(void) {
+ 				}
+ 			}
+ #endif
++			vgl_count_scene(active_write_fb->width, active_write_fb->height);
++			// burnout patch: depth/stencil kept across this target's scenes when asked
++			// (a target left for another one mid-frame and drawn again with depth tests).
++			if (active_write_fb->depthbuffer_ptr) {
++				sceGxmDepthStencilSurfaceSetForceLoadMode(active_write_fb->depthbuffer_ptr,
++					(active_write_fb->depth_keep & 1) ? SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED : SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED);
++				sceGxmDepthStencilSurfaceSetForceStoreMode(active_write_fb->depthbuffer_ptr,
++					(active_write_fb->depth_keep & 2) ? SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED : SCE_GXM_DEPTH_STENCIL_FORCE_STORE_DISABLED);
++			}
++			SceGxmValidRegion valid_region;
++			const SceGxmValidRegion *valid_ptr = NULL;
++			if (active_write_fb->valid_w > 0 && active_write_fb->valid_h > 0) {
++				valid_region.xMax = (active_write_fb->valid_w < active_write_fb->width ? active_write_fb->valid_w : active_write_fb->width) - 1;
++				valid_region.yMax = (active_write_fb->valid_h < active_write_fb->height ? active_write_fb->valid_h : active_write_fb->height) - 1;
++				valid_ptr = &valid_region;
++			}
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ 			render_target *fbo_rt = (render_target *)active_write_fb->target;
+ #ifdef RECYCLE_RENDERTARGETS
+@@ -670,7 +716,7 @@ void scene_reset(void) {
+ #else
+ 			int r = sceGxmBeginScene(gxm_context, 0, active_write_fb->target,
+ #endif
+-					NULL, NULL, NULL,
++					valid_ptr, NULL, NULL,
+ 					&active_write_fb->colorbuffer,
+ 					active_write_fb->depthbuffer_ptr);
+ #ifdef LOG_ERRORS
+@@ -679,6 +725,7 @@ void scene_reset(void) {
+ #endif
+ 		}
+ 
++		vgl_state_cache_reset(); // a new scene: GXM state set again
+ 		// Setting back current viewport if enabled cause sceGxm will reset it at sceGxmEndScene call
+ 		if (old_framebuffer != in_use_framebuffer) {
+ 			dirty_scissor_state = GL_TRUE;
+@@ -784,6 +831,7 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ #endif
+ 
+ 	vgl_framecount++;
++	vgl_scene_frames++;
+ #if !defined(DISABLE_CIRCULAR_POOL) && !defined(CIRCULAR_POOL_SPEEDHACK)
+ #ifdef HAVE_DEBUG_INTERFACE
+ 	vgl_circular_pool_frame_peak = (uint32_t)circular_data_pool_ptr[vgl_circular_idx] - (uint32_t)circular_data_pool[vgl_circular_idx];
+diff --git a/source/misc.c b/source/misc.c
+index 238f052..80d34be 100644
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -671,7 +671,9 @@ void glClear(GLbitfield mask) {
+ 	sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+ 
+ 	sceGxmSetVertexProgram(gxm_context, clear_vertex_program_patched);
++	vgl_state_cache_reset();
+ 	sceGxmSetFragmentProgram(gxm_context, is_fbo_float ? clear_fragment_program_float_patched : clear_fragment_program_patched);
++	vgl_state_cache_reset();
+ 
+ 	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vbuffer);
+ 	sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
+diff --git a/source/shared.h b/source/shared.h
+index 6954fa3..19ef563 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -454,6 +454,14 @@ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported
+ 	vgl_error = x; \
+ 	return y;
+ 
++// Burnout (2026-11-13): GXM state already set by the previous custom-shader
++// draw is not set again (sceGxmDraw then has less dirty state to emit).
++// Anything else that sets programs or textures, and every new scene, forgets it.
++extern GLboolean vgl_state_cache;
++extern const void *vgl_cur_vprog;
++extern const void *vgl_cur_fprog;
++extern SceGxmTexture vgl_cur_ftex[16];
++#define vgl_state_cache_reset() do { vgl_cur_vprog = NULL; vgl_cur_fprog = NULL; vgl_memset(vgl_cur_ftex, 0, sizeof(vgl_cur_ftex)); } while (0)
+ extern size_t max_vcache_size;
+ extern size_t max_fcache_size;
+ static inline __attribute__((always_inline)) void patch_vertex_program(SceGxmShaderPatcherId id, const SceGxmVertexAttribute *attr, uint32_t attr_num, const SceGxmVertexStream *stream, uint32_t stream_num, SceGxmVertexProgram **prog) {
+@@ -597,6 +605,8 @@ typedef struct {
+ 	GLboolean is_float;
+ 	uint8_t depthbuffer_state;
+ 	SceGxmRenderTarget *target;
++	int valid_w, valid_h; // burnout patch: scene valid region (0 = whole target)
++	int depth_keep; // burnout patch: next scene's depth/stencil: 1 loaded from memory, 2 stored to memory
+ 	SceGxmColorSurface colorbuffer;
+ 	SceGxmDepthStencilSurface depthbuffer;
+ 	SceGxmDepthStencilSurface *depthbuffer_ptr;
+diff --git a/source/tests.c b/source/tests.c
+index aad6b0e..f423d47 100644
+--- a/source/tests.c
++++ b/source/tests.c
+@@ -255,7 +255,9 @@ void update_scissor_test() {
+ 
+ 	// Setting current vertex program to clear screen one and fragment program to scissor test one
+ 	sceGxmSetVertexProgram(gxm_context, clear_vertex_program_patched);
++	vgl_state_cache_reset();
+ 	sceGxmSetFragmentProgram(gxm_context, scissor_test_fragment_program);
++	vgl_state_cache_reset();
+ 
+ 	// Invalidating viewport and culling
+ 	invalidate_viewport();
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index eeec610..e5a3c4a 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1280,6 +1280,12 @@ void vglSetupGarbageCollector(int priority, int affinity);
+ 
+ // Change the scenes per frame value to use for the display and fbos rendertargets. Default value: 1, 1.
+ void vglSetupRenderTargetScenesNum(uint8_t display_size, uint8_t fbo_size);
++int vglGetSceneStats(char *buf, int size); // burnout patch: "N frames: WxH scenes ..." since the last call (resets)
++void vglSetFramebufferValidRegion(GLsizei w, GLsizei h); // burnout patch: tiles of the bound FBO's top-left w x h only (0: all)
++void vglSetFramebufferDepthKeep(GLboolean load, GLboolean store); // burnout patch: the bound FBO's next scene loads / stores its depth and stencil
++void vglEnableStateCache(GLboolean on); // burnout patch: skip GXM program/texture sets equal to the previous draw
++void vglEnableDrawProfile(GLboolean on); // burnout patch: time the parts of glDrawElements (custom shaders)
++void vglGetDrawProfile(uint32_t *us); // burnout patch: 8 values, microseconds since the last call: frag program, textures, attributes, vertex program, uniforms, streams, whole glDrawElements, draws (count)
+ 
+ // Change what kind of vertex buffer objects are considered eligible for scratch memory usage in order to reduce allocation costs. Requires USE_SCRATCH_MEMORY.
+ void vglSetupScratchMemory(GLboolean scratch_for_dynamic, GLboolean scratch_for_stream);

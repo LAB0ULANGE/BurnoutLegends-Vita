@@ -28,6 +28,9 @@ constexpr int kMaxActive = 3;
 // Uniforms: u_texture, u_extent (texture coordinates of the picture's far
 // corner), u_pixels (picture size in its own pixels), u_time (seconds).
 std::string fragment_shader(const std::vector<int> &active);
+// A filter's name in a PSP language (2 French, 3 Spanish, 4 German, 5 Italian,
+// 6 Dutch; English otherwise), upper case (filter_names.cpp).
+std::string localized_name(int filter, int language);
 // "a + b + c" for logs.
 std::string describe(const std::vector<int> &active);
 

@@ -1,4 +1,5 @@
 #include "movie.hpp"
+#include "detached_thread.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -7,9 +8,21 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 
+#if defined(_WIN32) && !defined(__vita__)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#endif
 #if defined(__vita__)
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/sysmodule.h>
 #include <psp2/videodec.h>
 #endif
@@ -213,28 +226,236 @@ private:
     std::ifstream in_;
 };
 
+#if defined(_WIN32) && !defined(__vita__)
+// The playable PC build: the H.264 decoder of Windows (Media Foundation).
+const GUID kH264Decoder{0x62CE7E72, 0x4C71, 0x4D20, {0xB1, 0x5D, 0x45, 0x28, 0x31, 0xA8, 0x7D, 0x9D}};
+
+template <class T> void release(T *&p) {
+    if (p != nullptr) p->Release();
+    p = nullptr;
+}
+
+class WinMovie final : public Movie {
+public:
+    explicit WinMovie(std::shared_ptr<const Units> units) : units_(std::move(units)) {}
+    ~WinMovie() override { release(decoder_); }
+
+    bool start(std::string &error) {
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        (void)co;
+        static const bool started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+        if (!started) { error = "MFStartup failed"; return false; }
+        if (FAILED(CoCreateInstance(kH264Decoder, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&decoder_)))) {
+            error = "no H.264 decoder";
+            return false;
+        }
+        IMFMediaType *in = nullptr;
+        MFCreateMediaType(&in);
+        in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        MFSetAttributeSize(in, MF_MT_FRAME_SIZE, kWidth, kHeight);
+        const HRESULT set_in = decoder_->SetInputType(0, in, 0);
+        release(in);
+        if (FAILED(set_in)) { error = "H.264 input type refused"; return false; }
+        if (!choose_output()) { error = "no NV12 output"; return false; }
+        decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        return true;
+    }
+
+    bool next_frame(std::vector<std::uint8_t> &rgba) override {
+        if (shown_ >= units_->size()) return false;
+        rgba.assign(static_cast<std::size_t>(kWidth) * kHeight * 4u, 0u);
+        for (std::size_t i = 3; i < rgba.size(); i += 4u) rgba[i] = 0xFFu;
+        // Units in until a picture comes out (the decoder holds a few back).
+        for (int guard = 0; guard < 64; ++guard) {
+            if (take_output(rgba)) {
+                ++shown_;
+                return true;
+            }
+            if (next_ < units_->size()) {
+                feed((*units_)[next_]);
+                ++next_;
+            } else if (!drained_) {
+                decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+                drained_ = true;
+            } else {
+                break;
+            }
+        }
+        // Nothing decoded: the frame stays black, the movie goes on.
+        ++shown_;
+        return true;
+    }
+    std::size_t frame_count() const override { return units_->size(); }
+    void rewind() override {
+        decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        next_ = shown_ = 0;
+        drained_ = false;
+    }
+
+private:
+    bool choose_output() {
+        for (DWORD i = 0;; ++i) {
+            IMFMediaType *type = nullptr;
+            if (FAILED(decoder_->GetOutputAvailableType(0, i, &type))) return false;
+            GUID subtype{};
+            type->GetGUID(MF_MT_SUBTYPE, &subtype);
+            if (subtype == MFVideoFormat_NV12) {
+                const HRESULT hr = decoder_->SetOutputType(0, type, 0);
+                UINT32 w = kWidth, h = kHeight;
+                MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h);
+                UINT32 stride = 0;
+                if (FAILED(type->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride)) || stride == 0) stride = w;
+                width_ = static_cast<int>(w);
+                height_ = static_cast<int>(h);
+                stride_ = static_cast<int>(stride);
+                release(type);
+                return SUCCEEDED(hr);
+            }
+            release(type);
+        }
+    }
+
+    void feed(const std::vector<std::uint8_t> &unit) {
+        IMFSample *sample = nullptr;
+        IMFMediaBuffer *buffer = nullptr;
+        MFCreateSample(&sample);
+        MFCreateMemoryBuffer(static_cast<DWORD>(unit.size()), &buffer);
+        BYTE *data = nullptr;
+        buffer->Lock(&data, nullptr, nullptr);
+        std::memcpy(data, unit.data(), unit.size());
+        buffer->Unlock();
+        buffer->SetCurrentLength(static_cast<DWORD>(unit.size()));
+        sample->AddBuffer(buffer);
+        sample->SetSampleTime(static_cast<LONGLONG>(next_) * 333667);
+        sample->SetSampleDuration(333667);
+        decoder_->ProcessInput(0, sample, 0);
+        release(buffer);
+        release(sample);
+    }
+
+    bool take_output(std::vector<std::uint8_t> &rgba) {
+        MFT_OUTPUT_STREAM_INFO info{};
+        decoder_->GetOutputStreamInfo(0, &info);
+        const bool provides = (info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0u;
+        MFT_OUTPUT_DATA_BUFFER out{};
+        IMFSample *own = nullptr;
+        if (!provides) {
+            IMFMediaBuffer *buffer = nullptr;
+            MFCreateSample(&own);
+            MFCreateMemoryBuffer(info.cbSize != 0u ? info.cbSize : static_cast<DWORD>(stride_ * height_ * 3 / 2 + 4096), &buffer);
+            own->AddBuffer(buffer);
+            release(buffer);
+            out.pSample = own;
+        }
+        DWORD status = 0;
+        const HRESULT hr = decoder_->ProcessOutput(0, 1, &out, &status);
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            release(own);
+            choose_output();
+            return take_output(rgba);
+        }
+        if (FAILED(hr)) {
+            release(own);
+            if (out.pEvents != nullptr) out.pEvents->Release();
+            return false;
+        }
+        IMFSample *sample = out.pSample;
+        IMFMediaBuffer *buffer = nullptr;
+        if (sample != nullptr && SUCCEEDED(sample->ConvertToContiguousBuffer(&buffer))) {
+            BYTE *data = nullptr;
+            DWORD length = 0;
+            if (SUCCEEDED(buffer->Lock(&data, nullptr, &length))) {
+                convert(data, length, rgba);
+                buffer->Unlock();
+            }
+            release(buffer);
+        }
+        if (provides && sample != nullptr) sample->Release();
+        release(own);
+        if (out.pEvents != nullptr) out.pEvents->Release();
+        return true;
+    }
+
+    // NV12 (BT.601, studio range) to RGBA, the top-left kWidth x kHeight.
+    void convert(const BYTE *data, DWORD length, std::vector<std::uint8_t> &rgba) const {
+        const int luma_rows = height_;
+        if (static_cast<std::size_t>(stride_) * luma_rows * 3u / 2u > length) return;
+        const BYTE *uv_plane = data + static_cast<std::size_t>(stride_) * luma_rows;
+        const int w = std::min(width_, kWidth), h = std::min(height_, kHeight);
+        for (int y = 0; y < h; ++y) {
+            const BYTE *row = data + static_cast<std::size_t>(y) * stride_;
+            const BYTE *uv = uv_plane + static_cast<std::size_t>(y / 2) * stride_;
+            std::uint8_t *dst = rgba.data() + static_cast<std::size_t>(y) * kWidth * 4u;
+            for (int x = 0; x < w; ++x) {
+                const int c = row[x] - 16, d = uv[x & ~1] - 128, e = uv[(x & ~1) + 1] - 128;
+                const auto clamp = [](int v) { return static_cast<std::uint8_t>(std::clamp(v, 0, 255)); };
+                dst[x * 4] = clamp((298 * c + 409 * e + 128) >> 8);
+                dst[x * 4 + 1] = clamp((298 * c - 100 * d - 208 * e + 128) >> 8);
+                dst[x * 4 + 2] = clamp((298 * c + 516 * d + 128) >> 8);
+                dst[x * 4 + 3] = 0xFFu;
+            }
+        }
+    }
+
+    std::shared_ptr<const Units> units_;
+    IMFTransform *decoder_{};
+    std::size_t next_{}, shown_{};
+    bool drained_{};
+    int width_{kWidth}, height_{kHeight}, stride_{kWidth};
+};
+bool g_windows_decoder{};
+#endif
+
 } // namespace
 
-std::unique_ptr<Movie> open(const std::string &host_path, std::string &error) {
-    // Demuxed movies are kept (up to ~16 MiB): the menu's and the World Tour
-    // map's come back at every menu change, and reading and splitting their
-    // 3 MB files each time stalled the game.
-    static std::map<std::string, std::shared_ptr<const Units>> cache;
-    static std::size_t cached_bytes = 0;
-    std::shared_ptr<const Units> units;
-    if (const auto it = cache.find(host_path); it != cache.end()) units = it->second;
-    if (!units) {
-        auto parsed = std::make_shared<Units>(access_units(read_file(host_path)));
-        std::size_t bytes = 0;
-        for (const auto &unit : *parsed) bytes += unit.size();
-        if (cached_bytes + bytes > 16u * 1024u * 1024u) {
-            cache.clear();
-            cached_bytes = 0;
-        }
-        cache[host_path] = parsed;
-        cached_bytes += bytes;
-        units = std::move(parsed);
+// Demuxed movies are kept (up to ~16 MiB): the menu's and the World Tour
+// map's come back at every menu change, and reading and splitting their 3 MB
+// files each time stalled the game.
+SpinLock g_cache_mutex;  // see detached_thread.hpp
+std::map<std::string, std::shared_ptr<const Units>> g_cache;
+std::size_t g_cached_bytes = 0;
+
+std::shared_ptr<const Units> cached_units(const std::string &host_path) {
+    {
+        std::lock_guard lock(g_cache_mutex);
+        if (const auto it = g_cache.find(host_path); it != g_cache.end()) return it->second;
     }
+    auto parsed = std::make_shared<const Units>(access_units(read_file(host_path)));
+    std::size_t bytes = 0;
+    for (const auto &unit : *parsed) bytes += unit.size();
+    std::lock_guard lock(g_cache_mutex);
+    if (const auto it = g_cache.find(host_path); it != g_cache.end()) return it->second;  // prefetched meanwhile
+    if (g_cached_bytes + bytes > 16u * 1024u * 1024u) {
+        g_cache.clear();
+        g_cached_bytes = 0;
+    }
+    g_cache[host_path] = parsed;
+    g_cached_bytes += bytes;
+    return parsed;
+}
+
+void release_cache() {
+    std::size_t bytes = 0;
+    {
+        std::lock_guard lock(g_cache_mutex);
+        bytes = g_cached_bytes;
+        g_cache.clear();
+        g_cached_bytes = 0;
+    }
+    if (bytes != 0u) std::fprintf(stderr, "[movie] cache released: %u KiB\n", static_cast<unsigned>(bytes / 1024u));
+}
+
+void prefetch(std::vector<std::string> host_paths) {
+    start_detached([paths = std::move(host_paths)] {
+        for (const auto &path : paths) (void)cached_units(path);
+    });
+}
+
+std::unique_ptr<Movie> open(const std::string &host_path, std::string &error) {
+    std::shared_ptr<const Units> units = cached_units(host_path);
     if (units->empty()) {
         error = "no H.264 access units in " + host_path;
         return nullptr;
@@ -244,6 +465,13 @@ std::unique_ptr<Movie> open(const std::string &host_path, std::string &error) {
     if (!movie->start(error)) return nullptr;
     return movie;
 #else
+#if defined(_WIN32)
+    if (g_windows_decoder) {
+        auto movie = std::make_unique<WinMovie>(units);
+        if (movie->start(error)) return movie;
+        std::fprintf(stderr, "[movie] Windows decoder: %s\n", error.c_str());
+    }
+#endif
     std::string frames;
     if (const char *dir = std::getenv("PSPRECOMP_BURNOUT_MOVIE_FRAMES")) frames = std::string(dir) + "/" + base_name(host_path) + ".rgba";
     return std::make_unique<FileMovie>(units->size(), frames);
@@ -251,3 +479,9 @@ std::unique_ptr<Movie> open(const std::string &host_path, std::string &error) {
 }
 
 } // namespace burnout::movie
+
+#if defined(_WIN32) && !defined(__vita__)
+namespace burnout::movie {
+void use_windows_decoder() { g_windows_decoder = true; }
+} // namespace burnout::movie
+#endif
