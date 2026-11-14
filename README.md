@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/51a728fd-207b-4fc6-ad68-10b4aa05ae6b
+
 # Burnout Legends for PS Vita (native recompilation)
 
 ![Burnout Legends on PS Vita](docs/images/livearea.png)
@@ -13,6 +17,10 @@ movies and saves rebuilt for the Vita.
 > game file, no executable from the disc and no recompiled game code. Dump your own UMD.
 
 ## Trailer
+
+
+https://github.com/user-attachments/assets/69993d45-fb54-40fa-ac10-d913aeec1261
+
 
 *The video is compressed for GitHub: the game looks much sharper on the Vita's screen.*
 
