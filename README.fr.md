@@ -15,7 +15,8 @@ Ce n'est pas un émulateur : le code du jeu tourne nativement, avec un rendu
 > copie de votre propre UMD.
 
 ## Bande-annonce
-https://github.com/user-attachments/assets/a94ad1f3-301a-41da-83ff-b9dafbffb146
+https://github.com/user-attachments/assets/69993d45-fb54-40fa-ac10-d913aeec1261
+
 *La vidéo est compressée pour GitHub : le jeu est bien plus net sur l'écran de la Vita.*
 
 ## Captures
