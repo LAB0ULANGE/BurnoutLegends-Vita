@@ -121,7 +121,7 @@ constexpr const char *kBuild = "0.0.81-mesure";
 constexpr bool kPerfForce480 = false;
 constexpr const char *kBuild = kPerfForce480 ? "0.0.83-perfo480" : "0.0.83-perfz";
 #else
-constexpr const char *kBuild = kRelease ? "0.0.2" : "gl-109";
+constexpr const char *kBuild = kRelease ? "0.0.3" : "gl-109";
 #endif
 
 // Bonus filters (bonus.hpp): state from unlocks.bin, applied to the renderer.

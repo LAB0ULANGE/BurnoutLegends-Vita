@@ -339,18 +339,19 @@ bool install(const std::string &root) {
     switch (outcome.result) {
     case setup::Result::NoImage:
         line("Aucune ISO de Burnout Legends trouvee.", kSelected);
-        line("Copiez votre ISO ou CSO (ULES00125) dans", kText);
-        line("ux0:pspemu/ISO/ puis relancez le jeu.", kText);
+        line("Copiez votre ISO ou CSO (ULES00125/ULUS10025)", kText);
+        line("dans ux0:pspemu/ISO/ puis relancez le jeu.", kText);
         y += 20;
         line("No Burnout Legends ISO found.", kSelected);
-        line("Put your ISO or CSO (ULES00125) in", kText);
+        line("Put your ISO or CSO (ULES00125/ULUS10025) in", kText);
         line("ux0:pspemu/ISO/ and start the game again.", kText);
         break;
     case setup::Result::WrongVersion:
         line("Version non prise en charge / Unsupported version", kSelected);
         line(outcome.image, kDim);
-        line("Seule la version europeenne ULES00125 v1.01", kText);
-        line("Only the European version ULES00125 v1.01", kText);
+        line("Versions prises en charge : ULES00125 (Europe)", kText);
+        line("et ULUS10025 (USA)", kText);
+        line("Supported: ULES00125 (Europe), ULUS10025 (USA)", kText);
         break;
     default:
         line("L'installation a echoue / Install failed", kSelected);

@@ -12,6 +12,6 @@ sleep 9
 python -I "$S/vc.py" "screen on; press cross; press r2" >/dev/null
 for i in 1 2 3 4 5 6; do OUT="$S/../../out/sky" bash "$S/step.sh" "" 2 "$1_$i"; done
 python -I "$S/vc.py" "release cross; release r2" >/dev/null
-cd "$S/../../out/sky"; FF=$(ls -d /c/Users/bap71/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg*/ffmpeg-*/bin | head -1)
+cd "$S/../../out/sky"; FF=$(ls -d "$LOCALAPPDATA"/Microsoft/WinGet/Packages/Gyan.FFmpeg*/ffmpeg-*/bin | head -1)
 for i in 1 2 3 4 5 6; do echo "file '$1_$i.png'"; done > l.txt
 "$FF/ffmpeg.exe" -hide_banner -loglevel error -y -f concat -safe 0 -i l.txt -vf "scale=480:272,tile=3x2" -frames:v 1 "$1_sheet.png"

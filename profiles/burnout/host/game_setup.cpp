@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
@@ -20,9 +21,31 @@ namespace burnout::setup {
 namespace fs = std::filesystem;
 namespace {
 
-constexpr const char *kDiscId = "ULES00125";
-// SHA-256 of the decrypted EBOOT.BIN the recompiled code was made from.
-constexpr const char *kEbootSha256 = "89263a8f1f262971ad85761202fa6b02f4dfc86b3fbc733402ec20d0003e57c4";
+// The versions the recompiled code runs: their decrypted EBOOT.BIN have the
+// same code byte for byte (ULUS10025 1.00 against ULES00125 1.01: only a
+// region letter, one Riviera crash target and the build date differ in the
+// data, which the port loads from the player's own executable).
+struct Version {
+    const char *disc_id;
+    const char *sha256;  // of the decrypted EBOOT.BIN
+};
+constexpr Version kVersions[]{
+    {"ULES00125", "89263a8f1f262971ad85761202fa6b02f4dfc86b3fbc733402ec20d0003e57c4"},  // Europe 1.01 (the code's source)
+    {"ULUS10025", "166bf5a428ff5b9f46192bf80ec3f26cfff1d1833af50ea74fa81d23906e70f2"},  // USA 1.00
+};
+constexpr const char *kSupported = "ULES00125 (Europe) or ULUS10025 (USA)";
+
+bool supported_disc(const std::string &id) {
+    for (const Version &version : kVersions)
+        if (id == version.disc_id) return true;
+    return false;
+}
+
+bool supported_eboot(const std::string &sha) {
+    for (const Version &version : kVersions)
+        if (sha == version.sha256) return true;
+    return false;
+}
 constexpr const char *kPartial = "install.partial";
 constexpr const char *kDone = "install.ok";
 
@@ -407,10 +430,17 @@ Outcome install_from(const std::string &root, const std::string &image_path, con
     } else {
         elf = eboot;  // already decrypted (a homebrew-patched image)
     }
-    if (sha256(elf.data(), elf.size()) != kEbootSha256) {
+    if (!supported_eboot(sha256(elf.data(), elf.size()))) {
+        // PC study of other versions (ULUS10025...): keep their decrypted executable.
+        if (const char *keep = std::getenv("PSPRECOMP_KEEP_OTHER_EBOOT"); keep != nullptr && *keep != '\0') {
+            if (std::FILE *file = std::fopen(keep, "wb")) {
+                std::fwrite(elf.data(), 1u, elf.size(), file);
+                std::fclose(file);
+            }
+        }
         outcome.result = Result::WrongVersion;
         outcome.message = "This Burnout Legends (" + sfo_string(sfo, "DISC_ID") + " " + sfo_string(sfo, "DISC_VERSION") +
-                          ") is not the supported version (ULES00125 1.01)";
+                          ") is not a supported version (" + kSupported + ")";
         return outcome;
     }
     if (std::FILE *file = std::fopen((root + "EBOOT_DECRYPTED.ELF").c_str(), "wb")) {
@@ -454,6 +484,9 @@ Outcome install(const std::string &root, const std::vector<std::string> &folders
         return outcome;
     }
     std::string other;  // a Burnout Legends image of another version
+    // The European image first when there are several (players already
+    // installed from it keep the same game).
+    std::vector<std::pair<std::string, std::string>> found;  // disc id, path
     for (const std::string &path : find_images(folders)) {
         auto image = iso::Image::open(path);
         if (image == nullptr) continue;
@@ -461,21 +494,25 @@ Outcome install(const std::string &root, const std::vector<std::string> &folders
         std::vector<std::uint8_t> sfo;
         if (!image->find("PSP_GAME/PARAM.SFO", entry) || !image->read_file(entry, sfo)) continue;
         const std::string id = sfo_string(sfo, "DISC_ID");
-        if (id == kDiscId) {
-            image.reset();
-            return install_from(root, path, progress);
+        if (supported_disc(id)) {
+            found.emplace_back(id, path);
+            continue;
         }
-        if (id == "ULUS10025" || id == "ULJM05049" || lower(sfo_string(sfo, "TITLE")).find("burnout legends") != std::string::npos)
+        if (id == "ULJM05049" || id == "ULKS46027" || lower(sfo_string(sfo, "TITLE")).find("burnout legends") != std::string::npos)
             other = path + " (" + id + ")";
     }
+    std::stable_sort(found.begin(), found.end(), [](const auto &a, const auto &b) {
+        return (a.first == kVersions[0].disc_id) > (b.first == kVersions[0].disc_id);
+    });
+    if (!found.empty()) return install_from(root, found.front().second, progress);
     if (!other.empty()) {
         outcome.result = Result::WrongVersion;
         outcome.image = other;
-        outcome.message = "Found " + other + ", but only the European version ULES00125 is supported";
+        outcome.message = "Found " + other + ", but only " + std::string(kSupported) + " is supported";
         return outcome;
     }
     outcome.result = Result::NoImage;
-    outcome.message = "No Burnout Legends (ULES00125) ISO or CSO found";
+    outcome.message = "No Burnout Legends ISO or CSO found (" + std::string(kSupported) + ")";
     return outcome;
 }
 

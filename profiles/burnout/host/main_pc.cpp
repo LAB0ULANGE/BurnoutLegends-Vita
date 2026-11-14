@@ -393,11 +393,11 @@ bool install_if_needed() {
     std::string text;
     switch (outcome.result) {
     case burnout::setup::Result::NoImage:
-        text = "No Burnout Legends disc image found.\n\nPut your own copy of the game (ULES00125, .iso or .cso) next to "
+        text = "No Burnout Legends disc image found.\n\nPut your own copy of the game (ULES00125 Europe or ULUS10025 USA, .iso or .cso) next to "
                "burnout_legends.exe and launch it again.";
         break;
     case burnout::setup::Result::WrongVersion:
-        text = "This disc image is not the European Burnout Legends (ULES00125 v1.01):\n" + outcome.image;
+        text = "This disc image is not a supported Burnout Legends (ULES00125 Europe or ULUS10025 USA):\n" + outcome.image;
         break;
     default: text = "The game files could not be made:\n" + outcome.message; break;
     }

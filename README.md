@@ -81,16 +81,16 @@ is announced at the end of the race, like the game's own unlocks.
 - **MP3 only.** Other formats (AAC or M4A files renamed to `.mp3`, for example)
   are skipped. Convert them to MP3 first.
 
-## Supported game version
+## Supported game versions
 
-| | |
-|---|---|
-| Game | Burnout Legends, Europe |
-| Disc | **ULES00125**, DISC_VERSION 1.01 |
-| Decrypted `EBOOT.BIN` SHA-256 | `89263a8f1f262971ad85761202fa6b02f4dfc86b3fbc733402ec20d0003e57c4` |
+| Region | Disc | Decrypted `EBOOT.BIN` SHA-256 |
+|---|---|---|
+| Europe | **ULES00125**, DISC_VERSION 1.01 | `89263a8f1f262971ad85761202fa6b02f4dfc86b3fbc733402ec20d0003e57c4` |
+| USA (since 0.0.3) | **ULUS10025**, DISC_VERSION 1.00 | `166bf5a428ff5b9f46192bf80ec3f26cfff1d1833af50ea74fa81d23906e70f2` |
 
-Other versions (US ULUS10025, other revisions) are not supported yet: the
-recompiled code only matches this executable.
+Both have the same game code, byte for byte, and the same 6 languages: the game
+uses your Vita's language. The install recognises your version by itself. Other
+versions (Japan ULJM05049, Korea ULKS46027, other revisions) are not supported yet.
 
 ## Requirements
 
@@ -99,7 +99,7 @@ recompiled code only matches this executable.
   If you do not have it, extract it with
   [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D) and copy it to
   `ur0:data/external/libshacccg.suprx`.
-- Your own Burnout Legends disc image (**ULES00125**), ISO or CSO: the one you
+- Your own Burnout Legends disc image (**ULES00125** or **ULUS10025**), ISO or CSO: the one you
   play with Adrenaline
 - About 700 MB free on `ux0:`
 - Optional: the CapUnlocker plugin (the sound then runs on the Vita's fourth
@@ -134,11 +134,13 @@ The PSP controls, on the same buttons.
 - Short slowdowns can happen on the largest tracks (Waterfront, Downtown) when a
   new part of the track streams in.
 - About a minute of loading at each start (shader compilation).
-- Only ULES00125 v1.01 is supported (the install checks it).
+- Only ULES00125 v1.01 and ULUS10025 v1.00 are supported (the install checks it).
+- To switch to the other version, delete `ux0:data/burnout/` (keep `musique_perso/` and `unlocks.bin` if
+  you use them) and start the game again with the other ISO.
 
 ## Reporting a bug
 
-Please attach the log: **`ux0:data/burnout-0.0.2.log`** (and `.log.prev`, the
+Please attach the log: **`ux0:data/burnout-0.0.3.log`** (and `.log.prev`, the
 previous run). Say which track and what you were doing. The log already
 records memory use and every slow frame.
 

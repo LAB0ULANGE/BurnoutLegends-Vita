@@ -81,16 +81,17 @@ les déblocages du jeu.
 - **MP3 uniquement.** Les autres formats sont ignorés, par exemple un AAC ou un M4A
   renommé en `.mp3`. Convertissez-les d'abord en MP3.
 
-## Version du jeu prise en charge
+## Versions du jeu prises en charge
 
-| | |
-|---|---|
-| Jeu | Burnout Legends, Europe |
-| Disque | **ULES00125**, DISC_VERSION 1.01 |
-| SHA-256 de l'`EBOOT.BIN` déchiffré | `89263a8f1f262971ad85761202fa6b02f4dfc86b3fbc733402ec20d0003e57c4` |
+| Région | Disque | SHA-256 de l'`EBOOT.BIN` déchiffré |
+|---|---|---|
+| Europe | **ULES00125**, DISC_VERSION 1.01 | `89263a8f1f262971ad85761202fa6b02f4dfc86b3fbc733402ec20d0003e57c4` |
+| USA (depuis la 0.0.3) | **ULUS10025**, DISC_VERSION 1.00 | `166bf5a428ff5b9f46192bf80ec3f26cfff1d1833af50ea74fa81d23906e70f2` |
 
-Les autres versions (US ULUS10025, autres révisions) ne sont pas encore prises en
-charge : le code recompilé correspond à cet exécutable précis.
+Les deux ont le même code de jeu, octet pour octet, et les mêmes 6 langues : le
+jeu prend la langue de votre Vita. L'installation reconnaît votre version toute
+seule. Les autres versions (Japon ULJM05049, Corée ULKS46027, autres révisions)
+ne sont pas encore prises en charge.
 
 ## Prérequis
 
@@ -99,7 +100,7 @@ charge : le code recompilé correspond à cet exécutable précis.
   `ur0:data/external/`. Si vous ne l'avez pas, extrayez-le avec
   [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D) puis copiez-le en
   `ur0:data/external/libshacccg.suprx`.
-- Votre propre image de Burnout Legends (**ULES00125**), ISO ou CSO, celle
+- Votre propre image de Burnout Legends (**ULES00125** ou **ULUS10025**), ISO ou CSO, celle
   que vous utilisez avec Adrenaline
 - Environ 700 Mo libres sur `ux0:`
 - Facultatif : le plugin CapUnlocker (le son tourne alors sur le quatrième cœur de
@@ -136,11 +137,13 @@ Celles de la PSP, sur les mêmes boutons.
 - De courts ralentissements peuvent arriver sur les plus grands circuits
   (Waterfront, Downtown) quand une nouvelle partie du circuit se charge.
 - Environ une minute de chargement à chaque lancement (compilation des shaders).
-- Seule la version ULES00125 v1.01 est prise en charge.
+- Seules les versions ULES00125 v1.01 et ULUS10025 v1.00 sont prises en charge.
+- Pour passer à l'autre version, supprimez `ux0:data/burnout/` (gardez
+  `musique_perso/` et `unlocks.bin` si vous les utilisez) et relancez le jeu avec l'autre ISO.
 
 ## Signaler un bug
 
-Joignez le log : **`ux0:data/burnout-0.0.2.log`** (et `.log.prev`, la partie
+Joignez le log : **`ux0:data/burnout-0.0.3.log`** (et `.log.prev`, la partie
 précédente). Dites sur quel circuit et ce que vous faisiez. Le log note déjà la
 mémoire utilisée et chaque image trop lente.
 
