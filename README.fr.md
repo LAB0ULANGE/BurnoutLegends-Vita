@@ -1,3 +1,4 @@
+
 # Burnout Legends sur PS Vita (recompilation native)
 
 ![Burnout Legends sur PS Vita](docs/images/livearea.png)
@@ -14,7 +15,7 @@ Ce n'est pas un émulateur : le code du jeu tourne nativement, avec un rendu
 > copie de votre propre UMD.
 
 ## Bande-annonce
-
+https://github.com/user-attachments/assets/a94ad1f3-301a-41da-83ff-b9dafbffb146
 *La vidéo est compressée pour GitHub : le jeu est bien plus net sur l'écran de la Vita.*
 
 ## Captures
